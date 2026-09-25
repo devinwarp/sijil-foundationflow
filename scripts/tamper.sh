@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Demo helper: edits the record store directly with the sqlite3 CLI, from outside
-# the application. Uses nothing from Sijill — only sqlite3 and shasum.
+# the application. Uses nothing from Sijill: only sqlite3 and shasum.
 #
 #   tamper.sh backup        copy the store aside (run before the demo)
 #   tamper.sh alter 17      change seq 17's output_hash      -> verifier: content altered
@@ -49,7 +49,7 @@ case "$CMD" in
     printf 'forge    seq %s: content changed, record_hash recomputed (%s…), no private key\n' "$S" "${H:0:12}"
     ;;
   restore)
-    [ -f "$BAK" ] || die "no backup at $BAK — run: tamper.sh backup"
+    [ -f "$BAK" ] || die "no backup at $BAK, run: tamper.sh backup"
     N=$(q "ATTACH '$BAK' AS b;
       CREATE TEMP TABLE d AS SELECT * FROM b.records EXCEPT SELECT * FROM main.records;
       INSERT OR REPLACE INTO main.records SELECT * FROM temp.d;

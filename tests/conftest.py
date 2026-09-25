@@ -46,7 +46,7 @@ def make_chain(db: Path, key, n: int = 50) -> None:
         body = dict(type="inference", ts=record.now_ts(), model_id=MODEL, model_digest=APPROVED_DIGEST,
                     node_id="auh-node-01", node_region="AE-AZ", policy_id="gov-assistant", policy_hash="a" * 64,
                     approval_ref="APR-0147", mode=mode, decision=decision, rule_hits=json.dumps(hits),
-                    input_hash=record.input_hash([{"role": "user", "content": f"question {seq} — سؤال"}]),
+                    input_hash=record.input_hash([{"role": "user", "content": f"question {seq} سؤال"}]),
                     output_hash="" if decision == "block" else record.output_hash(f"answer {seq}"))
         rec = record.seal(body, seq, prev, key)
         store.append(rec)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sijill verifier — standalone CLI.
+Sijill verifier: standalone CLI.
 
 Reimplements canonicalisation and verification from the Build Spec
 (docs/README.md). Deliberately imports nothing from the `sijill/` package:

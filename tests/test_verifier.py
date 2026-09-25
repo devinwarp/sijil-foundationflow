@@ -1,5 +1,5 @@
 """Acceptance tests 1-4 (docs/README.md) against a chain written by sijill.record,
-tampered with the sqlite3 CLI and scripts/tamper.sh — never through the application."""
+tampered with the sqlite3 CLI and scripts/tamper.sh, never through the application."""
 
 from conftest import sqlite, tamper, verify
 
