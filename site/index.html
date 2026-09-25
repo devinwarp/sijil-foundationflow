@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sijil: proof of what your AI did, on infrastructure you own</title>
+<meta name="description" content="Sijil seals a signed, tamper-evident record of every LLM inference on hardware the customer owns. An independent verifier proves the chain is intact, or names the exact record that broke.">
+<meta property="og:title" content="Sijil: inference attestation for AI on infrastructure you own">
+<meta property="og:description" content="Every model call checked against policy and sealed into a signed, hash-chained record. An independent verifier names any record that was altered.">
+<meta property="og:image" content="https://sijil.infinitebarakah.com/assets/poster.jpg">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/png" href="/assets/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;800;900&family=IBM+Plex+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<header class="nav">
+  <a class="brand" href="#top"><img src="/assets/logo.png" alt="" width="30" height="30"><span>Sijil</span></a>
+  <nav>
+    <a href="#demo">Demo</a>
+    <a href="#how">How it works</a>
+    <a href="#integrators">For integrators</a>
+    <a class="gh" href="https://github.com/devinwarp/sijil-foundationflow">GitHub</a>
+  </nav>
+</header>
+
+<main id="top">
+
+  <section class="hero wrap">
+    <div class="hero-copy">
+      <p class="eyebrow">Inference attestation</p>
+      <h1>Proof of what your AI did, <em>on infrastructure you own.</em></h1>
+      <p class="lede">Sijil sits in front of your model endpoint. Every call is checked against policy and sealed into a signed, hash-chained record: which model version answered, where it ran, the policy in force, and who approved it. An independent verifier proves the chain is intact, or names the exact record that broke.</p>
+      <div class="ctas">
+        <a class="btn primary" href="#demo">Watch the 76-second demo</a>
+        <a class="btn" href="/assets/sijil-partner-brief.pdf">Partner brief (PDF)</a>
+      </div>
+      <p class="fine">No change to the model, the application or the serving runtime.</p>
+    </div>
+
+    <figure class="ledger" aria-label="Illustration: records sealing, one record tampered and caught">
+      <div class="ledger-bar"><i></i><i></i><i></i><span>auh-node-01 · AE-AZ · policy gov-assistant · APR-0147</span></div>
+      <div class="ledger-head"><span>seq</span><span>decision</span><span>rules hit</span><span>record hash</span></div>
+      <ol id="rows"></ol>
+      <div class="verdict" id="verdict">PASS records=0</div>
+      <figcaption>Illustration of the node console. The demo below is the real thing.</figcaption>
+    </figure>
+  </section>
+
+  <section class="question wrap">
+    <p class="quote">“An entity deployed an assistant six months ago. An auditor asks what it told a citizen on 12 March. <strong>What do they hand over?</strong>”</p>
+  </section>
+
+  <section class="wrap" id="demo">
+    <div class="section-head">
+      <p class="eyebrow">Live demo</p>
+      <h2>Watch a record get forged, and caught.</h2>
+      <p>Real proxy, real local model (Llama 3.2 3B in LM Studio), real tamper script. An allowed call, an Emirates ID flag, a residency block, a record altered and then forged from outside the app, and the audit report.</p>
+    </div>
+    <div class="video">
+      <video controls preload="none" poster="/assets/poster-clean.jpg" playsinline>
+        <source src="/assets/sijil-live-demo.mp4" type="video/mp4">
+      </video>
+    </div>
+  </section>
+
+  <section class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">The problem</p>
+      <h2>Four questions every auditor asks. None answerable today.</h2>
+    </div>
+    <dl class="questions">
+      <div><dt>Which model version produced this?</dt><dd>Endpoints get updated in place. Nothing recorded which version answered.</dd></div>
+      <div><dt>Where did the inference run?</dt><dd>An API returns a response, not a location. Residency is asserted in a contract, never proven per call.</dd></div>
+      <div><dt>What policy was in force?</dt><dd>Policy lives in a document. Nothing binds its version to the call.</dd></div>
+      <div><dt>Who approved this model for this use?</dt><dd>An email thread or a committee minute, disconnected from the system that serves the model.</dd></div>
+    </dl>
+    <p class="after">So assurance happens by paperwork, after the fact, and risk functions slow AI deployments down.</p>
+  </section>
+
+  <section class="wrap" id="how">
+    <div class="section-head">
+      <p class="eyebrow">How it works</p>
+      <h2>Four things, on every call.</h2>
+    </div>
+    <ol class="steps">
+      <li><span class="n">1</span><h3>Check</h3><p>The call is evaluated against the policy in force: data residency, approved model weights, sensitive terms. Record-only or enforce, per rule, the entity's choice.</p></li>
+      <li><span class="n">2</span><h3>Seal</h3><p>Model version, node and region, policy hash, approval reference, and hashes of the input and output, signed with Ed25519 and chained to the record before it. Blocks are sealed too.</p></li>
+      <li><span class="n">3</span><h3>Verify</h3><p>A standalone verifier that shares no code with the writer walks the chain and returns pass, or the exact record and the reason it failed.</p></li>
+      <li><span class="n">4</span><h3>Report</h3><p>An A4 audit report for any period: calls by decision, policies and approvals in force, every exception, and the verifier's result.</p></li>
+    </ol>
+  </section>
+
+  <section class="wrap tamper">
+    <div class="section-head">
+      <p class="eyebrow">The part nobody can wave away</p>
+      <h2>Logs can be edited. This can't, without being caught.</h2>
+    </div>
+    <div class="terms">
+      <div class="term">
+        <p class="who">An insider edits a record in the database</p>
+        <pre><span class="p">$</span> scripts/tamper.sh alter 17
+alter    seq 17: output_hash rewritten
+
+<span class="fail">FAIL seq=17 content altered</span></pre>
+      </div>
+      <div class="term">
+        <p class="who">A smarter attacker recomputes the hash too</p>
+        <pre><span class="p">$</span> scripts/tamper.sh forge 17
+forge    seq 17: record_hash recomputed, no private key
+
+<span class="fail">FAIL seq=17 signature invalid</span></pre>
+      </div>
+    </div>
+    <p class="after">The hash adds up, but the attacker doesn't hold the node's signing key. And the checker isn't marking its own homework: it reimplements the spec independently of the software that wrote the records.</p>
+  </section>
+
+  <section class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Measured</p>
+      <h2>What it costs to run.</h2>
+    </div>
+    <div class="numbers">
+      <div><b>1.3<small>ms</small></b><span>Added latency per call, p95, over 100 calls</span></div>
+      <div><b>&lt;1<small>min</small></b><span>From install to first sealed record</span></div>
+      <div><b>750<small>KB</small></b><span>Storage per 1,000 records</span></div>
+      <div><b>0</b><span>Changes to model, app or runtime</span></div>
+    </div>
+    <p class="fine">Measured on an Apple M4 Pro laptop with Llama 3.2 3B Instruct (Q4_K_S) in LM Studio.</p>
+  </section>
+
+  <section class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Where it fits</p>
+      <h2>Attestation exists. It just doesn't reach you.</h2>
+      <p>Hyperscaler confidential inference is hardware-rooted and stronger than ours, inside their cloud. Governance platforms can't reach the runtime. Full-platform vendors bundle lineage with adoption. Where the entity owns the hardware, there is nothing integrated.</p>
+    </div>
+    <div class="fit">
+      <div class="card muted-card">
+        <h3>Not the accounts you take whole</h3>
+        <p>Where a customer adopts a platform end to end, they get lineage and audit with it. Sijil is redundant there, and we say so.</p>
+      </div>
+      <div class="card accent-card">
+        <h3>The accounts you can't</h3>
+        <p>Customers who built their own inference stack, or run a mixed estate they won't replace, have no attestation path. Nobody replaces a working stack to get an audit trail. Sijil covers these accounts without displacing anything.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="wrap boundaries">
+    <div class="section-head">
+      <p class="eyebrow">Honest boundaries</p>
+      <h2>What we prove, and what we don't yet.</h2>
+    </div>
+    <ul>
+      <li><b>Proven:</b> records have not been altered, reordered or removed from within the chain since they were sealed.</li>
+      <li><b>Not yet:</b> that the sealing itself was honest. Node identity and region are asserted and signed by the node, not bound to the silicon. Hardware root of trust, built on NVIDIA and TEE attestation, is the roadmap.</li>
+      <li><b>By design:</b> the record holds hashes of what was asked and answered, never the content itself.</li>
+    </ul>
+  </section>
+
+  <section class="ask" id="integrators">
+    <div class="wrap ask-inner">
+      <p class="eyebrow">For integrators bidding government AI work</p>
+      <h2>Name one opportunity where the customer keeps their own inference stack.</h2>
+      <p>We'll write the technical response section for it, at no cost, before any commercial agreement. You hold the customer relationship and the contract; we deploy under your delivery.</p>
+      <div class="ctas">
+        <a class="btn dark" href="/assets/sijil-partner-brief.pdf">Read the partner brief</a>
+        <a class="btn ghost" href="https://foundationflow.ai">foundationflow.ai</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="wrap foot">
+  <div class="brand"><img src="/assets/logo.png" alt="" width="26" height="26"><span>Sijil</span></div>
+  <p>Built by <b>FoundationFlow</b>: Shameer Thaha, Narayan Dhingra, Tavishi Bajaj, and Devin. Fish Tank · Hub71 · 2026.</p>
+  <p><a href="https://github.com/devinwarp/sijil-foundationflow">Source and build log on GitHub</a></p>
+</footer>
+
+<script src="/ledger.js" defer></script>
+</body>
+</html>
