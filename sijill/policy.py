@@ -10,6 +10,16 @@ from .record import MODES, sha256_hex
 
 RULE_TYPES = ("region_allowlist", "model_allowlist", "keyword_flag")
 
+# Reserved pseudo-rule id written to rule_hits when the model runtime failed.
+UPSTREAM_ERROR_HIT = "upstream_error"
+
+# Each rule type must carry one list-of-strings key; keyword terms must be non-empty.
+REQUIRED_KEYS = {
+    "region_allowlist": ("allow", False),
+    "model_allowlist": ("allow_digests", False),
+    "keyword_flag": ("terms", True),
+}
+
 
 @dataclass(frozen=True)
 class Policy:
@@ -35,6 +45,15 @@ def load(path: str | Path) -> Policy:
     for r in rules:
         if r.get("type") not in RULE_TYPES or r.get("mode") not in MODES or not r.get("id"):
             raise ValueError(f"invalid rule in {path}: {r}")
+        if r["id"] == UPSTREAM_ERROR_HIT:
+            raise ValueError(f"rule id {UPSTREAM_ERROR_HIT!r} is reserved in {path}")
+        key, non_empty = REQUIRED_KEYS[r["type"]]
+        vals = r.get(key)
+        if (not isinstance(vals, list) or not all(isinstance(v, str) for v in vals)
+                or (non_empty and not vals)):
+            raise ValueError(
+                f"rule {r['id']!r} in {path}: {key} must be a "
+                f"{'non-empty ' if non_empty else ''}list of strings")
     ids = [r["id"] for r in rules]
     if len(ids) != len(set(ids)):
         raise ValueError(f"duplicate rule ids in {path}")
