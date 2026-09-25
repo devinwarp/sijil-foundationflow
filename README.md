@@ -137,3 +137,12 @@ dashboard/   index.html
 scripts/     seed.py bench.py tamper.sh
 tests/       pytest: acceptance 1-7, known-answer vector, product-claim checks
 ```
+
+## License
+
+Sijil is **source-available**, dual-licensed by Shameer Thaha:
+
+- **Everything except `verifier/`**: [Business Source License 1.1](LICENSE). Free for evaluation, research, education, non-commercial use, and one 60-day pilot per organisation. Other production use needs a commercial license. Converts to Apache-2.0 on 2029-09-25.
+- **`verifier/`**: [Apache License 2.0](verifier/LICENSE). Free for any use, so auditors and regulators can check a chain with no agreement with us.
+
+Commercial licensing: **shameer@infinitebarakah.com**. Details in [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md).
