@@ -119,7 +119,7 @@
   <button id="ask-sensitive">Ask with Emirates ID</button>
   <label for="region-select">Node region</label>
   <select id="region-select">
-    <option>AE-AZ</option><option>AE-DU</option><option>US-VA</option><option>DE-HE</option>
+    <option>AE-AZ</option><option>AE-DU</option><option>SG</option>
   </select>
   <span id="last"></span>
 </section>
@@ -139,7 +139,7 @@
 <script>
 const PROMPTS = {
   plain: "What documents do I need to renew a trade licence?",
-  sensitive: "My Emirates ID expired last month. How do I renew it?",
+  sensitive: "My Emirates ID number is 784-1990-1234567-1. Can you check my application status?",
 };
 const MAX_ROWS = 300;
 const $ = (id) => document.getElementById(id);

@@ -42,7 +42,7 @@ The first run creates `node.key` (Ed25519 private key, mode 0600), `node.pub` an
 | `NODE_KEY_PATH` / `NODE_PUBKEY_PATH` | `node.key` / `node.pub` |
 | `SIJILL_MODEL` | `llama-3.2-3b-instruct` |
 | `SIJILL_MODELS_DIR` | LM Studio `downloadsFolder` |
-| `SIJILL_ENTITY` | `Demonstration Government Entity` (report) |
+| `SIJILL_ENTITY` | `Ministry of Citizen Services` (report) |
 
 ## Commands
 
@@ -64,7 +64,7 @@ python -m pytest                                                    # acceptance
 | `GET /api/policy` | Rules and modes, node id, current region |
 | `GET /api/verify` | Runs the verifier CLI as a subprocess and returns its output |
 | `POST /api/admin/policy/reload` | Re-reads `policy.yaml`. A mode change writes a `policy_change` record |
-| `POST /api/admin/node/region` | `{"region": "US-VA"}`. Writes a `policy_change` record |
+| `POST /api/admin/node/region` | `{"region": "SG"}`. Writes a `policy_change` record |
 | `GET /api/report?from=&to=` | The audit PDF |
 
 **The admin endpoints have no authentication.** This is a local demo build.
@@ -85,8 +85,8 @@ scripts/tamper.sh backup
 On stage, with the console on one side and the terminal on the other:
 
 1. **Policy.** `cat policy.yaml`: three rules, residency and approved models on `enforce`, sensitive terms on `record`.
-2. **Traffic.** Click *Ask a plain question* (allow), then *Ask with Emirates ID* (amber flag, still answered).
-3. **Residency.** Set the region selector to `US-VA`. The header turns red and a policy change row appears. Ask again: blocked, and the block is sealed too. Set it back to `AE-AZ`.
+2. **Traffic.** Click *Ask a plain question* (allow), then *Ask with Emirates ID* (amber flag, still answered). The question includes an ID number, but the record only stores its SHA-256 hash, never the text.
+3. **Residency.** Set the region selector to `SG`. The header turns red and a policy change row appears. Ask again: blocked, and the block is sealed too. Set it back to `AE-AZ`.
 4. **Tamper, the key moment.** In the terminal:
    ```bash
    scripts/tamper.sh alter 17      # verifier bar: FAIL seq=17 content altered

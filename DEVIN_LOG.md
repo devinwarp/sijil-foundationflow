@@ -215,8 +215,14 @@ Design decisions worth a human look:
 
 | Who | File | Change | Why |
 | --- | --- | --- | --- |
-| | `sijill/record.py` | Review and freeze: _pending_ | |
-| | | | |
+| Shameer | `docs/` | Chose `docs/README.md` over the older Build Spec as the source of truth | The newer spec adds the demo console, `/api/verify` and the tamper subcommands |
+| Shameer | `sijill/*` | Assigned the core to Devin instead of the engineer, with Narayan reviewing | Capacity on the day. Review of the cryptographic core stays with a human |
+| Shameer | `sijill/digest.py`, `policy.yaml` | Chose SHA-256 of the GGUF weights file as the model digest | LM Studio's API reports no content digest |
+| Shameer | `report/` | Chose WeasyPrint over reportlab | The spec calls for an HTML template rendered to PDF |
+| Shameer | repo, `.gitignore` | Public repo, with the PRD and pitch deck kept out of git | The PRD contains internal commercial notes |
+| Narayan | `sijill/record.py` | Review and freeze: _pending_ | |
+
+---
 
 # Session 3, 25 Sep 2026: engine lane (`narayan/core`)
 
@@ -263,3 +269,67 @@ Accepted as is: an in-flight inference that seals after a `policy_change` carrie
 | --- | --- | --- | --- |
 | Narayan | `sijill/record.py` | Review and freeze: _pending_ | |
 | Narayan | | | |
+
+---
+
+# Session 3 — 25 Sep 2026: demo content (Shameer's lane, `shameer/demo`)
+
+## Delegated (by Shameer)
+Branch `shameer/demo` from `devin/build`. Only edit `dashboard/`, `report/`, `scripts/seed.py`, `README.md` and `docs/`. Apply Shameer's entity name, preset questions and demo region. The console must never offer a way to alter records.
+
+## Choices (Devin offered options, Shameer picked)
+| Item | Choice |
+| --- | --- |
+| Report entity | Ministry of Citizen Services (fictional, fits the pitch's citizen-assistant opening) |
+| Plain preset | "What documents do I need to renew a trade licence?" |
+| Sensitive preset | "My Emirates ID number is 784-1990-1234567-1. Can you check my application status?" (a fictional number) |
+| Disallowed region | SG. A neutral non-UAE region, rather than US-VA, following the PRD's advice not to frame sovereignty as anti-US with a US lab on the panel |
+
+## What came back
+- `dashboard/index.html`: new sensitive preset. The region selector is now `AE-AZ`, `AE-DU`, `SG`. Still no controls that alter records, and the policy strip is still display-only.
+- `report/generate.py`: `SIJILL_ENTITY` now defaults to Ministry of Citizen Services.
+- `scripts/seed.py`: seeded sensitive calls use the same ID-number question.
+- `README.md` and `docs/shared/shameer-prompt.md` updated to match. The run-sheet now points out that the ID number is stored only as a SHA-256 hash.
+- Not touched, because they're Narayan's lane: `tests/test_proxy.py` still uses `US-VA` as its disallowed region. The API accepts any region code, so the tests are unaffected.
+
+## Verification
+- `pytest`: 33 passed.
+- Live run on a scratch DB with the real model: the ID-number question was flagged (`sensitive_terms`) and answered. Switching to SG wrote a `policy_change` record and the next call got a 403. The verifier passed with 8 records. The report masthead reads "Ministry of Citizen Services". A headless screenshot shows SG in red with "outside residency".
+- Checked that no record contains the raw text: `input_hash` holds only the digest.
+
+## What a human changed, and why
+| Who | File | Change | Why |
+| --- | --- | --- | --- |
+| Shameer | `dashboard/`, `README.md` | Chose SG instead of US-VA as the disallowed demo region | Frames residency as a gap, not a grievance. Avoids an anti-US reading with a US lab on the panel |
+| Shameer | `dashboard/`, `scripts/seed.py` | Chose a sensitive preset that includes an ID number | Makes the point that the record holds only a hash of what was sent |
+| Shameer | `report/generate.py` | Set the report entity to Ministry of Citizen Services (fictional) | Matches the pitch's opening question about a citizen-facing assistant |
+
+---
+
+# Session 4 — 25 Sep 2026: pitch deck v2 (Shameer's lane)
+
+## Delegated (by Shameer)
+Take the 13-slide Fish Tank pitch and the brand logo, and produce a new, livelier version optimised for a 5-minute slot with a clear commercialization next step. Use GSAP for animation. New file, not an edit of the original.
+
+## What came back
+- `docs/presentation/Sijil — Fish Tank pitch v2.html` (git-ignored with the rest of `docs/presentation/`). Single self-contained file: GSAP 3.12 from jsDelivr, Google Fonts (Inter, IBM Plex Mono), logo embedded as base64. `sijil-logo.png` saved alongside.
+- 13 slides cut to 10: cover → hook → four questions → the gap → how it works → live demo → numbers → who pays → commercialization roadmap → the ask. "Where we stop", "Assurance unblocks adoption" and "Not solved yet" were folded into the market and roadmap slides rather than dropped.
+- New commercialization slide: today (working product + partner brief) → 30 days (write the compliance section for one integrator bid, free) → 90 days (paid pilot on a FlowServe-operated stack) → 12 months (annual per-model licences + TEE/GPU attestation). The honest boundaries sit under it as a strip.
+- Live-demo slide doubles as the fallback: → steps through `alter 17` / `restore` / `forge 17` / `restore` with a chain visualisation and the verifier bar reading exactly what the CLI prints.
+- Presenter aids: 5-minute timer (amber at 4:00, red at 4:45; starts on leaving slide 1), speaker notes with target timestamps (N), fullscreen (F), URL hash per slide.
+- Brand: `#FF4F00` from the logo, dark base, orange full-bleed for the ask.
+
+## Verification
+- Headless Chrome via Playwright at 1920×1080: every slide rendered after its animation, all four demo steps exercised, zero page or console errors. Layout fixes made from the screenshots (headline wrapping, chain overflow, market slide overflow).
+- Numbers on the slides match `README.md` ("Measured"): p95 0.91 ms, ~770 bytes/record.
+
+## What a human changed, and why
+| Who | File | Change | Why |
+| --- | --- | --- | --- |
+| Shameer | | _pending review_ | |
+
+## Partner brief v2 (same session)
+- `docs/partner-brief/Partner Brief v2.html` and `Partner Brief v2.pdf`: the one-page leave-behind, restyled to match deck v2 (logo, `#FF4F00`, Inter + Plex Mono). Copy is the original `Partner Brief.md` with three additions: a "What you saw today" strip (0.9 ms p95, <1 min install, 750 KB per 1,000 records, zero changes to model/app/runtime), the per-model-per-year pricing line inside Honest boundaries, and Today / 30 days / 90 days steps inside Next step so the brief and the deck's commercialization slide say the same thing.
+- Rendered with headless Chrome (Playwright) rather than WeasyPrint, because the venv's WeasyPrint cannot find pango's `libgobject` in a non-login shell. `report/generate.py` is untouched.
+- Verified: exactly one A4 page, zero content overflow measured in the DOM before printing. The original `Partner Brief.md` / `.pdf` are left as they were.
+- Spelling: the brief uses "Sijil" (as the deck and logo file do); the codebase and the original brief use "Sijill". Flagged to Shameer to pick one.

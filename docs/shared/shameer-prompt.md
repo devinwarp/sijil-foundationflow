@@ -6,10 +6,11 @@
 ## Before handing anything to Devin
 
 1. Fix `.env`: it still has `LM_API_TOKEN=your-token-here`, which overrides the real token in `.env.local`. Delete the line or put the real token in.
-2. Decide the demo content:
-   - Entity name on the report (currently `Demonstration Government Entity`).
-   - The two console preset questions: a plain one, and one containing "Emirates ID".
-   - The disallowed region to show (currently `US-VA`; the allowed ones are `AE-AZ` and `AE-DU`).
+2. Demo content (decided and applied on `shameer/demo`):
+   - Report entity: **Ministry of Citizen Services**.
+   - Plain preset: "What documents do I need to renew a trade licence?"
+   - Sensitive preset: "My Emirates ID number is 784-1990-1234567-1. Can you check my application status?"
+   - Disallowed region: **SG**. The allowed regions are `AE-AZ` and `AE-DU`.
 
 ## Setup
 
