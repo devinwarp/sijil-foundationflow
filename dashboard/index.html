@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sijill — node console</title>
+<style>
+  :root {
+    --paper: #eef1ef;
+    --sheet: #f8faf9;
+    --ink: #14212b;
+    --muted: #5d6b73;
+    --rule: #cfd7d4;
+    --seal: #0f6b4f;
+    --flag: #a86a12;
+    --block: #b3261e;
+    --policy: #6b7780;
+    --display: "Avenir Next Condensed", "Avenir Next", "Helvetica Neue", Arial, sans-serif;
+    --body: "Avenir Next", "Helvetica Neue", Arial, sans-serif;
+    --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--paper); color: var(--ink); font: 500 17px/1.4 var(--body);
+    display: grid; grid-template-rows: auto auto auto 1fr auto; height: 100vh; overflow: hidden;
+  }
+  .band { padding: 14px 32px; border-bottom: 1px solid var(--rule); }
+
+  /* 1. Header */
+  header { display: flex; align-items: baseline; gap: 28px; padding-top: 18px; }
+  .mark { font: 700 34px/1 var(--display); letter-spacing: .02em; text-transform: uppercase; margin: 0; }
+  .mark small { font: 600 13px var(--body); letter-spacing: .12em; color: var(--muted); margin-left: 10px; }
+  .fact { display: flex; flex-direction: column; }
+  .fact .label { font: 600 11px var(--body); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+  .fact .value { font: 600 22px/1.2 var(--mono); }
+  .spacer { flex: 1; }
+  #region.outside { color: var(--block); }
+  #region.outside::after { content: "  outside residency"; font: 600 12px var(--body); letter-spacing: .08em; text-transform: uppercase; }
+  #count { font-size: 34px; font-variant-numeric: tabular-nums; }
+
+  /* 2. Policy strip — display only */
+  .policy { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 26px; background: var(--sheet); }
+  .rule { display: flex; align-items: baseline; gap: 8px; font: 600 15px var(--mono); }
+  .mode { font: 700 11px var(--body); letter-spacing: .12em; text-transform: uppercase; padding: 3px 7px; border: 1.5px solid currentColor; border-radius: 3px; }
+  .mode.enforce { color: var(--block); }
+  .mode.record { color: var(--muted); }
+  .policy .meta { margin-left: auto; color: var(--muted); font: 500 13px var(--mono); }
+
+  /* 3. Send panel */
+  .send { display: flex; align-items: center; gap: 12px; }
+  button, select {
+    font: 600 15px var(--body); color: var(--ink); background: var(--sheet); border: 1.5px solid var(--ink);
+    border-radius: 4px; padding: 9px 16px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: var(--ink); color: var(--sheet); }
+  button:disabled { opacity: .45; cursor: progress; }
+  :focus-visible { outline: 3px solid var(--seal); outline-offset: 2px; }
+  .send label { font: 600 11px var(--body); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin-left: 18px; }
+  #last { margin-left: 16px; font: 500 14px var(--mono); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* 4. Ledger */
+  .ledger { overflow-y: auto; padding: 0 32px; }
+  table { width: 100%; border-collapse: collapse; font: 500 17px var(--mono); }
+  thead th {
+    position: sticky; top: 0; background: var(--paper); text-align: left; padding: 12px 10px 8px;
+    font: 600 11px var(--body); letter-spacing: .14em; text-transform: uppercase; color: var(--muted);
+    border-bottom: 1.5px solid var(--ink);
+  }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+  td.seq { width: 7ch; text-align: right; font-variant-numeric: tabular-nums; }
+  td.time { width: 13ch; color: var(--muted); }
+  td.decision { width: 16ch; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+  td.hash { width: 30ch; }
+  td.empty { padding: 40px 10px; color: var(--muted); font-family: var(--body); text-align: center; }
+  tr { border-left: 5px solid transparent; transition: opacity .3s; }
+  tr.flag { border-left-color: var(--flag); } tr.flag td.decision { color: var(--flag); }
+  tr.block { border-left-color: var(--block); background: #b3261e0d; } tr.block td.decision { color: var(--block); }
+  tr.policy_change td { color: var(--policy); } tr.policy_change { border-left-color: var(--policy); }
+  tr.fresh { animation: arrive .5s ease-out; }
+  @keyframes arrive { from { background: #0f6b4f22; } to { background: transparent; } }
+
+  /* Signature: the break, shown in place */
+  tr.broken { outline: 3px solid var(--block); outline-offset: -3px; background: #b3261e14; }
+  tr.broken td.hash::after { content: "  ← broken here"; color: var(--block); font-weight: 700; font-family: var(--body); }
+  tr.after-break { opacity: .32; }
+
+  /* 5. Verifier bar */
+  footer { display: flex; align-items: center; gap: 24px; padding: 18px 32px; border-top: 3px solid var(--ink); background: var(--sheet); }
+  #verdict { flex: 1; font: 700 30px/1.2 var(--mono); letter-spacing: -.01em; transition: color .2s; }
+  #verdict.pass { color: var(--seal); } #verdict.fail { color: var(--block); }
+  #verdict .range { font-size: 17px; font-weight: 500; margin-left: 14px; }
+  #verdict .when { display: block; font: 500 12px var(--body); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+  footer button { font-size: 16px; padding: 12px 20px; }
+
+  @media (max-width: 900px) {
+    body { font-size: 15px; overflow: auto; height: auto; display: block; }
+    header, .send { flex-wrap: wrap; }
+    #verdict { font-size: 20px; }
+    td.time { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+
+<header class="band">
+  <h1 class="mark">Sijill<small>Node console</small></h1>
+  <div class="fact"><span class="label">Node</span><span class="value" id="node">—</span></div>
+  <div class="fact"><span class="label">Region</span><span class="value" id="region">—</span></div>
+  <div class="spacer"></div>
+  <div class="fact"><span class="label">Records sealed</span><span class="value" id="count">0</span></div>
+</header>
+
+<section class="band policy" id="policy" aria-label="Policy in force"></section>
+
+<section class="band send" aria-label="Send a call">
+  <button id="ask-plain">Ask a plain question</button>
+  <button id="ask-sensitive">Ask with Emirates ID</button>
+  <label for="region-select">Node region</label>
+  <select id="region-select">
+    <option>AE-AZ</option><option>AE-DU</option><option>US-VA</option><option>DE-HE</option>
+  </select>
+  <span id="last"></span>
+</section>
+
+<main class="ledger">
+  <table>
+    <thead><tr><th>Seq</th><th>Time</th><th>Decision</th><th>Rules hit</th><th>Record hash</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</main>
+
+<footer>
+  <div id="verdict">Verifying…<span class="when">Independent verifier</span></div>
+  <button id="report">Generate report</button>
+</footer>
+
+<script>
+const PROMPTS = {
+  plain: "What documents do I need to renew a trade licence?",
+  sensitive: "My Emirates ID expired last month. How do I renew it?",
+};
+const MAX_ROWS = 300;
+const $ = (id) => document.getElementById(id);
+const rowsEl = $("rows");
+let lastSeq = 0, model = "llama-3.2-3b-instruct", brokenSeq = null, firstLoad = true;
+
+function label(rec) {
+  const hits = JSON.parse(rec.rule_hits || "[]");
+  if (rec.type === "policy_change") return hits.length ? `${hits.join(", ")} mode changed` : `region → ${rec.node_region}`;
+  return hits.join(", ") || "—";
+}
+
+function row(rec) {
+  const tr = document.createElement("tr");
+  tr.dataset.seq = rec.seq;
+  tr.className = rec.type === "policy_change" ? "policy_change" : rec.decision;
+  if (!firstLoad) tr.classList.add("fresh");
+  const cells = [
+    ["seq", rec.seq],
+    ["time", rec.ts.slice(11, 23)],
+    ["decision", rec.type === "policy_change" ? "policy change" : rec.decision],
+    ["rules", label(rec)],
+    ["hash", rec.record_hash.slice(0, 12)],
+  ];
+  for (const [cls, text] of cells) {
+    const td = document.createElement("td");
+    td.className = cls; td.textContent = text; tr.appendChild(td);
+  }
+  return tr;
+}
+
+function markBreak() {
+  for (const tr of rowsEl.children) {
+    const seq = Number(tr.dataset.seq);
+    tr.classList.toggle("broken", brokenSeq !== null && seq === brokenSeq);
+    tr.classList.toggle("after-break", brokenSeq !== null && seq > brokenSeq);
+  }
+}
+
+async function getJSON(url, opts) {
+  const r = await fetch(url, opts);
+  return { status: r.status, headers: r.headers, body: await r.json().catch(() => ({})) };
+}
+
+async function pollRecords() {
+  const { body } = await getJSON(`/api/records?since=${lastSeq}&limit=${MAX_ROWS}`);
+  $("count").textContent = (body.total ?? 0).toLocaleString("en-US");
+  for (const rec of body.records || []) {
+    rowsEl.prepend(row(rec));
+    lastSeq = rec.seq;
+  }
+  while (rowsEl.children.length > MAX_ROWS) rowsEl.lastChild.remove();
+  if (!rowsEl.querySelector("tr[data-seq]")) {
+    rowsEl.innerHTML = '<tr><td class="empty" colspan="5">No records sealed yet. Send a call to seal the first one.</td></tr>';
+  } else rowsEl.querySelector("td.empty")?.parentElement.remove();
+  firstLoad = false;
+  markBreak();
+}
+
+async function pollPolicy() {
+  const { body: p } = await getJSON("/api/policy");
+  model = p.model;
+  $("node").textContent = p.node_id;
+  $("region").textContent = p.region;
+  $("region").classList.toggle("outside", !p.region_allowed);
+  if (document.activeElement !== $("region-select")) {
+    const sel = $("region-select");
+    if (![...sel.options].some((o) => o.value === p.region)) sel.add(new Option(p.region));
+    sel.value = p.region;
+  }
+  const strip = $("policy");
+  strip.replaceChildren(...p.rules.map((r) => {
+    const el = document.createElement("span");
+    el.className = "rule";
+    el.innerHTML = `<span></span><span class="mode ${r.mode}">${r.mode}</span>`;
+    el.firstChild.textContent = r.id;
+    return el;
+  }));
+  const meta = document.createElement("span");
+  meta.className = "meta";
+  meta.textContent = `${p.policy_id} · ${p.approval_ref} · policy ${p.policy_hash.slice(0, 12)}`;
+  strip.appendChild(meta);
+}
+
+async function pollVerify() {
+  const { body: v } = await getJSON("/api/verify");
+  const el = $("verdict");
+  el.className = v.ok ? "pass" : "fail";
+  const out = v.output || "Verifier returned no output. Check that the proxy can run verifier/sijill_verify.py.";
+  const split = out.indexOf(" first=");
+  el.textContent = split > 0 ? out.slice(0, split) : out;
+  if (split > 0) {
+    const range = document.createElement("span");
+    range.className = "range";
+    range.textContent = out.slice(split + 1);
+    el.appendChild(range);
+  }
+  const when = document.createElement("span");
+  when.className = "when";
+  when.textContent = `Independent verifier · checked ${(v.checked_at || "").slice(11, 19)} UTC`;
+  el.appendChild(when);
+  const m = !v.ok && /seq=(\d+)/.exec(v.output || "");
+  brokenSeq = m ? Number(m[1]) : null;
+  markBreak();
+}
+
+async function ask(kind, button) {
+  button.disabled = true;
+  const started = performance.now();
+  try {
+    const r = await getJSON("/v1/chat/completions", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, max_tokens: 64, messages: [{ role: "user", content: PROMPTS[kind] }] }),
+    });
+    const secs = ((performance.now() - started) / 1000).toFixed(1);
+    const seq = r.headers.get("x-sijill-seq") ?? "?";
+    const decision = r.headers.get("x-sijill-decision") ?? `HTTP ${r.status}`;
+    const answer = r.body.choices?.[0]?.message?.content?.replace(/\s+/g, " ") ?? r.body.error?.message ?? "";
+    $("last").textContent = `seq ${seq} · ${decision} · ${secs}s · ${answer}`;
+  } catch (e) {
+    $("last").textContent = `Proxy unreachable: ${e.message}`;
+  } finally {
+    button.disabled = false;
+    pollRecords();
+  }
+}
+
+$("ask-plain").onclick = (e) => ask("plain", e.currentTarget);
+$("ask-sensitive").onclick = (e) => ask("sensitive", e.currentTarget);
+$("region-select").onchange = async (e) => {
+  await getJSON("/api/admin/node/region", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ region: e.target.value }),
+  });
+  e.target.blur();
+  pollPolicy(); pollRecords();
+};
+$("report").onclick = () => window.open("/api/report", "_blank");
+
+function every(ms, fn) {
+  const tick = () => fn().catch(() => {}).finally(() => setTimeout(tick, ms));
+  tick();
+}
+every(1000, pollRecords);
+every(1000, pollPolicy);
+every(2000, pollVerify);
+</script>
+</body>
+</html>
