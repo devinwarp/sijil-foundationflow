@@ -116,7 +116,7 @@ def main() -> int:
     ap.add_argument("--pubkey", default=os.environ.get("NODE_PUBKEY_PATH", "node.pub"))
     ap.add_argument("--from", dest="ts_from", help="YYYY-MM-DD or ISO timestamp (default: first record)")
     ap.add_argument("--to", dest="ts_to", help="YYYY-MM-DD or ISO timestamp (default: last record)")
-    ap.add_argument("--entity", default=os.environ.get("SIJILL_ENTITY", "Demonstration Government Entity"))
+    ap.add_argument("--entity", default=os.environ.get("SIJILL_ENTITY", "Ministry of Citizen Services"))
     ap.add_argument("--out", default="sijill-report.pdf")
     args = ap.parse_args()
     ctx = collect(args.db, args.pubkey, bound(args.ts_from, False), bound(args.ts_to, True), args.entity)

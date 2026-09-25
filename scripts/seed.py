@@ -20,7 +20,7 @@ PLAIN = [
     "What is the process for requesting a copy of a birth certificate?",
 ]
 SENSITIVE = [
-    "My Emirates ID expired last month. How do I renew it?",
+    "My Emirates ID number is 784-1990-1234567-1. Can you check my application status?",
     "Can I use my passport number instead of my visa number on the form?",
 ]
 

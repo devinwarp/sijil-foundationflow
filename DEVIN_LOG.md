@@ -217,3 +217,35 @@ Design decisions worth a human look:
 | --- | --- | --- | --- |
 | | `sijill/record.py` | Review and freeze: _pending_ | |
 | | | | |
+
+---
+
+# Session 3 — 25 Sep 2026: demo content (Shameer's lane, `shameer/demo`)
+
+## Delegated (by Shameer)
+Branch `shameer/demo` from `devin/build`. Only edit `dashboard/`, `report/`, `scripts/seed.py`, `README.md` and `docs/`. Apply Shameer's entity name, preset questions and demo region. The console must never offer a way to alter records.
+
+## Choices (Devin offered options, Shameer picked)
+| Item | Choice |
+| --- | --- |
+| Report entity | Ministry of Citizen Services (fictional, fits the pitch's citizen-assistant opening) |
+| Plain preset | "What documents do I need to renew a trade licence?" |
+| Sensitive preset | "My Emirates ID number is 784-1990-1234567-1. Can you check my application status?" (a fictional number) |
+| Disallowed region | SG. A neutral non-UAE region, rather than US-VA, following the PRD's advice not to frame sovereignty as anti-US with a US lab on the panel |
+
+## What came back
+- `dashboard/index.html`: new sensitive preset. The region selector is now `AE-AZ`, `AE-DU`, `SG`. Still no controls that alter records, and the policy strip is still display-only.
+- `report/generate.py`: `SIJILL_ENTITY` now defaults to Ministry of Citizen Services.
+- `scripts/seed.py`: seeded sensitive calls use the same ID-number question.
+- `README.md` and `docs/shared/shameer-prompt.md` updated to match. The run-sheet now points out that the ID number is stored only as a SHA-256 hash.
+- Not touched, because they're Narayan's lane: `tests/test_proxy.py` still uses `US-VA` as its disallowed region. The API accepts any region code, so the tests are unaffected.
+
+## Verification
+- `pytest`: 33 passed.
+- Live run on a scratch DB with the real model: the ID-number question was flagged (`sensitive_terms`) and answered. Switching to SG wrote a `policy_change` record and the next call got a 403. The verifier passed with 8 records. The report masthead reads "Ministry of Citizen Services". A headless screenshot shows SG in red with "outside residency".
+- Checked that no record contains the raw text: `input_hash` holds only the digest.
+
+## What a human changed, and why
+| Who | File | Change | Why |
+| --- | --- | --- | --- |
+| | | | |
