@@ -255,3 +255,27 @@ Branch `shameer/demo` from `devin/build`. Only edit `dashboard/`, `report/`, `sc
 | Shameer | `dashboard/`, `README.md` | Chose SG instead of US-VA as the disallowed demo region | Frames residency as a gap, not a grievance. Avoids an anti-US reading with a US lab on the panel |
 | Shameer | `dashboard/`, `scripts/seed.py` | Chose a sensitive preset that includes an ID number | Makes the point that the record holds only a hash of what was sent |
 | Shameer | `report/generate.py` | Set the report entity to Ministry of Citizen Services (fictional) | Matches the pitch's opening question about a citizen-facing assistant |
+
+---
+
+# Session 4 — 25 Sep 2026: pitch deck v2 (Shameer's lane)
+
+## Delegated (by Shameer)
+Take the 13-slide Fish Tank pitch and the brand logo, and produce a new, livelier version optimised for a 5-minute slot with a clear commercialization next step. Use GSAP for animation. New file, not an edit of the original.
+
+## What came back
+- `docs/presentation/Sijil — Fish Tank pitch v2.html` (git-ignored with the rest of `docs/presentation/`). Single self-contained file: GSAP 3.12 from jsDelivr, Google Fonts (Inter, IBM Plex Mono), logo embedded as base64. `sijil-logo.png` saved alongside.
+- 13 slides cut to 10: cover → hook → four questions → the gap → how it works → live demo → numbers → who pays → commercialization roadmap → the ask. "Where we stop", "Assurance unblocks adoption" and "Not solved yet" were folded into the market and roadmap slides rather than dropped.
+- New commercialization slide: today (working product + partner brief) → 30 days (write the compliance section for one integrator bid, free) → 90 days (paid pilot on a FlowServe-operated stack) → 12 months (annual per-model licences + TEE/GPU attestation). The honest boundaries sit under it as a strip.
+- Live-demo slide doubles as the fallback: → steps through `alter 17` / `restore` / `forge 17` / `restore` with a chain visualisation and the verifier bar reading exactly what the CLI prints.
+- Presenter aids: 5-minute timer (amber at 4:00, red at 4:45; starts on leaving slide 1), speaker notes with target timestamps (N), fullscreen (F), URL hash per slide.
+- Brand: `#FF4F00` from the logo, dark base, orange full-bleed for the ask.
+
+## Verification
+- Headless Chrome via Playwright at 1920×1080: every slide rendered after its animation, all four demo steps exercised, zero page or console errors. Layout fixes made from the screenshots (headline wrapping, chain overflow, market slide overflow).
+- Numbers on the slides match `README.md` ("Measured"): p95 0.91 ms, ~770 bytes/record.
+
+## What a human changed, and why
+| Who | File | Change | Why |
+| --- | --- | --- | --- |
+| Shameer | | _pending review_ | |
