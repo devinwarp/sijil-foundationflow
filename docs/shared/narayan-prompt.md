@@ -52,3 +52,30 @@ echo "LM_API_TOKEN=<your LM Studio token>" > .env.local
   ```
 - Fill in your rows of the "What a human changed, and why" table at the end of `DEVIN_LOG.md`.
 - Merge order: `narayan/core` into `devin/build` first, then `shameer/demo`, then everything into `main`.
+
+## `record.py` review checklist (do this yourself, about 20 minutes)
+
+Deck slide 7/8 says you reviewed and froze the sealing logic, and `DEVIN_LOG.md` still marks it _pending_. Check each item against "Record schema" and "Canonicalisation and hashing" in `docs/README.md`:
+
+1. `FIELDS` lists exactly the 18 spec fields, spelled as in the spec.
+2. `canonical_json` is `json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")`, and nothing else.
+3. `compute_record_hash` excludes `record_hash` and `signature` only.
+4. `_validate` makes `seq` the only integer. Every other field must be a string, and type, mode and decision are limited to the spec values.
+5. The signature is Ed25519 over `bytes.fromhex(record_hash)`, the 32 raw bytes, not the hex text, and is stored hex-encoded.
+6. `now_ts()` gives UTC with milliseconds and a `Z` suffix. `GENESIS_HASH` is 64 zeros.
+7. The caller supplies the chain link: `Node.seal` in `proxy.py` takes `seq` and `prev_hash` from the in-memory head, under the lock.
+8. Cross-check with a third implementation, independent of both `record.py` and the verifier:
+   ```bash
+   python - <<'PY'
+   import hashlib, json, sqlite3
+   db = sqlite3.connect("sijill.db")
+   db.row_factory = sqlite3.Row
+   r = dict(db.execute("SELECT * FROM records WHERE seq = 1").fetchone())
+   body = {k: v for k, v in r.items() if k not in ("record_hash", "signature")}
+   print(hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest() == r["record_hash"])
+   PY
+   ```
+   It should print `True`.
+9. `python -m pytest tests/test_record.py tests/test_verifier.py` passes. The known-answer vector in `test_record.py` was computed with the verifier's code, not `record.py`'s.
+
+Then replace the _pending_ row in the Session 2 table of `DEVIN_LOG.md`, for example: `| Narayan | sijill/record.py | Reviewed against the spec, items 1-9; no changes (or: changed X) | Correctness-critical; frozen from here |`.
