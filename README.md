@@ -2,6 +2,10 @@
 
 Inference attestation for AI running on infrastructure you own.
 
+[![Watch the live demo (1:16, narrated)](docs/media/sijil-live-demo-poster.jpg)](docs/media/sijil-live-demo.mp4)
+
+*Live demo, 1:16: an allowed call, an Emirates ID flag, a residency block, a record altered and then forged outside the app and caught by the independent verifier, and the audit report. Recorded against the real proxy and a local Llama 3.2 3B.*
+
 Sijill is a proxy in front of an OpenAI-compatible model endpoint. It evaluates every call against a policy, forwards or blocks it, and seals a signed, hash-chained record of it. An independent verifier proves the chain is intact or names the exact record that broke. A report generator produces an A4 audit PDF for a date range. Everything runs locally on one machine.
 
 The build spec is [`docs/README.md`](docs/README.md). The session log for the judges is [`DEVIN_LOG.md`](DEVIN_LOG.md).
