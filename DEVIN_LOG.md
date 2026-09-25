@@ -215,8 +215,12 @@ Design decisions worth a human look:
 
 | Who | File | Change | Why |
 | --- | --- | --- | --- |
-| | `sijill/record.py` | Review and freeze: _pending_ | |
-| | | | |
+| Shameer | `docs/` | Chose `docs/README.md` over the older Build Spec as the source of truth | The newer spec adds the demo console, `/api/verify` and the tamper subcommands |
+| Shameer | `sijill/*` | Assigned the core to Devin instead of the engineer, with Narayan reviewing | Capacity on the day. Review of the cryptographic core stays with a human |
+| Shameer | `sijill/digest.py`, `policy.yaml` | Chose SHA-256 of the GGUF weights file as the model digest | LM Studio's API reports no content digest |
+| Shameer | `report/` | Chose WeasyPrint over reportlab | The spec calls for an HTML template rendered to PDF |
+| Shameer | repo, `.gitignore` | Public repo, with the PRD and pitch deck kept out of git | The PRD contains internal commercial notes |
+| Narayan | `sijill/record.py` | Review and freeze: _pending_ | |
 
 ---
 
@@ -248,4 +252,6 @@ Branch `shameer/demo` from `devin/build`. Only edit `dashboard/`, `report/`, `sc
 ## What a human changed, and why
 | Who | File | Change | Why |
 | --- | --- | --- | --- |
-| | | | |
+| Shameer | `dashboard/`, `README.md` | Chose SG instead of US-VA as the disallowed demo region | Frames residency as a gap, not a grievance. Avoids an anti-US reading with a US lab on the panel |
+| Shameer | `dashboard/`, `scripts/seed.py` | Chose a sensitive preset that includes an ID number | Makes the point that the record holds only a hash of what was sent |
+| Shameer | `report/generate.py` | Set the report entity to Ministry of Citizen Services (fictional) | Matches the pitch's opening question about a citizen-facing assistant |
