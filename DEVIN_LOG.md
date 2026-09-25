@@ -220,7 +220,7 @@ Design decisions worth a human look:
 | Shameer | `sijill/digest.py`, `policy.yaml` | Chose SHA-256 of the GGUF weights file as the model digest | LM Studio's API reports no content digest |
 | Shameer | `report/` | Chose WeasyPrint over reportlab | The spec calls for an HTML template rendered to PDF |
 | Shameer | repo, `.gitignore` | Public repo, with the PRD and pitch deck kept out of git | The PRD contains internal commercial notes |
-| Narayan | `sijill/record.py` | Review and freeze: _pending_ | |
+| Narayan | `sijill/record.py` | Reviewed and frozen at `4498177`, 25 Sep 2026. No code change. | Checked line by line against `docs/README.md` "Record schema" and "Canonicalisation and hashing": 18 fields, genesis `prev_hash`, the three enums, canonical JSON flags, millisecond UTC timestamps, `record_hash` over every field except `record_hash` and `signature`, Ed25519 over the 32 raw hash bytes, `seq` as the only integer. Confirmed `verifier/sijill_verify.py` reimplements this independently and the known-answer vector in `tests/test_record.py` agrees. The core the judges see was checked by a human, not by the tool that wrote it. |
 
 ---
 
@@ -267,8 +267,8 @@ Accepted as is: an in-flight inference that seals after a `policy_change` carrie
 
 | Who | File | Change | Why |
 | --- | --- | --- | --- |
-| Narayan | `sijill/record.py` | Review and freeze: _pending_ | |
-| Narayan | | | |
+| Narayan | `sijill/record.py` | Review complete, frozen at `4498177` (see the Session 2 table above for the checklist). No change. | Human sign-off on the cryptographic core before anything in this session built on it. |
+| Narayan | `sijill/proxy.py`, `sijill/policy.py` | Decided the two open questions and the four review fixes (tables above), delegated the implementation, reviewed the result. Sent one change back: a `null` message content had been treated as a malformed reply (502); it is a valid OpenAI shape and now hashes `""`. | Devin's first pass would have turned legitimate tool-call replies into recorded failures. Caught in human review of the diff. |
 
 ---
 
@@ -359,4 +359,4 @@ Pull Narayan's `narayan/core`, review it, and merge both lanes into `main`.
 - `bench.py` (Narayan couldn't run it, as LM Studio was down on his machine): 100 calls, overhead p50 0.81 ms, p95 1.31 ms. End-to-end p50 94 ms.
 
 ## Still open
-- Narayan's review and freeze of `sijill/record.py` is still marked _pending_. Slide 8 of the deck says it was done.
+- ~~Narayan's review and freeze of `sijill/record.py`~~: done, frozen at `4498177` (merged from `narayan/core`, `ea581a2`).
