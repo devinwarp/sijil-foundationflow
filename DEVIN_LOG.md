@@ -215,7 +215,7 @@ Design decisions worth a human look:
 
 | Who | File | Change | Why |
 | --- | --- | --- | --- |
-| | `sijill/record.py` | Review and freeze: _pending_ | |
+| Narayan | `sijill/record.py` | Reviewed and frozen at `4498177`, 25 Sep 2026. No code change. | Checked line by line against `docs/README.md` "Record schema" and "Canonicalisation and hashing": 18 fields, genesis `prev_hash`, the three enums, canonical JSON flags, millisecond UTC timestamps, `record_hash` over every field except `record_hash` and `signature`, Ed25519 over the 32 raw hash bytes, `seq` as the only integer. Confirmed `verifier/sijill_verify.py` reimplements this independently and the known-answer vector in `tests/test_record.py` agrees. The core the judges see was checked by a human, not by the tool that wrote it. |
 | | | | |
 
 # Session 3, 25 Sep 2026: engine lane (`narayan/core`)
@@ -261,5 +261,5 @@ Accepted as is: an in-flight inference that seals after a `policy_change` carrie
 
 | Who | File | Change | Why |
 | --- | --- | --- | --- |
-| Narayan | `sijill/record.py` | Review and freeze: _pending_ | |
-| Narayan | | | |
+| Narayan | `sijill/record.py` | Review complete, frozen at `4498177` (see the Session 2 table above for the checklist). No change. | Human sign-off on the cryptographic core before anything in this session built on it. |
+| Narayan | `sijill/proxy.py`, `sijill/policy.py` | Decided the two open questions and the four review fixes (tables above), delegated the implementation, reviewed the result. Sent one change back: a `null` message content had been treated as a malformed reply (502); it is a valid OpenAI shape and now hashes `""`. | Devin's first pass would have turned legitimate tool-call replies into recorded failures. Caught in human review of the diff. |
