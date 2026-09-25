@@ -89,6 +89,24 @@ def node(tmp_path):
         yield client, settings
 
 
+@pytest.fixture
+def node_with(tmp_path):
+    """Factory: node_with(handler) -> (TestClient, settings) on one shared db/policy.
+
+    Enter the client with `with client:`; each app on the same paths sees the
+    previous app's chain, so restarts exercise the startup policy-drift path.
+    """
+    def make(handler):
+        if not (tmp_path / "policy.yaml").exists():
+            shutil.copy(ROOT / "policy.yaml", tmp_path / "policy.yaml")
+        settings = Settings(db_path=str(tmp_path / "sijill.db"), policy_path=str(tmp_path / "policy.yaml"),
+                            key_path=str(tmp_path / "node.key"), pubkey_path=str(tmp_path / "node.pub"),
+                            upstream="http://model.test/v1")
+        app = create_app(settings, transport=httpx.MockTransport(handler), resolver=StubResolver())
+        return TestClient(app), settings
+    return make
+
+
 def ask(client, content: str, model: str = MODEL):
     return client.post("/v1/chat/completions",
                        json={"model": model, "messages": [{"role": "user", "content": content}], "max_tokens": 16})

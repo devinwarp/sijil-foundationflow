@@ -28,6 +28,9 @@ from .store import Store
 ROOT = Path(__file__).resolve().parent.parent
 VERIFIER = ROOT / "verifier" / "sijill_verify.py"
 REPORT = ROOT / "report" / "generate.py"
+
+# Error type used in {"error": {"type": ...}} bodies when the model runtime failed.
+UPSTREAM_ERROR_TYPE = "upstream_error"
 DASHBOARD = ROOT / "dashboard" / "index.html"
 
 
@@ -53,6 +56,7 @@ class Settings:
             upstream=e("LMSTUDIO_BASE_URL", cls.upstream),
             upstream_token=e("LM_API_TOKEN", ""),
             default_model=e("SIJILL_MODEL", cls.default_model),
+            upstream_timeout=float(e("UPSTREAM_TIMEOUT", cls.upstream_timeout)),
         )
 
 
@@ -90,6 +94,19 @@ class Node:
             self.head = (rec["seq"], rec["record_hash"])
             return rec
 
+    async def adopt_policy(self, new: policy.Policy, old_hash: str,
+                           old: policy.Policy | None) -> dict | None:
+        """Put `new` in force; seal a policy_change record iff the policy hash moved.
+
+        `old` is the previous Policy object when known (reload), else None (startup,
+        where only the previous hash survives), in which case rule_hits is empty.
+        """
+        self.policy = new
+        if new.hash == old_hash:
+            return None
+        hits = policy.mode_changes(old, new) if old else []
+        return await self.seal(self.body(new, "policy_change", rule_hits=policy.rule_hits_json(hits)))
+
     async def aclose(self) -> None:
         await self.client.aclose()
         self.store.close()
@@ -102,6 +119,10 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.node = Node(settings, transport, resolver)
+        n = app.state.node
+        last = n.store.last()
+        if last and last["policy_hash"] != n.policy.hash:
+            await n.adopt_policy(n.policy, old_hash=last["policy_hash"], old=None)
         yield
         await app.state.node.aclose()
 
@@ -143,25 +164,43 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 "sijill": {"seq": rec["seq"], "decision": "block", "rule_hits": hits,
                            "record_hash": rec["record_hash"]}})
 
+        async def upstream_failed(status: int, content: dict, upstream_ms: float):
+            """Seal the call marked with the reserved upstream-error hit and respond."""
+            rec = await n.seal({**body, "rule_hits": policy.rule_hits_json(
+                hits + [policy.UPSTREAM_ERROR_HIT])})
+            return JSONResponse(status_code=status, headers=headers(rec, upstream_ms), content=content)
+
         t1 = perf_counter()
         try:
             resp = await n.client.post("/chat/completions", json={**payload, "model": model_id})
         except httpx.HTTPError as e:
-            upstream_ms = (perf_counter() - t1) * 1000
-            rec = await n.seal(body)
-            return JSONResponse(status_code=502, headers=headers(rec, upstream_ms),
-                                content={"error": {"message": f"model runtime unreachable: {e!r}",
-                                                   "type": "upstream_error"}})
+            return await upstream_failed(
+                502, {"error": {"message": f"model runtime unreachable: {e!r}",
+                                "type": UPSTREAM_ERROR_TYPE}}, (perf_counter() - t1) * 1000)
         upstream_ms = (perf_counter() - t1) * 1000
 
         if resp.status_code != 200:
-            rec = await n.seal(body)
-            return JSONResponse(status_code=resp.status_code, headers=headers(rec, upstream_ms),
-                                content=resp.json() if resp.headers.get("content-type", "").startswith(
-                                    "application/json") else {"error": {"message": resp.text}})
+            return await upstream_failed(
+                resp.status_code,
+                resp.json() if resp.headers.get("content-type", "").startswith("application/json")
+                else {"error": {"message": resp.text}},
+                upstream_ms)
 
-        data = resp.json()
-        text = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        # `content` absent or null is a valid OpenAI shape (tool calls): hash "".
+        try:
+            data = resp.json()
+            message = data["choices"][0]["message"]
+            if not isinstance(message, dict):
+                raise TypeError("malformed choice")
+            text = message.get("content")
+            text = "" if text is None else text
+            if not isinstance(text, str):
+                raise TypeError("message content is not a string or null")
+        except (ValueError, KeyError, IndexError, TypeError):
+            return await upstream_failed(
+                502, {"error": {"message": "model runtime returned a malformed response",
+                                "type": UPSTREAM_ERROR_TYPE}}, upstream_ms)
+
         rec = await n.seal({**body, "output_hash": record.output_hash(text)})
         return JSONResponse(content=data, headers=headers(rec, upstream_ms))
 
@@ -197,9 +236,9 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             new = policy.load(settings.policy_path)
         except Exception as e:
             raise HTTPException(400, f"policy not loaded: {e}")
-        changed = policy.mode_changes(n.policy, new)
-        n.policy = new
-        rec = await n.seal(n.body(new, "policy_change", rule_hits=policy.rule_hits_json(changed))) if changed else None
+        old = n.policy
+        rec = await n.adopt_policy(new, old_hash=old.hash, old=old)
+        changed = policy.mode_changes(old, new)
         return {"changed": changed, "seq": rec and rec["seq"], "policy_hash": new.hash}
 
     @app.post("/api/admin/node/region")
