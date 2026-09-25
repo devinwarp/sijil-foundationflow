@@ -1,0 +1,20 @@
+policy_id: gov-assistant
+version_label: "2026-09-25.1"
+approval_ref: "APR-0147"
+node:
+  id: "auh-node-01"
+  region: "AE-AZ"
+rules:
+  - id: residency
+    type: region_allowlist
+    allow: ["AE-AZ", "AE-DU"]
+    mode: enforce
+  - id: approved_models
+    type: model_allowlist
+    # SHA-256 of Llama-3.2-3B-Instruct-Q4_K_S.gguf (unsloth), as served by LM Studio
+    allow_digests: ["sha256:0fbba6b2d3fb9d319e546e91f7f04c44ce8278f1c2a133ca6db1e76619256be1"]
+    mode: enforce
+  - id: sensitive_terms
+    type: keyword_flag
+    terms: ["emirates id", "passport number"]
+    mode: record

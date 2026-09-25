@@ -1,5 +1,7 @@
 # Sijill — Build Spec
 
+> **SUPERSEDED.** This is an earlier draft. The source of truth for implementation is [`docs/README.md`](../README.md), which adds `/api/policy`, `/api/verify`, the demo console, and the `tamper.sh` subcommands. Do not build from this file.
+
 *For Devin or any coding agent. Self-contained: build from this document alone. Where this spec and the PRD disagree, this spec wins for implementation; the PRD wins for positioning.*
 
 ## Objective
