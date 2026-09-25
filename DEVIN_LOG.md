@@ -163,3 +163,57 @@ The Build Spec also indicates remaining Devin tasks:
 - README with setup and demo steps
 
 However, the immediate task from the first prompt is complete: "Stop and report when tests 1–4 pass."
+
+---
+
+# Session 2 — 25 Sep 2026: full build
+
+## Delegated (by Shameer)
+Initialise git and create `devinwarp/sijil-foundationflow` (public). Build to `docs/README.md` (the newer spec). Fix the gaps found in session 1's work. Devin also builds the correctness-critical core (`record.py`, `store.py`, `keys.py`, `policy.py`, `proxy.py`), which the spec assigned to the engineer, with a human review of `record.py` before freeze. Model digest = SHA-256 of the GGUF file. Report via WeasyPrint.
+
+## Clarifying questions Devin asked, and the answers
+| Question | Answer |
+| --- | --- |
+| Repo visibility | Public |
+| Which docs to commit | Specs and partner brief. PRD and pitch deck stay local (internal commercial notes) |
+| Which spec wins | `docs/README.md`. The older Build Spec is now marked superseded |
+| Layout | Flat: repo root is the project, package at `./sijill/` |
+| Who writes the core | Devin, with Narayan reviewing and owning it |
+| Model digest source | SHA-256 of the weights file on disk (LM Studio's API reports none) |
+
+## Gaps found in session 1's work, and fixed
+- Test 2 ran `SET output_hash = 'd' * 64`. In SQLite that stores the integer `0`, so the test passed for the wrong reason. It now writes a real 64-char value and asserts it landed.
+- Fixture timestamps weren't millisecond UTC (`+00:00`, no ms). All records now use `2026-09-25T10:00:00.123Z`.
+- The verifier crashed on a missing DB or table, read `SELECT *` (so extra columns changed the hash), and added text to the seq-1 failure line. It now reads only the spec's columns, opens the DB read-only, prints one spec-format line, and shows a large PASS/FAIL banner on a TTY for the projector.
+- The tests were standalone scripts using cwd-relative paths and `python`. They are now pytest with temp dirs.
+- Session 1 was tested on Python 3.14. Everything now runs in a Python 3.11 venv.
+
+## What Devin built
+| Commit | Content |
+| --- | --- |
+| `4498177` | `record.py` alone, first, so it can be reviewed before anything depends on it |
+| `1f31c68` | `keys.py`, `store.py` (SELECT/INSERT only), `policy.py`, `digest.py`, `proxy.py`, `policy.yaml` with the real model digest |
+| `6be9ed2` | Verifier hardening, `tamper.sh`, pytest acceptance tests 1-7, known-answer vector, product-claim tests |
+| `96fd4b9` | `seed.py`, `bench.py`, demo console, WeasyPrint report |
+
+Design decisions worth a human look:
+1. **Known-answer vector for `record.py`**, computed with the verifier's independent code, not with `record.py` itself. Two implementations agree.
+2. **`tamper.sh forge` uses only `sqlite3` and `shasum`.** Test 3 gets `signature invalid` (not `content altered`), which proves the shell recompute matches the canonical hash byte for byte.
+3. **The writer trusts its in-memory head**, not the DB. Deleting the newest record while running shows up as a gap. Found while thinking through `tamper.sh restore`; covered by a test.
+4. **`tamper.sh restore` only replaces rows that differ from the backup**, so records sealed after the backup survive. A whole-file restore would have silently dropped them during the demo.
+5. **A region change writes a `policy_change` record with `rule_hits=[]`.** The spec only defines `rule_hits` for mode changes. The console shows it as `region → US-VA`.
+6. **Upstream (model) failures are recorded** with an empty `output_hash`, and the proxy returns 502. Open for Narayan to confirm.
+7. **Found while running for real:** WeasyPrint can't find Homebrew's pango on macOS without `DYLD_FALLBACK_LIBRARY_PATH`. `generate.py` re-execs itself with it set.
+
+## Results
+- `pytest`: 33 passed. Covers acceptance 1-7, tamper alter/forge/restore on a proxy-written chain, the tail-deletion gap, and the verifier-independence and append-only checks.
+- Real run against LM Studio (Llama-3.2-3B Q4_K_S): seed, region block (403), policy reload, forge (`FAIL seq=17 signature invalid`), restore (PASS), report PDF.
+- `bench.py`, 100 calls on the real model: overhead p50 0.74 ms, p95 0.91 ms. End to end p50 92 ms.
+
+## What a human changed, and why
+*(Narayan and Shameer fill this in as they review. Judges read this section.)*
+
+| Who | File | Change | Why |
+| --- | --- | --- | --- |
+| | `sijill/record.py` | Review and freeze: _pending_ | |
+| | | | |
