@@ -217,3 +217,49 @@ Design decisions worth a human look:
 | --- | --- | --- | --- |
 | | `sijill/record.py` | Review and freeze: _pending_ | |
 | | | | |
+
+# Session 3, 25 Sep 2026: engine lane (`narayan/core`)
+
+## Delegated (by Narayan)
+Resolve the two open questions from session 2 (item 6 in "Design decisions worth a human look", and the startup policy gap), plus fixes from Narayan's review of `store.py`, `policy.py` and `proxy.py`. Scope limited to `sijill/`, `verifier/`, `tests/`, `policy.yaml`, `scripts/tamper.sh`, `scripts/bench.py`. `record.py` untouched.
+
+## Decisions Narayan made before delegating
+| Question | Decision | Why |
+| --- | --- | --- |
+| Failed model calls | Keep recording them, and mark them | `decision` is frozen to `allow`, `flag`, `block` by `record.py`, so the marker is a reserved pseudo-rule id `upstream_error` appended to `rule_hits`. No schema change, verifier unaffected, console shows it for free. `policy.load()` rejects a real rule with that id |
+| Policy edited while the proxy was down | Write a `policy_change` at startup | Compare the policy file hash with the last record's `policy_hash`. Same rule now applies to `/admin/policy/reload`: any hash change writes a record, not only a rule mode change. Otherwise `terms` or `allow_digests` edits would move `policy_hash` on later records with nothing on the ledger explaining it |
+
+## Review findings, and what was done
+| # | Finding | Fix |
+| --- | --- | --- |
+| F1 | Transport error and upstream non-200 were two separate paths, both recording without a marker | One `upstream_failed` path; both call it |
+| F3 | `policy.load()` did not check `allow`, `allow_digests`, `terms`. A malformed rule raised `KeyError` on the first request: HTTP 500 and **no record** | Validate per-type keys at load; `ValueError` names the rule |
+| F4 | A 200 with a non-JSON or malformed body raised before `seal`: 500 and no record | Routed through F1 (502, marked). A `null` content is a valid reply and hashes `""` |
+| F5 | `upstream_timeout` was the only setting not read from the environment | `UPSTREAM_TIMEOUT` |
+| - | `store.py` | Nothing to change |
+
+Accepted as is: an in-flight inference that seals after a `policy_change` carries the policy it was evaluated under (correct, single worker); admin endpoints unauthenticated (documented demo build); startup trusts the DB head (by design, the verifier catches it).
+
+## What Devin built
+| Commit | Content |
+| --- | --- |
+| `d345c01` | Em-dashes out of comments and fixture text (`record.py` keeps its docstring, frozen) |
+| `4908739` | `policy.load()` validation, reserved `upstream_error` id, `tests/test_policy.py` |
+| `9046585` | Marked failure path, `Node.adopt_policy` shared by startup and reload, `UPSTREAM_TIMEOUT`, 7 proxy tests |
+
+## Results
+- `pytest`: 49 passed (was 33). New coverage: marker on transport error, 404 passthrough, malformed 200 (three shapes), flagged prompt plus failure (`["sensitive_terms", "upstream_error"]`); null content hashes `""`; verifier PASS on a chain containing marked records; startup drift (fresh store none, edited term exactly one, unchanged restart none); reload on a term edit, a mode flip, and no change; `load()` rejections; env timeout.
+- `bench.py` not run this session: LM Studio was down on the build machine. To run on the demo laptop after the model is up.
+
+## Spec lines now stale (in `docs/README.md`, Shameer's lane)
+- Record schema, `output_hash`: "empty string if blocked" becomes "empty if blocked or the model call failed".
+- Record schema, `rule_hits`: add that the reserved id `upstream_error` marks a failed model call.
+- Endpoints, `POST /api/admin/policy/reload`: "if any rule mode changed" becomes "if the policy file hash changed".
+
+## What a human changed, and why
+*(Narayan fills this in. Judges read this section.)*
+
+| Who | File | Change | Why |
+| --- | --- | --- | --- |
+| Narayan | `sijill/record.py` | Review and freeze: _pending_ | |
+| Narayan | | | |
