@@ -63,7 +63,7 @@ python -m pytest                                                    # acceptance
 | `GET /api/records?since=N` | Records with seq > N, plus the total count |
 | `GET /api/policy` | Rules and modes, node id, current region |
 | `GET /api/verify` | Runs the verifier CLI as a subprocess and returns its output |
-| `POST /api/admin/policy/reload` | Re-reads `policy.yaml`. A mode change writes a `policy_change` record |
+| `POST /api/admin/policy/reload` | Re-reads `policy.yaml`. Any change to the file writes a `policy_change` record, and so does a change made while the proxy was down, at the next startup |
 | `POST /api/admin/node/region` | `{"region": "SG"}`. Writes a `policy_change` record |
 | `GET /api/report?from=&to=` | The audit PDF |
 
@@ -116,7 +116,8 @@ Fallback: a pre-generated `report.pdf` and the screen recording.
 - **`tamper.sh forge` uses only `sqlite3` and `shasum`.** An attacker who knows the algorithm can recompute a valid `record_hash`, but can't sign it.
 - **The writer trusts its own head.** The proxy keeps the chain head in memory. Deleting the newest record while it runs shows up as a gap at the next record.
 - **Model digest** is the SHA-256 of the weights file, re-checked by file size and mtime on every call. A model whose weights can't be located gets an empty digest and is blocked by `approved_models`.
-- **Upstream failures are recorded** with an empty `output_hash`, and the proxy returns 502.
+- **Upstream failures are recorded**, marked with the reserved rule id `upstream_error` and an empty `output_hash`. The proxy returns 502, or passes through the runtime's error status.
+- **Policy file hash is tracked.** Any edit to `policy.yaml` is sealed as a `policy_change` on reload, or at startup if it happened while the proxy was down, so every change in `policy_hash` has a record explaining it.
 
 ## Honest boundaries
 

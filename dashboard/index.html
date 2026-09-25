@@ -146,12 +146,16 @@ const $ = (id) => document.getElementById(id);
 const rowsEl = $("rows");
 let lastSeq = 0, model = "llama-3.2-3b-instruct", brokenSeq = null, firstLoad = true;
 
-function label(rec) {
+function label(rec, prev) {
   const hits = JSON.parse(rec.rule_hits || "[]");
-  if (rec.type === "policy_change") return hits.length ? `${hits.join(", ")} mode changed` : `region → ${rec.node_region}`;
-  return hits.join(", ") || "—";
+  if (rec.type !== "policy_change") return hits.join(", ") || "—";
+  if (hits.length) return `${hits.join(", ")} mode changed`;
+  if (prev && prev.node_region !== rec.node_region) return `region → ${rec.node_region}`;
+  if (prev && prev.policy_hash !== rec.policy_hash) return `policy file updated · ${rec.policy_hash.slice(0, 12)}`;
+  return `region ${rec.node_region} · policy ${rec.policy_hash.slice(0, 12)}`;
 }
 
+let prevRec = null;
 function row(rec) {
   const tr = document.createElement("tr");
   tr.dataset.seq = rec.seq;
@@ -161,7 +165,7 @@ function row(rec) {
     ["seq", rec.seq],
     ["time", rec.ts.slice(11, 23)],
     ["decision", rec.type === "policy_change" ? "policy change" : rec.decision],
-    ["rules", label(rec)],
+    ["rules", label(rec, prevRec && prevRec.seq === rec.seq - 1 ? prevRec : null)],
     ["hash", rec.record_hash.slice(0, 12)],
   ];
   for (const [cls, text] of cells) {
@@ -189,6 +193,7 @@ async function pollRecords() {
   $("count").textContent = (body.total ?? 0).toLocaleString("en-US");
   for (const rec of body.records || []) {
     rowsEl.prepend(row(rec));
+    prevRec = rec;
     lastSeq = rec.seq;
   }
   while (rowsEl.children.length > MAX_ROWS) rowsEl.lastChild.remove();

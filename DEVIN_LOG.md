@@ -333,3 +333,30 @@ Take the 13-slide Fish Tank pitch and the brand logo, and produce a new, livelie
 - Rendered with headless Chrome (Playwright) rather than WeasyPrint, because the venv's WeasyPrint cannot find pango's `libgobject` in a non-login shell. `report/generate.py` is untouched.
 - Verified: exactly one A4 page, zero content overflow measured in the DOM before printing. The original `Partner Brief.md` / `.pdf` are left as they were.
 - Spelling: the brief uses "Sijil" (as the deck and logo file do); the codebase and the original brief use "Sijill". Flagged to Shameer to pick one.
+
+---
+
+# Session 5, 25 Sep 2026: review and merge (Shameer)
+
+## Delegated (by Shameer)
+Pull Narayan's `narayan/core`, review it, and merge both lanes into `main`.
+
+## Review of `narayan/core` (4 commits, engine lane only)
+- Scope: only `sijill/`, `verifier/`, `tests/`, `scripts/tamper.sh` and `DEVIN_LOG.md` touched. `record.py` unchanged, so the known-answer test still holds.
+- Code: approved. The failure paths now always seal a record before responding, closing the three routes where a call could 500 with nothing on the ledger. The reserved `upstream_error` id needs no schema change. Policy validation fails at load, not on the first request.
+- The one behaviour change needed follow-up in Shameer's lane: `policy_change` now fires on any policy hash change, including at startup, often with `rule_hits=[]`. The console labelled every empty-hits policy change as `region → X`, which would have mislabelled a terms edit or startup drift on stage.
+
+## Merge
+`narayan/core` fast-forwarded into `devin/build`, then `shameer/demo` merged in. The only conflict was `DEVIN_LOG.md`, where both lanes had added to the end. Resolved by keeping both, in order.
+
+## Follow-up in Shameer's lane
+- `dashboard/index.html`: a policy change is labelled from the record before it. A region move shows `region → X`, a hash-only change shows `policy file updated · <hash>`, and a mode change shows `<rule> mode changed`.
+- `docs/README.md` (spec) and `README.md`: updated the three lines Narayan flagged (`output_hash` empty on failure, the `upstream_error` marker, reload on any hash change) and the design notes.
+
+## Verification on the merged build
+- `pytest`: 49 passed.
+- Live, real model: seed; SG round trip; a terms-only edit plus reload wrote a record with `rule_hits=[]`; a mode flip wrote one with `["sensitive_terms"]`; the file was edited while the proxy was down and startup wrote one; with the model endpoint down, the call returned 502 and was sealed with `["upstream_error"]`. Verifier PASS with 113 records. Console screenshot checked.
+- `bench.py` (Narayan couldn't run it, as LM Studio was down on his machine): 100 calls, overhead p50 0.81 ms, p95 1.31 ms. End-to-end p50 94 ms.
+
+## Still open
+- Narayan's review and freeze of `sijill/record.py` is still marked _pending_. Slide 8 of the deck says it was done.

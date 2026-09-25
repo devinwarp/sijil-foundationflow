@@ -68,9 +68,9 @@ One table, `records`. One row per event.
 | approval_ref | text | From policy file |
 | mode | text | `record` or `enforce` — the strictest mode among rules that fired |
 | decision | text | `allow`, `flag` or `block` |
-| rule_hits | text | JSON array of rule ids that fired |
+| rule_hits | text | JSON array of rule ids that fired. The reserved id `upstream_error` marks a call whose model request failed |
 | input_hash | text | SHA-256 of canonical request messages |
-| output_hash | text | SHA-256 of response text; empty string if blocked |
+| output_hash | text | SHA-256 of response text; empty string if blocked or the model call failed |
 | prev_hash | text | `record_hash` of seq−1; 64 zeros for seq 1 |
 | record_hash | text | See below |
 | signature | text | Hex Ed25519 signature over `record_hash` bytes |
@@ -132,7 +132,7 @@ Rule semantics:
 | GET /api/records?since=N | Records with seq greater than N, for the console |
 | GET /api/policy | Current rules and their modes, for the policy strip |
 | GET /api/verify | Runs `verifier/sijill_verify.py` as a subprocess and returns its output and exit code. Must shell out to the CLI — must not import the verifier |
-| POST /api/admin/policy/reload | Re-read policy.yaml; if any rule mode changed, write a `policy_change` record |
+| POST /api/admin/policy/reload | Re-read policy.yaml; if the policy file hash changed, write a `policy_change` record (`rule_hits` lists rules whose mode changed, possibly none). The same check runs at startup against the last record |
 | POST /api/admin/node/region | Body `{"region": "..."}`. Demo control for triggering residency. Writes a `policy_change` record |
 | GET /api/report?from=&to= | Returns the PDF for the range |
 
