@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+venv/
+.venv/
+env/
+
+# Local data and secrets
+*.db
+*.db.bak
+*.pem
+*.pub
+*.hex
+node.key
+.env
+.env.*
+.DS_Store
+
+# Internal docs kept local
+docs/spec/Sijill — PRD (Fish Tank build).pdf
+docs/presentation/
