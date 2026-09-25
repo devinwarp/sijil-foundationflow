@@ -19,6 +19,7 @@ node.key
 
 # Internal docs kept local
 docs/spec/Sijill — PRD (Fish Tank build).pdf
-docs/presentation/
+docs/presentation/*
+!docs/presentation/Sijil — Fish Tank pitch v2.html
 .sijill_digests.json
 docs/demo_script.md
