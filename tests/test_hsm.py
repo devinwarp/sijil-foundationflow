@@ -68,3 +68,22 @@ def test_unreachable_hsm_refuses_to_start(hsm, tmp_path):
         with TestClient(app):
             pass
     assert not Path(s.key_path).exists()
+
+
+def test_hsm_on_chain_signed_by_another_key_refuses_to_start(hsm, tmp_path):
+    """Switching an existing ledger to the HSM must not overwrite node.pub and orphan every record."""
+    s = settings(tmp_path, hsm)
+    s.pkcs11_module = ""                                  # first run: file key
+    with TestClient(create_app(s, transport=httpx.MockTransport(stub_model), resolver=StubResolver()),
+                    headers=ADMIN) as client:
+        assert ask(client, "q").status_code == 200
+    pub = Path(s.pubkey_path).read_bytes()
+    s.pkcs11_module = hsm
+    app = create_app(s, transport=httpx.MockTransport(stub_model), resolver=StubResolver())
+    with pytest.raises(RuntimeError, match="different key"):
+        with TestClient(app):
+            pass
+    assert Path(s.pubkey_path).read_bytes() == pub
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+    from sijill.hsm import Pkcs11Signer
+    Pkcs11Signer(hsm, "sijil", "node", "1234").close()   # refusal released the token session

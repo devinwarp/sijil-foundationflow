@@ -4,10 +4,11 @@ import asyncio
 import json
 
 import httpx
+import pytest
 
 from conftest import ADMIN, MODEL, rows, sse, stub_stream, verify
 from sijill import record
-from sijill.policy import UPSTREAM_ERROR_HIT
+from sijill.policy import HALT_HIT, UPSTREAM_ERROR_HIT
 
 
 def stream(client, content: str, model: str = MODEL):
@@ -77,50 +78,128 @@ class SlowStream(httpx.AsyncByteStream):
         await asyncio.sleep(0)
 
 
+async def raw_stream(app, *, disconnect: bool, during=None, after=None) -> list[bytes]:
+    """Drive one streamed call through raw ASGI (spec 2.3, like uvicorn), lifespan included.
+
+    disconnect=True hangs up after the first body chunk. during(client) runs once the first chunk
+    is out and after(client) once the call has ended, each with an in-process client for the other
+    endpoints. Returns the body chunks.
+    """
+    inbox: asyncio.Queue = asyncio.Queue()
+    started = asyncio.Event()
+
+    async def lifespan_send(msg):
+        started.set() if msg["type"] == "lifespan.startup.complete" else None
+    await inbox.put({"type": "lifespan.startup"})
+    life = asyncio.create_task(app({"type": "lifespan", "asgi": {"version": "3.0"}}, inbox.get, lifespan_send))
+    await asyncio.wait_for(started.wait(), 5)
+
+    body = json.dumps({"model": MODEL, "stream": True, "messages": [{"role": "user", "content": "hello"}]}).encode()
+    first_chunk = asyncio.Event()
+    sent_body = False
+    chunks: list[bytes] = []
+
+    async def receive():
+        nonlocal sent_body
+        if not sent_body:
+            sent_body = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await first_chunk.wait()
+        if not disconnect:
+            await asyncio.Event().wait()  # client stays connected; cancelled when the response ends
+        return {"type": "http.disconnect"}
+
+    async def send(msg):
+        if msg["type"] == "http.response.body" and msg.get("body"):
+            chunks.append(msg["body"])
+            first_chunk.set()
+
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}, "http_version": "1.1",
+             "method": "POST", "scheme": "http", "path": "/v1/chat/completions", "raw_path": b"",
+             "query_string": b"", "server": ("test", 80), "client": ("test", 1),
+             "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
+                         (b"authorization", ADMIN["Authorization"].encode())]}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test",
+                                 headers=ADMIN) as other:
+        call = asyncio.create_task(app(scope, receive, send))
+        if during:
+            await asyncio.wait_for(first_chunk.wait(), 5)
+            await during(other)
+        await asyncio.wait_for(call, 10)
+        if after:
+            await after(other)
+    await inbox.put({"type": "lifespan.shutdown"})
+    await asyncio.wait_for(life, 5)
+    return chunks
+
+
+def slow(request):
+    return httpx.Response(200, stream=SlowStream(), headers={"content-type": "text/event-stream"})
+
+
 def test_client_disconnect_still_seals_one_record(node_with):
-    """Raw ASGI, spec 2.3 (uvicorn): disconnect cancels the body task; the call must still seal once."""
-    def slow(request):
-        return httpx.Response(200, stream=SlowStream(), headers={"content-type": "text/event-stream"})
+    """Disconnect cancels the body task; the call must still seal once."""
     client, s = node_with(slow)
-    app = client.app
-
-    async def drive():
-        inbox: asyncio.Queue = asyncio.Queue()
-        started = asyncio.Event()
-
-        async def lifespan_send(msg):
-            started.set() if msg["type"] == "lifespan.startup.complete" else None
-        await inbox.put({"type": "lifespan.startup"})
-        life = asyncio.create_task(app({"type": "lifespan", "asgi": {"version": "3.0"}}, inbox.get, lifespan_send))
-        await asyncio.wait_for(started.wait(), 5)
-
-        body = json.dumps({"model": MODEL, "stream": True,
-                           "messages": [{"role": "user", "content": "hello"}]}).encode()
-        first_chunk = asyncio.Event()
-        sent_body = False
-
-        async def receive():
-            nonlocal sent_body
-            if not sent_body:
-                sent_body = True
-                return {"type": "http.request", "body": body, "more_body": False}
-            await first_chunk.wait()
-            return {"type": "http.disconnect"}
-
-        async def send(msg):
-            if msg["type"] == "http.response.body" and msg.get("body"):
-                first_chunk.set()
-
-        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}, "http_version": "1.1",
-                 "method": "POST", "scheme": "http", "path": "/v1/chat/completions", "raw_path": b"",
-                 "query_string": b"", "server": ("test", 80), "client": ("test", 1),
-                 "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
-                             (b"authorization", ADMIN["Authorization"].encode())]}
-        await asyncio.wait_for(app(scope, receive, send), 10)
-        await inbox.put({"type": "lifespan.shutdown"})
-        await asyncio.wait_for(life, 5)
-
-    asyncio.run(drive())
+    asyncio.run(raw_stream(client.app, disconnect=True))
     [rec] = rows(s.db_path)
     assert UPSTREAM_ERROR_HIT in json.loads(rec["rule_hits"]) and rec["output_hash"] == ""
     assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_halt_mid_stream_ends_stream_and_seals_it_halted(node_with):
+    """A stream already relaying when the operator halts stops; nothing is sealed `allow` after `halted`."""
+    client, s = node_with(slow)
+
+    async def halt(other):
+        assert (await other.post("/api/admin/halt", json={"halted": True})).json()["seq"]
+
+    async def resume(other):
+        assert (await other.post("/api/admin/halt", json={"halted": False})).json()["seq"]
+
+    text = b"".join(asyncio.run(raw_stream(client.app, disconnect=False, during=halt, after=resume))).decode()
+    assert "data: [DONE]" not in text and text.count("data: {") < 2000
+    recs = rows(s.db_path)
+    kinds = [(r["type"], json.loads(r["rule_hits"])) for r in recs]
+    start = kinds.index(("policy_change", [HALT_HIT]))
+    end = kinds.index(("policy_change", ["resumed"]))
+    between = recs[start + 1:end]
+    assert [r for r in between if r["decision"] == "allow"] == []
+    [rec] = [r for r in recs if r["type"] == "inference"]
+    assert {HALT_HIT, UPSTREAM_ERROR_HIT} <= set(json.loads(rec["rule_hits"])) and rec["output_hash"] == ""
+    assert f"record_hash={rec['record_hash']}" in text
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_in_stream_error_event_seals_upstream_error(node_with):
+    """vLLM reports a mid-stream failure as `data: {"error": ...}` and may still send [DONE]."""
+    def errs(request):
+        body = sse(["partial"], done=False) + b'data: {"error": {"message": "out of memory"}}\n\ndata: [DONE]\n\n'
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+    client, s = node_with(errs)
+    with client, stream(client, "hello") as r:
+        "".join(r.iter_lines())
+    [rec] = rows(s.db_path)
+    assert UPSTREAM_ERROR_HIT in json.loads(rec["rule_hits"]) and rec["output_hash"] == ""
+
+
+def test_upstream_closed_even_when_seal_fails(node_with):
+    """A seal failure (e.g. HSM session lost) must not leak the upstream connection."""
+    closed = []
+
+    class Tracked(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield sse(["a"])
+
+        async def aclose(self):
+            closed.append(True)
+
+    client, _ = node_with(lambda req: httpx.Response(200, stream=Tracked(),
+                                                     headers={"content-type": "text/event-stream"}))
+    with client:
+        async def broken(body):
+            raise RuntimeError("signer unavailable")
+        client.app.state.node.seal = broken
+        with pytest.raises(RuntimeError, match="signer unavailable"):
+            with stream(client, "hello") as r:
+                "".join(r.iter_lines())
+    assert closed

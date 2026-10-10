@@ -88,8 +88,16 @@ class Node:
             from .hsm import Pkcs11Signer
             self.key = Pkcs11Signer(settings.pkcs11_module, settings.pkcs11_token,
                                     settings.pkcs11_key, settings.pkcs11_pin)
-            Path(settings.pubkey_path).write_bytes(self.key.public_key().public_bytes(
-                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+            pem = self.key.public_key().public_bytes(serialization.Encoding.PEM,
+                                                     serialization.PublicFormat.SubjectPublicKeyInfo)
+            pub_path = Path(settings.pubkey_path)
+            if self.store.last() and pub_path.exists() and pub_path.read_bytes() != pem:
+                # Overwriting node.pub would make every earlier record fail verification.
+                self.key.close()
+                self.store.close()
+                raise RuntimeError(f"chain in {settings.db_path} was signed by a different key than the HSM "
+                                   f"key; start a new database to rotate to the HSM key")
+            pub_path.write_bytes(pem)
         else:
             self.key = keys.load_or_generate(settings.key_path, settings.pubkey_path)
         self.policy = policy.load(settings.policy_path)
@@ -224,31 +232,50 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 return await upstream_failed(resp.status_code, content, (perf_counter() - t1) * 1000)
 
             async def relay():
-                parts, done, rec = [], False, None
+                parts, done, errored, rec = [], False, False, None
                 try:
                     async for line in resp.aiter_lines():
+                        if n.halted:  # operator halt lands mid-stream: stop relaying now
+                            break
                         if line == "data: [DONE]":
                             done = True
                             break
                         if line.startswith("data: "):
                             try:
-                                delta = json.loads(line[6:])["choices"][0].get("delta") or {}
-                            except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+                                event = json.loads(line[6:])
+                            except ValueError:
+                                event = None
+                            if isinstance(event, dict) and "error" in event:
+                                errored = True  # in-stream failure (vLLM), even if [DONE] follows
+                            try:
+                                delta = event["choices"][0].get("delta") or {}
+                            except (KeyError, IndexError, TypeError, AttributeError):
                                 delta = {}
                             if isinstance(delta.get("content"), str):
                                 parts.append(delta["content"])
                         yield (line + "\n").encode()
                 finally:
-                    sealed = ({**body, "output_hash": record.output_hash("".join(parts))} if done else
-                              {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT])})
+                    # Read the halt flag here, with no await before the seal: a halt that has flipped
+                    # it has its `halted` record sealed or queued ahead of ours on the lock.
+                    halted = n.halted
+                    if done and not errored and not halted:
+                        sealed = {**body, "output_hash": record.output_hash("".join(parts))}
+                    elif halted:
+                        sealed = {**body, "decision": "block", "mode": "enforce", "rule_hits": policy.rule_hits_json(
+                            hits + [policy.HALT_HIT, policy.UPSTREAM_ERROR_HIT])}
+                    else:
+                        sealed = {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT])}
                     # Shielded: a client hang-up cancels this task (anyio, level-triggered), but the call
-                    # must still be sealed. Seal first; closing the upstream may itself yield.
+                    # must still be sealed. Seal first; closing the upstream may itself yield. The close
+                    # runs even if the seal raises, so a signer outage does not leak the connection.
                     with anyio.CancelScope(shield=True):
-                        rec = await n.seal(sealed)
-                        await resp.aclose()
+                        try:
+                            rec = await n.seal(sealed)
+                        finally:
+                            await resp.aclose()
                 yield (f": sijill seq={rec['seq']} decision={rec['decision']} "
                        f"record_hash={rec['record_hash']}\n\n").encode()
-                if done:
+                if done and not halted:
                     yield b"data: [DONE]\n\n"
 
             return StreamingResponse(relay(), media_type="text/event-stream",
