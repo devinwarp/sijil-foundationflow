@@ -37,7 +37,8 @@ def settings(tmp_path, module: str) -> Settings:
     return Settings(db_path=str(tmp_path / "sijill.db"), policy_path=str(tmp_path / "policy.yaml"),
                     key_path=str(tmp_path / "node.key"), pubkey_path=str(tmp_path / "node.pub"),
                     upstream="http://model.test/v1", admin_token=ADMIN_TOKEN, pkcs11_module=module,
-                    pkcs11_token="sijil", pkcs11_key="node", pkcs11_pin="1234")
+                    pkcs11_token="sijil", pkcs11_key="node", pkcs11_pin="1234",
+                    halt_path=str(tmp_path / "sijill.halt"))
 
 
 def test_signer_signature_verifies(hsm):

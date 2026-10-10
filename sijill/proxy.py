@@ -53,6 +53,7 @@ class Settings:
     pkcs11_token: str = ""
     pkcs11_key: str = ""
     pkcs11_pin: str = ""
+    halt_path: str = "sijill.halt"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -71,6 +72,7 @@ class Settings:
             pkcs11_token=e("SIJILL_PKCS11_TOKEN", ""),
             pkcs11_key=e("SIJILL_PKCS11_KEY", ""),
             pkcs11_pin=e("SIJILL_PKCS11_PIN", ""),
+            halt_path=e("SIJILL_HALT_PATH", cls.halt_path),
         )
 
 
@@ -97,6 +99,7 @@ class Node:
         # deleted or edited at the tail while running still shows up as a break.
         self.head = self.store.head()
         self.lock = asyncio.Lock()
+        self.halted = Path(settings.halt_path).exists()
         self.resolver = resolver or DigestResolver()
         headers = {"Authorization": f"Bearer {settings.upstream_token}"} if settings.upstream_token else {}
         self.client = httpx.AsyncClient(base_url=settings.upstream, headers=headers,
@@ -178,6 +181,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         digest = await asyncio.to_thread(n.resolver.resolve, model_id)
         pol, region = n.policy, n.region
         decision, mode, hits = policy.evaluate(pol, region, digest, payload["messages"])
+        if n.halted:
+            decision, mode, hits = "block", "enforce", [policy.HALT_HIT]
         body = n.body(pol, "inference", model_id=model_id, model_digest=digest, mode=mode, decision=decision,
                       rule_hits=policy.rule_hits_json(hits), input_hash=record.input_hash(payload["messages"]))
 
@@ -333,6 +338,21 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         n.region = region
         rec = await n.seal(n.body(n.policy, "policy_change"))
         return {"region": region, "region_allowed": n.policy.region_allowed(region), "seq": rec["seq"]}
+
+    @app.post("/api/admin/halt", dependencies=[Depends(require_admin)])
+    async def halt(request: Request):
+        n = node(request)
+        want = (await request.json()).get("halted")
+        if not isinstance(want, bool):
+            raise HTTPException(400, 'body must be {"halted": true|false}')
+        if want == n.halted:
+            return {"halted": want, "seq": None}
+        flag = Path(settings.halt_path)
+        flag.touch() if want else flag.unlink(missing_ok=True)
+        n.halted = want
+        hit = policy.HALT_HIT if want else policy.RESUME_HIT
+        rec = await n.seal(n.body(n.policy, "policy_change", rule_hits=policy.rule_hits_json([hit])))
+        return {"halted": want, "seq": rec["seq"]}
 
     @app.get("/api/report")
     async def report(request: Request):

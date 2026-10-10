@@ -13,7 +13,8 @@ def make_client(tmp_path, admin_token: str, headers: dict | None = None) -> tupl
     shutil.copy(ROOT / "policy.yaml", tmp_path / "policy.yaml")
     s = Settings(db_path=str(tmp_path / "sijill.db"), policy_path=str(tmp_path / "policy.yaml"),
                  key_path=str(tmp_path / "node.key"), pubkey_path=str(tmp_path / "node.pub"),
-                 upstream="http://model.test/v1", admin_token=admin_token)
+                 upstream="http://model.test/v1", admin_token=admin_token,
+                 halt_path=str(tmp_path / "sijill.halt"))
     app = create_app(s, transport=httpx.MockTransport(stub_model), resolver=StubResolver())
     return TestClient(app, headers=headers or {}), s
 

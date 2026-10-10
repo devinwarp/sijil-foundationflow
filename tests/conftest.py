@@ -85,7 +85,8 @@ def node(tmp_path):
     shutil.copy(ROOT / "policy.yaml", tmp_path / "policy.yaml")
     settings = Settings(db_path=str(tmp_path / "sijill.db"), policy_path=str(tmp_path / "policy.yaml"),
                         key_path=str(tmp_path / "node.key"), pubkey_path=str(tmp_path / "node.pub"),
-                        upstream="http://model.test/v1", admin_token=ADMIN_TOKEN)
+                        upstream="http://model.test/v1", admin_token=ADMIN_TOKEN,
+                        halt_path=str(tmp_path / "sijill.halt"))
     app = create_app(settings, transport=httpx.MockTransport(stub_model), resolver=StubResolver())
     with TestClient(app, headers=ADMIN) as client:
         yield client, settings
@@ -103,7 +104,8 @@ def node_with(tmp_path):
             shutil.copy(ROOT / "policy.yaml", tmp_path / "policy.yaml")
         settings = Settings(db_path=str(tmp_path / "sijill.db"), policy_path=str(tmp_path / "policy.yaml"),
                             key_path=str(tmp_path / "node.key"), pubkey_path=str(tmp_path / "node.pub"),
-                            upstream="http://model.test/v1", admin_token=ADMIN_TOKEN)
+                            upstream="http://model.test/v1", admin_token=ADMIN_TOKEN,
+                            halt_path=str(tmp_path / "sijill.halt"))
         app = create_app(settings, transport=httpx.MockTransport(handler), resolver=StubResolver())
         return TestClient(app, headers=ADMIN), settings
     return make
