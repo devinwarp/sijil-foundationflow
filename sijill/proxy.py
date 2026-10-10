@@ -20,6 +20,7 @@ from time import perf_counter
 
 import anyio
 import httpx
+from cryptography.hazmat.primitives import serialization
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
@@ -48,6 +49,10 @@ class Settings:
     default_model: str = "llama-3.2-3b-instruct"
     upstream_timeout: float = 120.0
     admin_token: str = ""
+    pkcs11_module: str = ""
+    pkcs11_token: str = ""
+    pkcs11_key: str = ""
+    pkcs11_pin: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -62,6 +67,10 @@ class Settings:
             default_model=e("SIJILL_MODEL", cls.default_model),
             upstream_timeout=float(e("UPSTREAM_TIMEOUT", cls.upstream_timeout)),
             admin_token=e("SIJILL_ADMIN_TOKEN", ""),
+            pkcs11_module=e("SIJILL_PKCS11_MODULE", ""),
+            pkcs11_token=e("SIJILL_PKCS11_TOKEN", ""),
+            pkcs11_key=e("SIJILL_PKCS11_KEY", ""),
+            pkcs11_pin=e("SIJILL_PKCS11_PIN", ""),
         )
 
 
@@ -72,7 +81,15 @@ class Node:
                  resolver: DigestResolver | None = None):
         self.settings = settings
         self.store = Store(settings.db_path)
-        self.key = keys.load_or_generate(settings.key_path, settings.pubkey_path)
+        if settings.pkcs11_module:
+            # No fallback to a key file: a configured HSM that fails is a startup error.
+            from .hsm import Pkcs11Signer
+            self.key = Pkcs11Signer(settings.pkcs11_module, settings.pkcs11_token,
+                                    settings.pkcs11_key, settings.pkcs11_pin)
+            Path(settings.pubkey_path).write_bytes(self.key.public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+        else:
+            self.key = keys.load_or_generate(settings.key_path, settings.pubkey_path)
         self.policy = policy.load(settings.policy_path)
         last = self.store.last()
         self.region = last["node_region"] if last else self.policy.node_region
