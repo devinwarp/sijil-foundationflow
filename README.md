@@ -47,6 +47,12 @@ The first run creates `node.key` (Ed25519 private key, mode 0600), `node.pub` an
 | `SIJILL_MODEL` | `llama-3.2-3b-instruct` |
 | `SIJILL_MODELS_DIR` | LM Studio `downloadsFolder` |
 | `SIJILL_ENTITY` | `Ministry of Citizen Services` (report) |
+| `SIJILL_ADMIN_TOKEN` | *(none)*. Bearer token for `/api/admin/*`. Unset disables those endpoints (503) |
+| `SIJILL_HALT_PATH` | `sijill.halt`. Flag file; while it exists every call is blocked and sealed |
+| `SIJILL_PKCS11_MODULE` | *(none)*. Path to the vendor PKCS#11 library. Setting it selects HSM signing |
+| `SIJILL_PKCS11_TOKEN` | Token label on the HSM |
+| `SIJILL_PKCS11_KEY` | Label of the Ed25519 key object on the token |
+| `SIJILL_PKCS11_PIN` | User PIN for the token session |
 
 ## Commands
 
@@ -128,9 +134,9 @@ Fallback: a pre-generated `report.pdf` and the screen recording.
 
 Sijill proves records haven't been altered since they were sealed. It doesn't prove the sealing process was honest: node identity and region are asserted by the node and signed with its key, not bound to hardware. Hardware root of trust (TEE / GPU attestation) is roadmap. The chain also can't detect truncation of its newest records while the node is offline. Anchoring the chain head externally would fix that.
 
-HSM signing is optional over PKCS#11 (`SIJILL_PKCS11_*`); when set there is no key-file fallback, and HSM custody limits key theft, not a compromised host.
+HSM signing is optional over PKCS#11 (`SIJILL_PKCS11_*`). When it is configured, a failing HSM at startup stops the proxy; there is no key-file fallback. HSM custody limits key theft, not a compromised host.
 
-Read endpoints (`/api/records`, `/api/policy`, `/api/verify`, `/api/report`, the dashboard) are unauthenticated in the pilot build and are expected behind the entity's SSO reverse proxy.
+Read endpoints (`/api/records`, `/api/policy`, `/api/verify`, `/api/report`, and the dashboard at `/`) are unauthenticated in the pilot build and are expected behind the entity's SSO reverse proxy.
 
 ## Layout
 
