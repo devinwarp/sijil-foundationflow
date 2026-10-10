@@ -283,9 +283,11 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         return JSONResponse(content=data, headers=headers(rec, upstream_ms))
 
     @app.get("/api/records")
-    async def records(request: Request, since: int = 0, limit: int = 200):
+    async def records(request: Request, since: int = 0, limit: int = 200, after: int | None = None):
         n = node(request)
-        return {"total": n.store.count(), "records": n.store.since(since, max(1, min(limit, 1000)))}
+        limit = max(1, min(limit, 1000))
+        page = n.store.after(after, limit) if after is not None else n.store.since(since, limit)
+        return {"total": n.store.count(), "records": page}
 
     @app.get("/api/policy")
     async def current_policy(request: Request):

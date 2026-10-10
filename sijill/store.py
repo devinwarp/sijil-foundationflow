@@ -61,6 +61,12 @@ class Store:
             f"SELECT {COLUMNS} FROM records WHERE seq > ? ORDER BY seq DESC LIMIT ?", (seq, limit)).fetchall()
         return [dict(r) for r in reversed(rows)]
 
+    def after(self, seq: int, limit: int = 200) -> list[dict]:
+        """Records with seq > `seq`, ascending; the OLDEST `limit` of them (lossless paging)."""
+        rows = self.conn.execute(
+            f"SELECT {COLUMNS} FROM records WHERE seq > ? ORDER BY seq LIMIT ?", (seq, limit)).fetchall()
+        return [dict(r) for r in rows]
+
     def between(self, ts_from: str, ts_to: str) -> list[dict]:
         rows = self.conn.execute(
             f"SELECT {COLUMNS} FROM records WHERE ts >= ? AND ts <= ? ORDER BY seq", (ts_from, ts_to)).fetchall()
