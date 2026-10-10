@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sijil Operator Guide</title>
+<style>
+/* Self-contained on purpose: this file ships inside air-gapped install bundles, so no web fonts or remote assets. */
+:root {
+  --bg: #f5f6f4; --surface: #ffffff; --fg: #17201e; --muted: #59645f; --line: #d4dbd8;
+  --accent: #0e5c57; --accent-soft: #e2eeec; --code-bg: #eef1ef; --warn: #8a5a00; --warn-soft: #fbf1dc;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1514; --surface: #161e1d; --fg: #e3ebe8; --muted: #9aa8a3; --line: #2b3735;
+    --accent: #66c2b9; --accent-soft: #17302d; --code-bg: #1b2524; --warn: #e3a845; --warn-soft: #2e2615;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1514; --surface: #161e1d; --fg: #e3ebe8; --muted: #9aa8a3; --line: #2b3735;
+  --accent: #66c2b9; --accent-soft: #17302d; --code-bg: #1b2524; --warn: #e3a845; --warn-soft: #2e2615;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 400 1rem/1.6 var(--sans); }
+.page { max-width: 54rem; margin: 0 auto; padding-inline: 20px; padding-block: 40px 72px; display: grid; gap: 44px; }
+h1, h2, h3 { font-family: var(--serif); font-weight: 600; line-height: 1.2; text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(1.9rem, 5vw, 2.5rem); }
+h2 { font-size: 1.5rem; }
+h3 { font-size: 1.08rem; }
+p, ul, ol { margin: 0; }
+section { display: grid; gap: 14px; }
+ul, ol { padding-left: 1.3rem; display: grid; gap: 6px; }
+.eyebrow { font: 500 0.74rem/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+.lead { font-size: 1.1rem; max-width: 44rem; }
+.muted { color: var(--muted); }
+header { display: grid; gap: 12px; border-bottom: 1px solid var(--line); padding-bottom: 24px; }
+.meta { font: 0.8rem/1.4 var(--mono); color: var(--muted); }
+nav ol { columns: 2 14rem; display: block; }
+nav li { margin-bottom: 4px; }
+a { color: var(--accent); text-underline-offset: 2px; }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+code { font: 0.88em var(--mono); background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+pre { margin: 0; background: var(--code-bg); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; overflow-x: auto; font: 0.84rem/1.55 var(--mono); }
+pre code { background: none; padding: 0; font-size: inherit; }
+.flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; }
+.node { flex: 1 1 9rem; min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; display: grid; gap: 2px; }
+.node b { font-size: 0.95rem; }
+.node span { font-size: 0.82rem; color: var(--muted); }
+.node.core { border-color: var(--accent); background: var(--accent-soft); }
+.arrow { align-self: center; color: var(--muted); font: 1.1rem var(--mono); }
+.steps { list-style: none; padding: 0; counter-reset: step; display: grid; gap: 22px; }
+.steps > li { counter-increment: step; display: grid; grid-template-columns: 2rem 1fr; gap: 6px 12px; }
+.steps > li::before { content: counter(step); font: 600 0.95rem/2rem var(--mono); text-align: center; width: 2rem; height: 2rem; border-radius: 50%; background: var(--accent-soft); color: var(--accent); }
+.steps > li > div { display: grid; gap: 8px; min-width: 0; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; min-width: 36rem; font-size: 0.9rem; }
+th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+tr:last-child td { border-bottom: 0; }
+th { font: 500 0.72rem/1.3 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); background: var(--bg); }
+td:first-child { white-space: nowrap; }
+.note { border-left: 3px solid var(--warn); background: var(--warn-soft); padding: 10px 14px; border-radius: 0 6px 6px 0; display: grid; gap: 6px; }
+.note b { color: var(--warn); }
+.ops { display: grid; grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr)); gap: 16px; }
+.op { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; display: grid; gap: 8px; align-content: start; min-width: 0; }
+footer { border-top: 1px solid var(--line); padding-top: 16px; font: 0.8rem/1.5 var(--mono); color: var(--muted); }
+@media print { .page { max-width: none; } pre, .op, .node { break-inside: avoid; } }
+</style>
+</head>
+<body>
+<div class="page">
+
+<header>
+  <span class="eyebrow">Operator guide · install and day-to-day operation</span>
+  <h1>Sijil Operator Guide</h1>
+  <p class="lead">How to install Sijil inside an entity's own network, point its AI agents at it, and run it day to day: monitoring, emergency stop, policy changes and audit exports.</p>
+  <p class="meta">Applies to the pilot build (Milestone 1). Ships inside every offline bundle as OPERATOR_GUIDE.html.</p>
+</header>
+
+<nav aria-label="Contents">
+  <ol>
+    <li><a href="#how">How Sijil sits in the network</a></li>
+    <li><a href="#prereq">Before you start</a></li>
+    <li><a href="#bundle">Build the offline bundle</a></li>
+    <li><a href="#install">Install on site</a></li>
+    <li><a href="#config">Configuration reference</a></li>
+    <li><a href="#ops">Day-to-day operation</a></li>
+    <li><a href="#upgrade">Upgrades and key changes</a></li>
+    <li><a href="#trouble">Troubleshooting</a></li>
+    <li><a href="#limits">Known limits of this build</a></li>
+  </ol>
+</nav>
+
+<section id="how">
+  <span class="eyebrow">1</span>
+  <h2>How Sijil sits in the network</h2>
+  <p>Sijil is one container between the entity's agents and its model server. Agents call Sijil instead of the model. Sijil checks each call against the entity's policy, forwards or blocks it, and seals a signed record of the decision. Nothing leaves the entity's network.</p>
+  <div class="flow" role="img" aria-label="Agents call Sijil, Sijil calls the model server, records flow to the SIEM and to auditors">
+    <div class="node"><b>AI agents</b><span>OpenAI-compatible clients</span></div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="node core"><b>Sijil</b><span>policy check, signed record per call</span></div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="node"><b>Model server</b><span>self-hosted, e.g. vLLM, llama.cpp</span></div>
+  </div>
+  <div class="flow">
+    <div class="node"><b>SOC / SIEM</b><span>receives every record as CEF over syslog</span></div>
+    <div class="node"><b>Auditors</b><span>verify an export offline with the free verifier</span></div>
+    <div class="node"><b>HSM (optional)</b><span>holds the Ed25519 signing key</span></div>
+  </div>
+</section>
+
+<section id="prereq">
+  <span class="eyebrow">2</span>
+  <h2>Before you start</h2>
+  <ul>
+    <li><strong>Host:</strong> a Linux VM with Docker or Podman. One container, one worker; 2 vCPU and 4 GB RAM are enough for a pilot.</li>
+    <li><strong>Model server:</strong> self-hosted, OpenAI-compatible (<code>/v1/chat/completions</code>), reachable from the host, with bearer-token auth or none.</li>
+    <li><strong>Model weights on disk:</strong> the GGUF file the model server loads, readable from the Sijil host. Sijil fingerprints it (SHA-256) to prove which model answered.</li>
+    <li><strong>An admin token:</strong> a random string of 32 or more characters, kept in the entity's secret store.</li>
+    <li><strong>A reverse proxy with the entity's SSO</strong> in front of Sijil's read pages (see step 7).</li>
+    <li><strong>Optional:</strong> an HSM with a PKCS#11 library and an Ed25519 key; a SIEM syslog endpoint (TCP preferred).</li>
+  </ul>
+</section>
+
+<section id="bundle">
+  <span class="eyebrow">3</span>
+  <h2>Build the offline bundle</h2>
+  <p>On a connected machine with Docker, from a clean checkout of <code>main</code>:</p>
+  <pre><code>scripts/bundle_offline.sh
+# prints dist/sijil-&lt;sha&gt;.tar.gz</code></pre>
+  <p>The script refuses to build from uncommitted changes, so the image tag always matches a real commit. The bundle holds the image, <code>policy.yaml</code>, the verifier, the SIEM forwarder, <code>INSTALL.txt</code> and this guide. Carry it to the site on approved media.</p>
+</section>
+
+<section id="install">
+  <span class="eyebrow">4</span>
+  <h2>Install on site</h2>
+  <ol class="steps">
+    <li><div>
+      <h3>Load the image</h3>
+      <pre><code>tar xzf sijil-&lt;sha&gt;.tar.gz &amp;&amp; cd sijil-&lt;sha&gt;
+docker load &lt; sijil-image-&lt;sha&gt;.tar.gz        # or: podman load -i sijil-image-&lt;sha&gt;.tar.gz</code></pre>
+    </div></li>
+    <li><div>
+      <h3>Fingerprint the approved model</h3>
+      <pre><code>sha256sum /srv/models/&lt;model-file&gt;.gguf</code></pre>
+      <p>Put the result in <code>policy.yaml</code> as <code>sha256:&lt;hex&gt;</code> under the <code>approved_models</code> rule. Agents must request the model by a name the weights file starts with: model <code>llama-3.2-3b-instruct</code> matches <code>Llama-3.2-3B-Instruct-Q4_K_S.gguf</code> (case-insensitive).</p>
+    </div></li>
+    <li><div>
+      <h3>Edit the policy</h3>
+      <p>Keep it in its own directory and mount the directory, so edits are seen without restarting the container.</p>
+      <pre><code>mkdir -p /etc/sijil &amp;&amp; cp policy.yaml /etc/sijil/
+
+policy_id: gov-assistant
+version_label: "2026-10-11.1"
+approval_ref: "APR-0147"            # the entity's approval reference
+node:
+  id: "auh-node-01"
+  region: "AE-AZ"
+rules:
+  - id: residency
+    type: region_allowlist
+    allow: ["AE-AZ", "AE-DU"]
+    mode: enforce
+  - id: approved_models
+    type: model_allowlist
+    allow_digests: ["sha256:&lt;hex from step 2&gt;"]
+    mode: enforce
+  - id: sensitive_terms
+    type: keyword_flag
+    terms: ["emirates id", "passport number"]
+    mode: record</code></pre>
+      <p class="muted"><code>enforce</code> blocks a call that matches; <code>record</code> lets it through and flags it on the record. Rule ids <code>upstream_error</code>, <code>halted</code> and <code>resumed</code> are reserved.</p>
+    </div></li>
+    <li><div>
+      <h3>Run Sijil</h3>
+      <pre><code>docker network create sijil-net
+docker run -d --name sijil --network sijil-net --restart unless-stopped \
+  -p 8000:8000 \
+  -v /etc/sijil:/config:ro \
+  -v /srv/models:/models:ro \
+  -v sijil-data:/data \
+  -e SIJILL_ADMIN_TOKEN=&lt;admin token&gt; \
+  -e LMSTUDIO_BASE_URL=http://&lt;model-server&gt;:&lt;port&gt;/v1 \
+  -e LM_API_TOKEN=&lt;model server token, if any&gt; \
+  -e SIJILL_MODEL=&lt;default model name&gt; \
+  sijil:&lt;sha&gt;</code></pre>
+      <p>All state (records, signing key or public key, digest cache, halt flag) lives in the <code>sijil-data</code> volume. Back it up like any database volume.</p>
+      <p><strong>With an HSM</strong>, add the vendor library and the four PKCS#11 settings:</p>
+      <pre><code>  -v /opt/vendor/lib:/opt/pkcs11:ro \
+  -e SIJILL_PKCS11_MODULE=/opt/pkcs11/&lt;library&gt;.so \
+  -e SIJILL_PKCS11_TOKEN=&lt;token label&gt; \
+  -e SIJILL_PKCS11_KEY=&lt;key label&gt; \
+  -e SIJILL_PKCS11_PIN=&lt;user PIN&gt; \</code></pre>
+      <p class="muted">If the HSM is configured but unreachable, Sijil refuses to start. It never falls back to a key file.</p>
+    </div></li>
+    <li><div>
+      <h3>Check it is healthy</h3>
+      <pre><code>curl -s http://localhost:8000/api/policy   # "admin_auth": "token", your policy_id and region
+curl -s http://localhost:8000/api/verify   # "ok": true</code></pre>
+      <p>From a repo checkout, <code>scripts/smoke_container.sh sijil:&lt;sha&gt;</code> runs the full container check, including one real model call.</p>
+    </div></li>
+    <li><div>
+      <h3>Point the agents at Sijil</h3>
+      <p>Set each agent's OpenAI base URL to <code>http://&lt;sijil-host&gt;:8000/v1</code>. No agent code changes. Streaming (<code>stream: true</code>) is supported. Blocked calls return HTTP 403 with the rule ids and the record's sequence number.</p>
+    </div></li>
+    <li><div>
+      <h3>Put the read pages behind SSO</h3>
+      <p>The dashboard <code>/</code> and <code>/api/records</code>, <code>/api/policy</code>, <code>/api/verify</code>, <code>/api/report</code> have no login of their own in this build. Publish them only through the entity's reverse proxy with SSO. Agents need only <code>/v1/chat/completions</code>; admin calls need the admin token.</p>
+    </div></li>
+    <li><div>
+      <h3>Connect the SOC</h3>
+      <p>Run the forwarder from the same image, on the same network and volume:</p>
+      <pre><code>docker run -d --name sijil-siem --network sijil-net --restart unless-stopped \
+  -v sijil-data:/data --entrypoint python sijil:&lt;sha&gt; \
+  scripts/siem_forward.py --url http://sijil:8000 --sink &lt;siem-host&gt;:514 --state /data/siem_state</code></pre>
+      <p>TCP is the default and does not drop records; add <code>--udp</code> only for a UDP-only receiver. Delivery is at-least-once: after a crash, up to one page may be sent twice. Blocks arrive at CEF severity 8, flags at 5, everything else at 3.</p>
+    </div></li>
+  </ol>
+</section>
+
+<section id="config">
+  <span class="eyebrow">5</span>
+  <h2>Configuration reference</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Setting</th><th>In the image</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>SIJILL_ADMIN_TOKEN</code></td><td>unset</td><td>Bearer token for <code>/api/admin/*</code>. Unset disables those endpoints (503); a wrong token gets 401.</td></tr>
+        <tr><td><code>LMSTUDIO_BASE_URL</code></td><td><code>http://localhost:1234/v1</code></td><td>The model server's OpenAI-compatible base URL. Despite the name, any compatible server works.</td></tr>
+        <tr><td><code>LM_API_TOKEN</code></td><td>unset</td><td>Sent upstream as <code>Authorization: Bearer</code>.</td></tr>
+        <tr><td><code>SIJILL_MODEL</code></td><td><code>llama-3.2-3b-instruct</code></td><td>Model used when a request names none.</td></tr>
+        <tr><td><code>UPSTREAM_TIMEOUT</code></td><td><code>120</code></td><td>Seconds to wait for the model server.</td></tr>
+        <tr><td><code>SIJILL_MODELS_DIR</code></td><td><code>/models</code></td><td>Where the GGUF weights are mounted (read-only).</td></tr>
+        <tr><td><code>SIJILL_DIGEST_CACHE</code></td><td><code>/data/sijill_digests.json</code></td><td>Cache of model fingerprints, so a multi-GB file is hashed once per change.</td></tr>
+        <tr><td><code>POLICY_PATH</code></td><td><code>/config/policy.yaml</code></td><td>The policy file.</td></tr>
+        <tr><td><code>DATABASE_PATH</code></td><td><code>/data/sijill.db</code></td><td>The append-only record store.</td></tr>
+        <tr><td><code>NODE_KEY_PATH</code>, <code>NODE_PUBKEY_PATH</code></td><td><code>/data/node.key</code>, <code>/data/node.pub</code></td><td>File signing key (created on first run) and the public key auditors verify with.</td></tr>
+        <tr><td><code>SIJILL_HALT_PATH</code></td><td><code>/data/sijill.halt</code></td><td>While this file exists, every call is blocked and sealed.</td></tr>
+        <tr><td><code>SIJILL_PKCS11_MODULE</code></td><td>unset</td><td>Vendor PKCS#11 library. Setting it switches signing to the HSM.</td></tr>
+        <tr><td><code>SIJILL_PKCS11_TOKEN</code>, <code>_KEY</code>, <code>_PIN</code></td><td>unset</td><td>Token label, key label and user PIN on the HSM.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="ops">
+  <span class="eyebrow">6</span>
+  <h2>Day-to-day operation</h2>
+  <p>Admin calls below assume <code>TOKEN</code> holds the admin token and <code>S</code> the Sijil URL, for example <code>S=http://localhost:8000</code>.</p>
+  <div class="ops">
+    <div class="op">
+      <h3>Daily health check</h3>
+      <pre><code>curl -s $S/api/verify</code></pre>
+      <p><code>"ok": true</code> means every record's hash, signature and chain link checks out. Any <code>FAIL seq=N</code> is an incident: see Troubleshooting.</p>
+    </div>
+    <div class="op">
+      <h3>Emergency stop</h3>
+      <pre><code>curl -s -X POST $S/api/admin/halt \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"halted": true}'</code></pre>
+      <p>Every call is blocked and sealed with <code>halted</code>; streams in progress are cut off. The halt survives a restart. Resume with <code>{"halted": false}</code>. Both actions are on the record.</p>
+    </div>
+    <div class="op">
+      <h3>Change the policy</h3>
+      <pre><code># edit /etc/sijil/policy.yaml, then
+curl -s -X POST $S/api/admin/policy/reload \
+  -H "Authorization: Bearer $TOKEN"</code></pre>
+      <p>Any change to the file is sealed as a <code>policy_change</code> record naming the rules whose mode changed. A malformed file is rejected and the old policy stays in force.</p>
+    </div>
+    <div class="op">
+      <h3>Record a region move</h3>
+      <pre><code>curl -s -X POST $S/api/admin/node/region \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"region": "AE-DU"}'</code></pre>
+      <p>Use when the node is moved or failed over. If the new region is not allowed, the <code>residency</code> rule blocks calls from then on.</p>
+    </div>
+    <div class="op">
+      <h3>Export for an auditor</h3>
+      <pre><code>docker run --rm -v sijil-data:/data --entrypoint sqlite3 sijil:&lt;sha&gt; \
+  /data/sijill.db ".backup /data/export.db"
+docker run --rm -v sijil-data:/data --entrypoint cat sijil:&lt;sha&gt; /data/export.db &gt; export.db
+docker run --rm -v sijil-data:/data --entrypoint cat sijil:&lt;sha&gt; /data/node.pub &gt; node.pub</code></pre>
+      <p>Always export with <code>.backup</code>: a plain copy of a live database can be torn and fail verification. Hand over <code>export.db</code>, <code>node.pub</code> and the <code>verifier/</code> folder.</p>
+    </div>
+    <div class="op">
+      <h3>Auditor verifies, offline</h3>
+      <pre><code>python3 verifier/sijill_verify.py --db export.db --pubkey node.pub</code></pre>
+      <p>Needs only Python 3 and the <code>cryptography</code> package. Prints <code>PASS records=N</code> or <code>FAIL seq=N &lt;reason&gt;</code>. It shares no code with Sijil, so the auditor does not have to trust us.</p>
+    </div>
+    <div class="op">
+      <h3>Audit report (PDF)</h3>
+      <pre><code>curl -s "$S/api/report?from=2026-10-01T00:00:00Z&amp;to=2026-10-31T23:59:59Z" \
+  -o sijil-report.pdf</code></pre>
+      <p>Decisions, rule hits and the verification result for the period. <code>from</code> and <code>to</code> are optional.</p>
+    </div>
+    <div class="op">
+      <h3>Watch the SOC feed</h3>
+      <pre><code>docker ps --filter name=sijil-siem
+docker run --rm -v sijil-data:/data --entrypoint cat sijil:&lt;sha&gt; /data/siem_state</code></pre>
+      <p>The forwarder retries through outages and resumes from its saved position. It does not log its retries yet, so if the SIEM shows a gap, check that the container is running and that the saved sequence number keeps rising.</p>
+    </div>
+  </div>
+</section>
+
+<section id="upgrade">
+  <span class="eyebrow">7</span>
+  <h2>Upgrades and key changes</h2>
+  <ul>
+    <li><strong>Upgrade:</strong> load the new bundle's image, then replace the container with the same volume, network and settings. The chain continues; run the health check after.</li>
+    <li><strong>Moving to an HSM:</strong> Sijil refuses to start if the HSM key differs from the key that signed the existing records. Export and archive the old chain with its <code>node.pub</code>, then start the HSM-backed node on a new volume.</li>
+    <li><strong>New model version:</strong> fingerprint the new weights, add the digest to <code>approved_models</code>, reload the policy. Remove the old digest when the old model is retired.</li>
+  </ul>
+</section>
+
+<section id="trouble">
+  <span class="eyebrow">8</span>
+  <h2>Troubleshooting</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Symptom</th><th>Cause and fix</th></tr></thead>
+      <tbody>
+        <tr><td>Admin call returns 503</td><td><code>SIJILL_ADMIN_TOKEN</code> is not set on the container. Set it and recreate the container.</td></tr>
+        <tr><td>Admin call returns 401</td><td>Wrong or missing <code>Authorization: Bearer</code> header.</td></tr>
+        <tr><td>Every call 403, hit <code>approved_models</code></td><td>The model's fingerprint is not in the policy, or Sijil cannot find the weights: check the <code>/models</code> mount and that the model name matches the start of the GGUF file name.</td></tr>
+        <tr><td>Every call 403, hit <code>residency</code></td><td>The node's region is not in the allowlist. Check <code>/api/policy</code> for the current region.</td></tr>
+        <tr><td>Every call 403, hit <code>halted</code></td><td>An operator halted the node. Resume with <code>{"halted": false}</code> when cleared.</td></tr>
+        <tr><td>502 with <code>upstream_error</code></td><td>The model server is down or returned something invalid. The failed call is still sealed.</td></tr>
+        <tr><td>Container exits at start, <code>PinIncorrect</code></td><td>Wrong <code>SIJILL_PKCS11_PIN</code>.</td></tr>
+        <tr><td>Container exits at start, "signed by a different key"</td><td>HSM key does not match the chain in the volume. See Upgrades: start a new volume.</td></tr>
+        <tr><td>Verifier: <code>FAIL seq=N content altered</code> or <code>signature invalid</code></td><td>Record N was changed after sealing, or the export is torn. Re-export with <code>.backup</code>; if it still fails, treat it as a security incident and preserve the volume.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="limits">
+  <span class="eyebrow">9</span>
+  <h2>Known limits of this build</h2>
+  <div class="note">
+    <p><b>Read these before a security review.</b></p>
+    <ul>
+      <li>The approved-model check needs the weights on disk. A remote or API-only model gets no fingerprint and is blocked by an enforcing <code>approved_models</code> rule. API model fingerprints come in the next milestone.</li>
+      <li>Only <code>/v1/chat/completions</code> is proxied. Tool-call policy (the MCP guard) comes in the next milestone.</li>
+      <li>Upstream auth is a bearer token. Azure OpenAI's own <code>api-key</code> header is not supported yet.</li>
+      <li>Read pages have no login of their own; they must sit behind the entity's SSO proxy.</li>
+      <li>Streamed answers are sealed after delivery. If signing fails mid-stream (for example the HSM drops), that answer was delivered but not sealed.</li>
+      <li>A non-streamed call already sent to the model when a halt lands completes and is sealed after the halt record. A halted stream is sealed <code>block</code> with <code>halted</code> and <code>upstream_error</code> even though part of it was delivered.</li>
+      <li>Records prove nothing was changed after sealing. They do not prove the host itself was honest; hardware attestation is on the roadmap.</li>
+    </ul>
+  </div>
+</section>
+
+<footer>Sijil / FoundationFlow · docs/OPERATOR_GUIDE.html · the full security checklist is docs/PILOT_SECURITY.md</footer>
+</div>
+</body>
+</html>
