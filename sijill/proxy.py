@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 
+import anyio
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -213,11 +214,13 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                                 parts.append(delta["content"])
                         yield (line + "\n").encode()
                 finally:
-                    await resp.aclose()
                     sealed = ({**body, "output_hash": record.output_hash("".join(parts))} if done else
                               {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT])})
-                    # Shielded: a client hang-up cancels this generator, but the call must still be sealed.
-                    rec = await asyncio.shield(n.seal(sealed))
+                    # Shielded: a client hang-up cancels this task (anyio, level-triggered), but the call
+                    # must still be sealed. Seal first; closing the upstream may itself yield.
+                    with anyio.CancelScope(shield=True):
+                        rec = await n.seal(sealed)
+                        await resp.aclose()
                 yield (f": sijill seq={rec['seq']} decision={rec['decision']} "
                        f"record_hash={rec['record_hash']}\n\n").encode()
                 if done:

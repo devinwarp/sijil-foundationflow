@@ -1,10 +1,11 @@
 """stream: true is relayed as it arrives and sealed once, on the hash of the whole answer."""
 
+import asyncio
 import json
 
 import httpx
 
-from conftest import MODEL, rows, sse, stub_stream, verify
+from conftest import ADMIN, MODEL, rows, sse, stub_stream, verify
 from sijill import record
 from sijill.policy import UPSTREAM_ERROR_HIT
 
@@ -64,14 +65,62 @@ def test_stream_upstream_500_is_sealed_and_returned(node_with):
     assert UPSTREAM_ERROR_HIT in json.loads(rows(s.db_path)[0]["rule_hits"])
 
 
+class SlowStream(httpx.AsyncByteStream):
+    """Upstream body that yields between chunks and whose close yields, like a real socket close."""
+
+    async def __aiter__(self):
+        for i in range(2000):
+            await asyncio.sleep(0.001)
+            yield sse([f"w{i} "], done=False)
+
+    async def aclose(self):
+        await asyncio.sleep(0)
+
+
 def test_client_disconnect_still_seals_one_record(node_with):
-    def long_stream(request):
-        return httpx.Response(200, content=sse([f"w{i} " for i in range(2000)]),
-                              headers={"content-type": "text/event-stream"})
-    client, s = node_with(long_stream)
-    with client:
-        with stream(client, "hello") as r:
-            next(r.iter_lines())  # read one line, then hang up
-        recs = rows(s.db_path)
-    assert len(recs) == 1
+    """Raw ASGI, spec 2.3 (uvicorn): disconnect cancels the body task; the call must still seal once."""
+    def slow(request):
+        return httpx.Response(200, stream=SlowStream(), headers={"content-type": "text/event-stream"})
+    client, s = node_with(slow)
+    app = client.app
+
+    async def drive():
+        inbox: asyncio.Queue = asyncio.Queue()
+        started = asyncio.Event()
+
+        async def lifespan_send(msg):
+            started.set() if msg["type"] == "lifespan.startup.complete" else None
+        await inbox.put({"type": "lifespan.startup"})
+        life = asyncio.create_task(app({"type": "lifespan", "asgi": {"version": "3.0"}}, inbox.get, lifespan_send))
+        await asyncio.wait_for(started.wait(), 5)
+
+        body = json.dumps({"model": MODEL, "stream": True,
+                           "messages": [{"role": "user", "content": "hello"}]}).encode()
+        first_chunk = asyncio.Event()
+        sent_body = False
+
+        async def receive():
+            nonlocal sent_body
+            if not sent_body:
+                sent_body = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await first_chunk.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(msg):
+            if msg["type"] == "http.response.body" and msg.get("body"):
+                first_chunk.set()
+
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}, "http_version": "1.1",
+                 "method": "POST", "scheme": "http", "path": "/v1/chat/completions", "raw_path": b"",
+                 "query_string": b"", "server": ("test", 80), "client": ("test", 1),
+                 "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
+                             (b"authorization", ADMIN["Authorization"].encode())]}
+        await asyncio.wait_for(app(scope, receive, send), 10)
+        await inbox.put({"type": "lifespan.shutdown"})
+        await asyncio.wait_for(life, 5)
+
+    asyncio.run(drive())
+    [rec] = rows(s.db_path)
+    assert UPSTREAM_ERROR_HIT in json.loads(rec["rule_hits"]) and rec["output_hash"] == ""
     assert verify(s.db_path, s.pubkey_path)[0] == 0
