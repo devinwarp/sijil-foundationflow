@@ -132,6 +132,9 @@ class Node:
     async def aclose(self) -> None:
         await self.client.aclose()
         self.store.close()
+        close = getattr(self.key, "close", None)  # HSM signer only; file keys have none
+        if close:
+            close()
 
 
 def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTransport | None = None,

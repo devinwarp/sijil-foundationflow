@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pkcs11.exceptions import PinIncorrect
 from fastapi.testclient import TestClient
 
 from conftest import ADMIN, ADMIN_TOKEN, ROOT, StubResolver, ask, stub_model, verify
@@ -62,7 +63,7 @@ def test_unreachable_hsm_refuses_to_start(hsm, tmp_path):
     s = settings(tmp_path, hsm)
     s.pkcs11_pin = "wrong"
     app = create_app(s, transport=httpx.MockTransport(stub_model), resolver=StubResolver())
-    with pytest.raises(Exception):
+    with pytest.raises(PinIncorrect):
         with TestClient(app):
             pass
     assert not Path(s.key_path).exists()
