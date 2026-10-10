@@ -9,6 +9,7 @@ Admin endpoints require `Authorization: Bearer $SIJILL_ADMIN_TOKEN`; with no tok
 
 import asyncio
 import hmac
+import json
 import os
 import sys
 import tempfile
@@ -19,7 +20,7 @@ from time import perf_counter
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
 from . import keys, policy, record
@@ -151,8 +152,6 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             raise HTTPException(400, "request body must be JSON")
         if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
             raise HTTPException(400, "`messages` must be a list")
-        if payload.get("stream"):
-            raise HTTPException(400, "streaming is not supported by Sijill")
 
         model_id = str(payload.get("model") or settings.default_model)
         digest = await asyncio.to_thread(n.resolver.resolve, model_id)
@@ -181,6 +180,52 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             return JSONResponse(status_code=status, headers=headers(rec, upstream_ms), content=content)
 
         t1 = perf_counter()
+        if payload.get("stream"):
+            req = n.client.build_request("POST", "/chat/completions", json={**payload, "model": model_id})
+            try:
+                resp = await n.client.send(req, stream=True)
+            except httpx.HTTPError as e:
+                return await upstream_failed(
+                    502, {"error": {"message": f"model runtime unreachable: {e!r}",
+                                    "type": UPSTREAM_ERROR_TYPE}}, (perf_counter() - t1) * 1000)
+            if resp.status_code != 200:
+                raw = await resp.aread()
+                await resp.aclose()
+                try:
+                    content = json.loads(raw)
+                except ValueError:
+                    content = {"error": {"message": raw.decode(errors="replace")}}
+                return await upstream_failed(resp.status_code, content, (perf_counter() - t1) * 1000)
+
+            async def relay():
+                parts, done, rec = [], False, None
+                try:
+                    async for line in resp.aiter_lines():
+                        if line == "data: [DONE]":
+                            done = True
+                            break
+                        if line.startswith("data: "):
+                            try:
+                                delta = json.loads(line[6:])["choices"][0].get("delta") or {}
+                            except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+                                delta = {}
+                            if isinstance(delta.get("content"), str):
+                                parts.append(delta["content"])
+                        yield (line + "\n").encode()
+                finally:
+                    await resp.aclose()
+                    sealed = ({**body, "output_hash": record.output_hash("".join(parts))} if done else
+                              {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT])})
+                    # Shielded: a client hang-up cancels this generator, but the call must still be sealed.
+                    rec = await asyncio.shield(n.seal(sealed))
+                yield (f": sijill seq={rec['seq']} decision={rec['decision']} "
+                       f"record_hash={rec['record_hash']}\n\n").encode()
+                if done:
+                    yield b"data: [DONE]\n\n"
+
+            return StreamingResponse(relay(), media_type="text/event-stream",
+                                     headers={"X-Sijill-Decision": decision, "Cache-Control": "no-cache"})
+
         try:
             resp = await n.client.post("/chat/completions", json={**payload, "model": model_id})
         except httpx.HTTPError as e:

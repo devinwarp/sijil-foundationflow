@@ -41,12 +41,6 @@ def test_unapproved_model_is_blocked(node):
     assert UPSTREAM_ERROR_HIT not in rec["rule_hits"]
 
 
-def test_streaming_rejected_and_not_recorded(node):
-    client, s = node
-    r = client.post("/v1/chat/completions", json={"model": "x", "stream": True, "messages": []})
-    assert r.status_code == 400 and rows(s.db_path) == []
-
-
 def test_seed_50_through_proxy_then_tamper_demo(node):
     """Test 1-4 again, on a chain written by the real proxy."""
     client, s = node

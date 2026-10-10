@@ -114,6 +114,16 @@ def ask(client, content: str, model: str = MODEL):
                        json={"model": model, "messages": [{"role": "user", "content": content}], "max_tokens": 16})
 
 
+def sse(chunks: list[str], done: bool = True) -> bytes:
+    events = "".join(
+        f"data: {json.dumps({'choices': [{'index': 0, 'delta': {'content': c}}]})}\n\n" for c in chunks)
+    return (events + ("data: [DONE]\n\n" if done else "")).encode()
+
+
+def stub_stream(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, content=sse(["Stub ", "answer"]), headers={"content-type": "text/event-stream"})
+
+
 def rows(db, where: str = "1=1") -> list[dict]:
     conn = sqlite3.connect(db)
     conn.row_factory = sqlite3.Row
