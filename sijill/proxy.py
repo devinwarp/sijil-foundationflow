@@ -4,10 +4,11 @@ Run a single worker (records are sealed under an in-process lock):
 
     uvicorn sijill.proxy:app --port 8000 --env-file .env.local
 
-Admin endpoints have NO authentication. This is a local demo build; say so.
+Admin endpoints require `Authorization: Bearer $SIJILL_ADMIN_TOKEN`; with no token set they are disabled.
 """
 
 import asyncio
+import hmac
 import os
 import sys
 import tempfile
@@ -17,7 +18,7 @@ from pathlib import Path
 from time import perf_counter
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 
@@ -44,6 +45,7 @@ class Settings:
     upstream_token: str = ""
     default_model: str = "llama-3.2-3b-instruct"
     upstream_timeout: float = 120.0
+    admin_token: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -57,6 +59,7 @@ class Settings:
             upstream_token=e("LM_API_TOKEN", ""),
             default_model=e("SIJILL_MODEL", cls.default_model),
             upstream_timeout=float(e("UPSTREAM_TIMEOUT", cls.upstream_timeout)),
+            admin_token=e("SIJILL_ADMIN_TOKEN", ""),
         )
 
 
@@ -130,6 +133,13 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
     def node(request: Request) -> Node:
         return request.app.state.node
+
+    def require_admin(request: Request) -> None:
+        if not settings.admin_token:
+            raise HTTPException(503, "admin endpoints disabled: set SIJILL_ADMIN_TOKEN")
+        supplied = request.headers.get("authorization", "").encode()
+        if not hmac.compare_digest(supplied, f"Bearer {settings.admin_token}".encode()):
+            raise HTTPException(401, "admin token required")
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
@@ -217,7 +227,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 "policy_hash": p.hash, "node_id": p.node_id, "region": n.region,
                 "region_allowed": p.region_allowed(n.region), "model": settings.default_model,
                 "rules": [{"id": r["id"], "type": r["type"], "mode": r["mode"]} for r in p.rules],
-                "admin_auth": "none (demo build)"}
+                "admin_auth": "token" if settings.admin_token else "disabled"}
 
     @app.get("/api/verify")
     async def verify():
@@ -229,7 +239,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "output": out.decode().strip(),
                 "checked_at": record.now_ts()}
 
-    @app.post("/api/admin/policy/reload")
+    @app.post("/api/admin/policy/reload", dependencies=[Depends(require_admin)])
     async def reload_policy(request: Request):
         n = node(request)
         try:
@@ -241,7 +251,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         changed = policy.mode_changes(old, new)
         return {"changed": changed, "seq": rec and rec["seq"], "policy_hash": new.hash}
 
-    @app.post("/api/admin/node/region")
+    @app.post("/api/admin/node/region", dependencies=[Depends(require_admin)])
     async def set_region(request: Request):
         n = node(request)
         region = (await request.json()).get("region")
