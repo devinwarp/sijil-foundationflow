@@ -1,10 +1,16 @@
 .git
+.superpowers
 venv
 .env
 .env.*
+**/.env
+**/.env.*
 node.key
 node.pub
+**/node.key
+**/node.pub
 *.db
+**/*.db
 .sijill_digests.json
 .pytest_cache
 **/__pycache__
