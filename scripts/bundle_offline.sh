@@ -22,8 +22,8 @@ cat > "$OUT/INSTALL.txt" <<EOT
 5. SIEM: python3 scripts/siem_forward.py --url http://<host>:8000 --sink <siem>:514
    TCP is the default; add --udp for UDP-only syslog receivers.
 6. Copy the public key and DB out of the data volume (node.pub lives at /data/node.pub):
-     docker run --rm -v sijil-data:/data alpine cat /data/node.pub > node.pub
-     docker run --rm -v sijil-data:/data alpine cat /data/sijill.db > sijill.db
+     docker run --rm -v sijil-data:/data --entrypoint cat sijil:$SHA /data/node.pub > node.pub
+     docker run --rm -v sijil-data:/data --entrypoint cat sijil:$SHA /data/sijill.db > sijill.db
    Verify offline at any time: python3 verifier/sijill_verify.py --db sijill.db --pubkey node.pub
 EOT
 (cd dist && tar czf "sijil-$SHA.tar.gz" "sijil-$SHA")
