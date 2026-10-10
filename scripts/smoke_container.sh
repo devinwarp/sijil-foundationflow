@@ -92,14 +92,19 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 HTTPServer(("0.0.0.0", 9000), H).serve_forever()' >/dev/null
 
+ready=0
+for _ in $(seq 1 40); do
+  if docker exec "$STUB" python -c 'import socket; socket.create_connection(("127.0.0.1", 9000), 1)' >/dev/null 2>&1; then ready=1; break; fi
+  sleep 0.5
+done
+[ "$ready" = 1 ] || { docker logs "$STUB" >&2 || true; fail "stub upstream did not start"; }
+
 CPORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 CBASE="http://127.0.0.1:$CPORT"
-# SMOKE_CHAT_ENV: extra docker run args, only to reproduce failures on purpose (e.g. "-e SIJILL_DIGEST_CACHE=/app/x.json")
-# shellcheck disable=SC2086
 docker run -d --name "$CHAT" --network "$NET" -p "127.0.0.1:$CPORT:8000" \
   -v "$TMP/policy.yaml:/config/policy.yaml:ro" -v "$TMP:/models:ro" \
   -e SIJILL_ADMIN_TOKEN="$TOKEN" -e "LMSTUDIO_BASE_URL=http://$STUB:9000/v1" -e SIJILL_MODEL=smoke-model \
-  ${SMOKE_CHAT_ENV:-} "$IMAGE" >/dev/null
+  "$IMAGE" >/dev/null
 
 up=0
 for _ in $(seq 1 40); do
@@ -117,6 +122,11 @@ if [ "$code" != 200 ] || ! tr -d '\r' < "$chat_hdr" | grep -qi '^x-sijill-decisi
   fail "chat call returned $code or was not allowed"
 fi
 echo "chat call=200 decision=allow"
+
+# The cache write is non-fatal, so check it actually landed on the /data volume.
+docker exec "$CHAT" test -s /data/sijill_digests.json || fail "digest cache not written to /data"
+if docker logs "$CHAT" 2>&1 | grep -q "digest cache not written"; then fail "proxy logged a digest cache write failure"; fi
+echo "digest cache on /data"
 
 verify=$(curl -fsS "$CBASE/api/verify")
 echo "$verify" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["ok"] is True else 1)' \

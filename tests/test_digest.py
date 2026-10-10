@@ -1,4 +1,6 @@
+import asyncio
 import hashlib
+from pathlib import Path
 
 from sijill.digest import DigestResolver
 from sijill.proxy import Node, Settings
@@ -24,8 +26,12 @@ def test_digest_cache_env_reaches_resolver(tmp_path, monkeypatch):
     s = Settings.from_env()
     assert s.digest_cache == str(tmp_path / "d.json")
     assert Settings().digest_cache == ".sijill_digests.json"
-    (tmp_path / "policy.yaml").write_text(open("policy.yaml").read())
+    (tmp_path / "policy.yaml").write_text((Path(__file__).parent.parent / "policy.yaml").read_text())
     node = Node(Settings(db_path=str(tmp_path / "s.db"), policy_path=str(tmp_path / "policy.yaml"),
                          key_path=str(tmp_path / "k"), pubkey_path=str(tmp_path / "p"),
                          digest_cache=s.digest_cache))
-    assert node.resolver.cache_path == tmp_path / "d.json"
+    try:
+        assert node.resolver.cache_path == tmp_path / "d.json"
+    finally:
+        node.store.close()
+        asyncio.run(node.aclose())

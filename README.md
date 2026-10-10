@@ -35,7 +35,7 @@ uvicorn sijill.proxy:app --port 8000 --env-file .env.local   # one worker only
 open http://localhost:8000                                  # demo console
 ```
 
-The first run creates `node.key` (Ed25519 private key, mode 0600), `node.pub` and `sijill.db`. The first call to a model hashes its weights file, which takes about 4 s. After that the digest is cached in `.sijill_digests.json`.
+The first run creates `node.key` (Ed25519 private key, mode 0600), `node.pub` and `sijill.db`. The first call to a model hashes its weights file, which takes about 4 s. After that the digest is cached at `SIJILL_DIGEST_CACHE` (default `.sijill_digests.json`).
 
 | Env var | Default |
 | --- | --- |
