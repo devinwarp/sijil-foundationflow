@@ -45,7 +45,8 @@ The first run creates `node.key` (Ed25519 private key, mode 0600), `node.pub` an
 | `POLICY_PATH` | `policy.yaml` |
 | `NODE_KEY_PATH` / `NODE_PUBKEY_PATH` | `node.key` / `node.pub` |
 | `SIJILL_MODEL` | `llama-3.2-3b-instruct` |
-| `SIJILL_MODELS_DIR` | LM Studio `downloadsFolder` |
+| `SIJILL_MODELS_DIR` | LM Studio `downloadsFolder`. `/models` in the container: mount weights read-only there |
+| `SIJILL_DIGEST_CACHE` | `.sijill_digests.json`. `/data/sijill_digests.json` in the container. Losing it only means re-hashing the weights |
 | `SIJILL_ENTITY` | `Ministry of Citizen Services` (report) |
 | `SIJILL_ADMIN_TOKEN` | *(none)*. Bearer token for `/api/admin/*`. Unset disables those endpoints (503) |
 | `SIJILL_HALT_PATH` | `sijill.halt`. Flag file; while it exists every call is blocked and sealed |

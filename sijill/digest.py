@@ -8,6 +8,7 @@ weights cannot be located gets an empty digest, which no allowlist contains.
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 
 
@@ -57,5 +58,8 @@ class DigestResolver:
                 for chunk in iter(lambda: f.read(1 << 22), b""):
                     h.update(chunk)
             self.cache[key] = f"sha256:{h.hexdigest()}"
-            self.cache_path.write_text(json.dumps(self.cache, indent=2))
+            try:
+                self.cache_path.write_text(json.dumps(self.cache, indent=2))
+            except OSError as e:  # the digest is still right; only the on-disk cache is lost
+                print(f"sijill: digest cache not written ({self.cache_path}): {e}", file=sys.stderr)
         return self.cache[key]
