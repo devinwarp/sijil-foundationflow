@@ -1,0 +1,13 @@
+.git
+venv
+.env
+.env.*
+node.key
+node.pub
+*.db
+.sijill_digests.json
+.pytest_cache
+**/__pycache__
+docs
+site
+dist
