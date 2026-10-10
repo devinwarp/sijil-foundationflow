@@ -2,7 +2,11 @@
 
 import importlib.util
 import json
+import re
 import socket
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from conftest import ROOT, ask
 from sijill.store import Store
@@ -53,3 +57,51 @@ def test_syslog_over_udp(tmp_path):
     siem.send_udp(("127.0.0.1", sink.getsockname()[1]), siem.syslog_line(REC, "auh-node-01"))
     data = sink.recv(65535).decode()
     assert data.startswith("<132>1 2026-10-10T08:00:00.000Z auh-node-01 sijil - - - CEF:0|")
+
+
+def test_backlog_larger_than_one_page_forwards_contiguously(chain, tmp_path):
+    db, _ = chain                                    # 50 records
+    store = Store(str(db))
+
+    class Pages(BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = parse_qs(urlparse(self.path).query)
+            body = json.dumps({"records": store.after(int(q["after"][0]), int(q["limit"][0]))}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    http = HTTPServer(("127.0.0.1", 0), Pages)
+    threading.Thread(target=http.serve_forever, daemon=True).start()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    received = []
+
+    def reader():
+        conn, _ = listener.accept()
+        with conn:
+            buf = b""
+            while chunk := conn.recv(65535):
+                buf += chunk
+        received.extend(buf.decode().splitlines())
+
+    t = threading.Thread(target=reader)
+    t.start()
+    state = tmp_path / "siem.state"
+    try:
+        last = siem.run(f"http://127.0.0.1:{http.server_port}", ("127.0.0.1", listener.getsockname()[1]),
+                        state, page=3, once=True)
+        t.join(5)
+    finally:
+        http.shutdown()
+        http.server_close()
+        listener.close()
+    seqs = [int(re.search(r" cn1=(\d+) ", line).group(1)) for line in received]
+    assert seqs == list(range(1, 51))
+    assert last == 50 and state.read_text() == "50"

@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Forward Sijil ledger records to a SIEM as CEF over syslog (RFC 5424; UDP, or TCP newline-framed).
+"""Forward Sijil ledger records to a SIEM as CEF over syslog (RFC 5424).
 
-    python scripts/siem_forward.py --url http://127.0.0.1:8000 --sink siem.local:514 [--tcp]
+    python scripts/siem_forward.py --url http://127.0.0.1:8000 --sink siem.local:514 [--udp]
 
-Stdlib only. Remembers the last forwarded seq in --state so restarts neither skip nor repeat records.
+Transport is TCP (newline-framed) by default. --udp opts in to UDP, which is fire-and-forget:
+it can silently drop records under load, so use it only where the SIEM cannot take TCP.
+
+Stdlib only. Remembers the last forwarded seq in --state. Delivery is at-least-once: a crash
+mid-page resends up to one page on restart; no record is skipped.
 """
 
 import argparse
 import json
+import os
 import socket
 import time
 from datetime import datetime
@@ -47,28 +52,59 @@ def send_udp(addr: tuple[str, int], line: str) -> None:
         s.sendto(line.encode(), addr)
 
 
-def run(url: str, sink: tuple[str, int], state_path: Path, tcp: bool = False, interval: float = 2.0,
-        token: str = "", once: bool = False) -> int:
-    """Forward records after the saved seq. `once` drains the whole backlog, then returns."""
-    last = int(state_path.read_text()) if state_path.exists() else 0
-    conn = socket.create_connection(sink) if tcp else None
+def _load_state(path: Path) -> int:
+    return int(path.read_text()) if path.exists() else 0
+
+
+def _save_state(path: Path, seq: int) -> None:
+    tmp = path.with_name(path.name + ".tmp")     # same directory, so os.replace is atomic
+    tmp.write_text(str(seq))
+    os.replace(tmp, path)
+
+
+def run(url: str, sink: tuple[str, int], state_path: Path, udp: bool = False, interval: float = 2.0,
+        token: str = "", once: bool = False, page: int = 1000) -> int:
+    """Forward records after the saved seq; returns the last forwarded seq.
+
+    `once` drains the whole backlog then returns, and errors propagate. Otherwise the loop
+    retries forever: on OSError it sleeps, reconnects TCP, and resumes from the saved seq.
+    State advances only after a whole page has been sent.
+    """
+    state = _load_state(state_path)
     headers = {"Authorization": f"Bearer {token}"} if token else {}
+    conn = None
     try:
         while True:
-            with urlopen(Request(f"{url}/api/records?after={last}&limit=1000", headers=headers)) as r:
-                page = json.load(r)["records"]
-            for rec in page:
-                line = syslog_line(rec, rec["node_id"])
-                conn.sendall((line + "\n").encode()) if conn else send_udp(sink, line)
-                last = rec["seq"]
-            if page:
-                state_path.write_text(str(last))
-            if not page:
+            try:
+                if not udp and conn is None:
+                    conn = socket.create_connection(sink)
+                with urlopen(Request(f"{url}/api/records?after={state}&limit={page}", headers=headers)) as r:
+                    recs = json.load(r)["records"]
+                cursor = state
+                for rec in recs:
+                    line = syslog_line(rec, rec["node_id"])
+                    if udp:
+                        send_udp(sink, line)
+                    else:
+                        conn.sendall((line + "\n").encode())
+                    cursor = rec["seq"]
+            except OSError:
                 if once:
-                    return last
+                    raise
+                if conn is not None:
+                    conn.close()
+                    conn = None
+                time.sleep(interval)
+                continue
+            if recs:
+                _save_state(state_path, cursor)
+                state = cursor
+            elif once:
+                return state
+            else:
                 time.sleep(interval)
     finally:
-        if conn:
+        if conn is not None:
             conn.close()
 
 
@@ -76,9 +112,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--url", default="http://127.0.0.1:8000")
     ap.add_argument("--sink", required=True, help="host:port of the syslog receiver")
-    ap.add_argument("--tcp", action="store_true")
+    ap.add_argument("--udp", action="store_true", help="UDP instead of TCP; may drop records under load")
     ap.add_argument("--state", default=".siem_state")
     ap.add_argument("--interval", type=float, default=2.0)
     a = ap.parse_args()
     host, port = a.sink.rsplit(":", 1)
-    run(a.url, (host, int(port)), Path(a.state), a.tcp, a.interval)
+    run(a.url, (host, int(port)), Path(a.state), udp=a.udp, interval=a.interval)
