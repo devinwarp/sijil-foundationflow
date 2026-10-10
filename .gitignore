@@ -23,3 +23,6 @@ docs/presentation/*
 !docs/presentation/Sijil — Fish Tank pitch v2.html
 .sijill_digests.json
 docs/demo_script.md
+
+# Offline bundle output
+dist/

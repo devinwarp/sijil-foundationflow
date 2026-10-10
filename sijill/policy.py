@@ -13,6 +13,11 @@ RULE_TYPES = ("region_allowlist", "model_allowlist", "keyword_flag")
 # Reserved pseudo-rule id written to rule_hits when the model runtime failed.
 UPSTREAM_ERROR_HIT = "upstream_error"
 
+# Reserved pseudo-rule ids for the operator halt switch.
+HALT_HIT = "halted"
+RESUME_HIT = "resumed"
+RESERVED_IDS = (UPSTREAM_ERROR_HIT, HALT_HIT, RESUME_HIT)
+
 # Each rule type must carry one list-of-strings key; keyword terms must be non-empty.
 REQUIRED_KEYS = {
     "region_allowlist": ("allow", False),
@@ -45,8 +50,8 @@ def load(path: str | Path) -> Policy:
     for r in rules:
         if r.get("type") not in RULE_TYPES or r.get("mode") not in MODES or not r.get("id"):
             raise ValueError(f"invalid rule in {path}: {r}")
-        if r["id"] == UPSTREAM_ERROR_HIT:
-            raise ValueError(f"rule id {UPSTREAM_ERROR_HIT!r} is reserved in {path}")
+        if r["id"] in RESERVED_IDS:
+            raise ValueError(f"rule id {r['id']!r} is reserved in {path}")
         key, non_empty = REQUIRED_KEYS[r["type"]]
         vals = r.get(key)
         if (not isinstance(vals, list) or not all(isinstance(v, str) for v in vals)

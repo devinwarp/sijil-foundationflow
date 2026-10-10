@@ -18,6 +18,8 @@ VERIFIER = ROOT / "verifier" / "sijill_verify.py"
 TAMPER = ROOT / "scripts" / "tamper.sh"
 APPROVED_DIGEST = "sha256:0fbba6b2d3fb9d319e546e91f7f04c44ce8278f1c2a133ca6db1e76619256be1"
 MODEL = "llama-3.2-3b-instruct"
+ADMIN_TOKEN = "test-admin"
+ADMIN = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
 def verify(db, pub) -> tuple[int, str]:
@@ -83,9 +85,10 @@ def node(tmp_path):
     shutil.copy(ROOT / "policy.yaml", tmp_path / "policy.yaml")
     settings = Settings(db_path=str(tmp_path / "sijill.db"), policy_path=str(tmp_path / "policy.yaml"),
                         key_path=str(tmp_path / "node.key"), pubkey_path=str(tmp_path / "node.pub"),
-                        upstream="http://model.test/v1")
+                        upstream="http://model.test/v1", admin_token=ADMIN_TOKEN,
+                        halt_path=str(tmp_path / "sijill.halt"))
     app = create_app(settings, transport=httpx.MockTransport(stub_model), resolver=StubResolver())
-    with TestClient(app) as client:
+    with TestClient(app, headers=ADMIN) as client:
         yield client, settings
 
 
@@ -101,15 +104,26 @@ def node_with(tmp_path):
             shutil.copy(ROOT / "policy.yaml", tmp_path / "policy.yaml")
         settings = Settings(db_path=str(tmp_path / "sijill.db"), policy_path=str(tmp_path / "policy.yaml"),
                             key_path=str(tmp_path / "node.key"), pubkey_path=str(tmp_path / "node.pub"),
-                            upstream="http://model.test/v1")
+                            upstream="http://model.test/v1", admin_token=ADMIN_TOKEN,
+                            halt_path=str(tmp_path / "sijill.halt"))
         app = create_app(settings, transport=httpx.MockTransport(handler), resolver=StubResolver())
-        return TestClient(app), settings
+        return TestClient(app, headers=ADMIN), settings
     return make
 
 
 def ask(client, content: str, model: str = MODEL):
     return client.post("/v1/chat/completions",
                        json={"model": model, "messages": [{"role": "user", "content": content}], "max_tokens": 16})
+
+
+def sse(chunks: list[str], done: bool = True) -> bytes:
+    events = "".join(
+        f"data: {json.dumps({'choices': [{'index': 0, 'delta': {'content': c}}]})}\n\n" for c in chunks)
+    return (events + ("data: [DONE]\n\n" if done else "")).encode()
+
+
+def stub_stream(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, content=sse(["Stub ", "answer"]), headers={"content-type": "text/event-stream"})
 
 
 def rows(db, where: str = "1=1") -> list[dict]:

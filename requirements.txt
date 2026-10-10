@@ -1,3 +1,4 @@
+anyio==4.15.1
 cryptography==50.0.1
 fastapi==0.141.1
 httpx==0.28.1
@@ -7,3 +8,5 @@ python-dotenv==1.2.3
 PyYAML==6.0.3
 uvicorn[standard]==0.54.0
 weasyprint==70.0
+python-pkcs11==0.10.0
+asn1crypto==1.5.1

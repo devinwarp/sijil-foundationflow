@@ -47,6 +47,12 @@ The first run creates `node.key` (Ed25519 private key, mode 0600), `node.pub` an
 | `SIJILL_MODEL` | `llama-3.2-3b-instruct` |
 | `SIJILL_MODELS_DIR` | LM Studio `downloadsFolder` |
 | `SIJILL_ENTITY` | `Ministry of Citizen Services` (report) |
+| `SIJILL_ADMIN_TOKEN` | *(none)*. Bearer token for `/api/admin/*`. Unset disables those endpoints (503) |
+| `SIJILL_HALT_PATH` | `sijill.halt`. Flag file; while it exists every call is blocked and sealed |
+| `SIJILL_PKCS11_MODULE` | *(none)*. Path to the vendor PKCS#11 library. Setting it selects HSM signing |
+| `SIJILL_PKCS11_TOKEN` | Token label on the HSM |
+| `SIJILL_PKCS11_KEY` | Label of the Ed25519 key object on the token |
+| `SIJILL_PKCS11_PIN` | User PIN for the token session |
 
 ## Commands
 
@@ -63,15 +69,16 @@ python -m pytest                                                    # acceptance
 
 | Method and path | Purpose |
 | --- | --- |
-| `POST /v1/chat/completions` | OpenAI-compatible, non-streaming. Blocked calls get HTTP 403 with the record's `seq` |
+| `POST /v1/chat/completions` | OpenAI-compatible. `"stream": true` is supported and sealed on the full answer, even if the client hangs up. Blocked calls get HTTP 403 with the record's `seq` |
 | `GET /api/records?since=N` | Records with seq > N, plus the total count |
 | `GET /api/policy` | Rules and modes, node id, current region |
 | `GET /api/verify` | Runs the verifier CLI as a subprocess and returns its output |
 | `POST /api/admin/policy/reload` | Re-reads `policy.yaml`. Any change to the file writes a `policy_change` record, and so does a change made while the proxy was down, at the next startup |
 | `POST /api/admin/node/region` | `{"region": "SG"}`. Writes a `policy_change` record |
+| `POST /api/admin/halt` | `{"halted": true}` blocks and seals every call until `{"halted": false}`. The halt survives restart (`SIJILL_HALT_PATH`) |
 | `GET /api/report?from=&to=` | The audit PDF |
 
-**The admin endpoints have no authentication.** This is a local demo build.
+**Admin endpoints need `Authorization: Bearer $SIJILL_ADMIN_TOKEN`.** They return 401 when the token is wrong, and are disabled (503) when `SIJILL_ADMIN_TOKEN` is unset.
 
 Every response carries `X-Sijill-Seq`, `X-Sijill-Decision`, `X-Sijill-Record-Hash` and `X-Sijill-Overhead-Ms`. The last is handler time minus the time spent waiting on the model.
 
@@ -126,6 +133,14 @@ Fallback: a pre-generated `report.pdf` and the screen recording.
 ## Honest boundaries
 
 Sijill proves records haven't been altered since they were sealed. It doesn't prove the sealing process was honest: node identity and region are asserted by the node and signed with its key, not bound to hardware. Hardware root of trust (TEE / GPU attestation) is roadmap. The chain also can't detect truncation of its newest records while the node is offline. Anchoring the chain head externally would fix that.
+
+HSM signing is optional over PKCS#11 (`SIJILL_PKCS11_*`). When it is configured, a failing HSM at startup stops the proxy; there is no key-file fallback. HSM custody limits key theft, not a compromised host. Enabling the HSM on a database signed by another key is refused at startup: rotate to the HSM key on a new database.
+
+Halt stops what has not started. A stream in flight stops at its next chunk and is sealed `block` with `halted` and `upstream_error`. A non-streamed call already forwarded to the model completes and is sealed `allow` after the `halted` record.
+
+A streamed answer is sealed after it reaches the client. If the signer fails at that moment (say the HSM session drops), the client has an answer the ledger does not hold.
+
+Read endpoints (`/api/records`, `/api/policy`, `/api/verify`, `/api/report`, and the dashboard at `/`) are unauthenticated in the pilot build and are expected behind the entity's SSO reverse proxy.
 
 ## Layout
 

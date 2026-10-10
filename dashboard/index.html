@@ -275,8 +275,10 @@ async function ask(kind, button) {
 $("ask-plain").onclick = (e) => ask("plain", e.currentTarget);
 $("ask-sensitive").onclick = (e) => ask("sensitive", e.currentTarget);
 $("region-select").onchange = async (e) => {
+  const admin = new URLSearchParams(location.hash.slice(1)).get("admin") || "";
   await getJSON("/api/admin/node/region", {
-    method: "POST", headers: { "Content-Type": "application/json" },
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${admin}` },
     body: JSON.stringify({ region: e.target.value }),
   });
   e.target.blur();

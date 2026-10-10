@@ -4,10 +4,12 @@ Run a single worker (records are sealed under an in-process lock):
 
     uvicorn sijill.proxy:app --port 8000 --env-file .env.local
 
-Admin endpoints have NO authentication. This is a local demo build; say so.
+Admin endpoints require `Authorization: Bearer $SIJILL_ADMIN_TOKEN`; with no token set they are disabled.
 """
 
 import asyncio
+import hmac
+import json
 import os
 import sys
 import tempfile
@@ -16,9 +18,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 
+import anyio
 import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from cryptography.hazmat.primitives import serialization
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
 from . import keys, policy, record
@@ -44,6 +48,12 @@ class Settings:
     upstream_token: str = ""
     default_model: str = "llama-3.2-3b-instruct"
     upstream_timeout: float = 120.0
+    admin_token: str = ""
+    pkcs11_module: str = ""
+    pkcs11_token: str = ""
+    pkcs11_key: str = ""
+    pkcs11_pin: str = ""
+    halt_path: str = "sijill.halt"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -57,6 +67,12 @@ class Settings:
             upstream_token=e("LM_API_TOKEN", ""),
             default_model=e("SIJILL_MODEL", cls.default_model),
             upstream_timeout=float(e("UPSTREAM_TIMEOUT", cls.upstream_timeout)),
+            admin_token=e("SIJILL_ADMIN_TOKEN", ""),
+            pkcs11_module=e("SIJILL_PKCS11_MODULE", ""),
+            pkcs11_token=e("SIJILL_PKCS11_TOKEN", ""),
+            pkcs11_key=e("SIJILL_PKCS11_KEY", ""),
+            pkcs11_pin=e("SIJILL_PKCS11_PIN", ""),
+            halt_path=e("SIJILL_HALT_PATH", cls.halt_path),
         )
 
 
@@ -67,7 +83,23 @@ class Node:
                  resolver: DigestResolver | None = None):
         self.settings = settings
         self.store = Store(settings.db_path)
-        self.key = keys.load_or_generate(settings.key_path, settings.pubkey_path)
+        if settings.pkcs11_module:
+            # No fallback to a key file: a configured HSM that fails is a startup error.
+            from .hsm import Pkcs11Signer
+            self.key = Pkcs11Signer(settings.pkcs11_module, settings.pkcs11_token,
+                                    settings.pkcs11_key, settings.pkcs11_pin)
+            pem = self.key.public_key().public_bytes(serialization.Encoding.PEM,
+                                                     serialization.PublicFormat.SubjectPublicKeyInfo)
+            pub_path = Path(settings.pubkey_path)
+            if self.store.last() and pub_path.exists() and pub_path.read_bytes() != pem:
+                # Overwriting node.pub would make every earlier record fail verification.
+                self.key.close()
+                self.store.close()
+                raise RuntimeError(f"chain in {settings.db_path} was signed by a different key than the HSM "
+                                   f"key; start a new database to rotate to the HSM key")
+            pub_path.write_bytes(pem)
+        else:
+            self.key = keys.load_or_generate(settings.key_path, settings.pubkey_path)
         self.policy = policy.load(settings.policy_path)
         last = self.store.last()
         self.region = last["node_region"] if last else self.policy.node_region
@@ -75,6 +107,7 @@ class Node:
         # deleted or edited at the tail while running still shows up as a break.
         self.head = self.store.head()
         self.lock = asyncio.Lock()
+        self.halted = Path(settings.halt_path).exists()
         self.resolver = resolver or DigestResolver()
         headers = {"Authorization": f"Bearer {settings.upstream_token}"} if settings.upstream_token else {}
         self.client = httpx.AsyncClient(base_url=settings.upstream, headers=headers,
@@ -110,6 +143,9 @@ class Node:
     async def aclose(self) -> None:
         await self.client.aclose()
         self.store.close()
+        close = getattr(self.key, "close", None)  # HSM signer only; file keys have none
+        if close:
+            close()
 
 
 def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTransport | None = None,
@@ -131,6 +167,13 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
     def node(request: Request) -> Node:
         return request.app.state.node
 
+    def require_admin(request: Request) -> None:
+        if not settings.admin_token:
+            raise HTTPException(503, "admin endpoints disabled: set SIJILL_ADMIN_TOKEN")
+        supplied = request.headers.get("authorization", "").encode()
+        if not hmac.compare_digest(supplied, f"Bearer {settings.admin_token}".encode()):
+            raise HTTPException(401, "admin token required")
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
         t0 = perf_counter()
@@ -141,13 +184,13 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             raise HTTPException(400, "request body must be JSON")
         if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
             raise HTTPException(400, "`messages` must be a list")
-        if payload.get("stream"):
-            raise HTTPException(400, "streaming is not supported by Sijill")
 
         model_id = str(payload.get("model") or settings.default_model)
         digest = await asyncio.to_thread(n.resolver.resolve, model_id)
         pol, region = n.policy, n.region
         decision, mode, hits = policy.evaluate(pol, region, digest, payload["messages"])
+        if n.halted:
+            decision, mode, hits = "block", "enforce", [policy.HALT_HIT]
         body = n.body(pol, "inference", model_id=model_id, model_digest=digest, mode=mode, decision=decision,
                       rule_hits=policy.rule_hits_json(hits), input_hash=record.input_hash(payload["messages"]))
 
@@ -171,6 +214,73 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             return JSONResponse(status_code=status, headers=headers(rec, upstream_ms), content=content)
 
         t1 = perf_counter()
+        if payload.get("stream"):
+            req = n.client.build_request("POST", "/chat/completions", json={**payload, "model": model_id})
+            try:
+                resp = await n.client.send(req, stream=True)
+            except httpx.HTTPError as e:
+                return await upstream_failed(
+                    502, {"error": {"message": f"model runtime unreachable: {e!r}",
+                                    "type": UPSTREAM_ERROR_TYPE}}, (perf_counter() - t1) * 1000)
+            if resp.status_code != 200:
+                raw = await resp.aread()
+                await resp.aclose()
+                try:
+                    content = json.loads(raw)
+                except ValueError:
+                    content = {"error": {"message": raw.decode(errors="replace")}}
+                return await upstream_failed(resp.status_code, content, (perf_counter() - t1) * 1000)
+
+            async def relay():
+                parts, done, errored, rec = [], False, False, None
+                try:
+                    async for line in resp.aiter_lines():
+                        if n.halted:  # operator halt lands mid-stream: stop relaying now
+                            break
+                        if line == "data: [DONE]":
+                            done = True
+                            break
+                        if line.startswith("data: "):
+                            try:
+                                event = json.loads(line[6:])
+                            except ValueError:
+                                event = None
+                            if isinstance(event, dict) and "error" in event:
+                                errored = True  # in-stream failure (vLLM), even if [DONE] follows
+                            try:
+                                delta = event["choices"][0].get("delta") or {}
+                            except (KeyError, IndexError, TypeError, AttributeError):
+                                delta = {}
+                            if isinstance(delta.get("content"), str):
+                                parts.append(delta["content"])
+                        yield (line + "\n").encode()
+                finally:
+                    # Read the halt flag here, with no await before the seal: a halt that has flipped
+                    # it has its `halted` record sealed or queued ahead of ours on the lock.
+                    halted = n.halted
+                    if done and not errored and not halted:
+                        sealed = {**body, "output_hash": record.output_hash("".join(parts))}
+                    elif halted:
+                        sealed = {**body, "decision": "block", "mode": "enforce", "rule_hits": policy.rule_hits_json(
+                            hits + [policy.HALT_HIT, policy.UPSTREAM_ERROR_HIT])}
+                    else:
+                        sealed = {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT])}
+                    # Shielded: a client hang-up cancels this task (anyio, level-triggered), but the call
+                    # must still be sealed. Seal first; closing the upstream may itself yield. The close
+                    # runs even if the seal raises, so a signer outage does not leak the connection.
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            rec = await n.seal(sealed)
+                        finally:
+                            await resp.aclose()
+                yield (f": sijill seq={rec['seq']} decision={rec['decision']} "
+                       f"record_hash={rec['record_hash']}\n\n").encode()
+                if done and not halted:
+                    yield b"data: [DONE]\n\n"
+
+            return StreamingResponse(relay(), media_type="text/event-stream",
+                                     headers={"X-Sijill-Decision": decision, "Cache-Control": "no-cache"})
+
         try:
             resp = await n.client.post("/chat/completions", json={**payload, "model": model_id})
         except httpx.HTTPError as e:
@@ -205,9 +315,11 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         return JSONResponse(content=data, headers=headers(rec, upstream_ms))
 
     @app.get("/api/records")
-    async def records(request: Request, since: int = 0, limit: int = 200):
+    async def records(request: Request, since: int = 0, limit: int = 200, after: int | None = None):
         n = node(request)
-        return {"total": n.store.count(), "records": n.store.since(since, max(1, min(limit, 1000)))}
+        limit = max(1, min(limit, 1000))
+        page = n.store.after(after, limit) if after is not None else n.store.since(since, limit)
+        return {"total": n.store.count(), "records": page}
 
     @app.get("/api/policy")
     async def current_policy(request: Request):
@@ -217,7 +329,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 "policy_hash": p.hash, "node_id": p.node_id, "region": n.region,
                 "region_allowed": p.region_allowed(n.region), "model": settings.default_model,
                 "rules": [{"id": r["id"], "type": r["type"], "mode": r["mode"]} for r in p.rules],
-                "admin_auth": "none (demo build)"}
+                "admin_auth": "token" if settings.admin_token else "disabled"}
 
     @app.get("/api/verify")
     async def verify():
@@ -229,7 +341,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "output": out.decode().strip(),
                 "checked_at": record.now_ts()}
 
-    @app.post("/api/admin/policy/reload")
+    @app.post("/api/admin/policy/reload", dependencies=[Depends(require_admin)])
     async def reload_policy(request: Request):
         n = node(request)
         try:
@@ -241,7 +353,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         changed = policy.mode_changes(old, new)
         return {"changed": changed, "seq": rec and rec["seq"], "policy_hash": new.hash}
 
-    @app.post("/api/admin/node/region")
+    @app.post("/api/admin/node/region", dependencies=[Depends(require_admin)])
     async def set_region(request: Request):
         n = node(request)
         region = (await request.json()).get("region")
@@ -253,6 +365,21 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         n.region = region
         rec = await n.seal(n.body(n.policy, "policy_change"))
         return {"region": region, "region_allowed": n.policy.region_allowed(region), "seq": rec["seq"]}
+
+    @app.post("/api/admin/halt", dependencies=[Depends(require_admin)])
+    async def halt(request: Request):
+        n = node(request)
+        want = (await request.json()).get("halted")
+        if not isinstance(want, bool):
+            raise HTTPException(400, 'body must be {"halted": true|false}')
+        if want == n.halted:
+            return {"halted": want, "seq": None}
+        flag = Path(settings.halt_path)
+        flag.touch() if want else flag.unlink(missing_ok=True)
+        n.halted = want
+        hit = policy.HALT_HIT if want else policy.RESUME_HIT
+        rec = await n.seal(n.body(n.policy, "policy_change", rule_hits=policy.rule_hits_json([hit])))
+        return {"halted": want, "seq": rec["seq"]}
 
     @app.get("/api/report")
     async def report(request: Request):
