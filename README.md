@@ -134,7 +134,11 @@ Fallback: a pre-generated `report.pdf` and the screen recording.
 
 Sijill proves records haven't been altered since they were sealed. It doesn't prove the sealing process was honest: node identity and region are asserted by the node and signed with its key, not bound to hardware. Hardware root of trust (TEE / GPU attestation) is roadmap. The chain also can't detect truncation of its newest records while the node is offline. Anchoring the chain head externally would fix that.
 
-HSM signing is optional over PKCS#11 (`SIJILL_PKCS11_*`). When it is configured, a failing HSM at startup stops the proxy; there is no key-file fallback. HSM custody limits key theft, not a compromised host.
+HSM signing is optional over PKCS#11 (`SIJILL_PKCS11_*`). When it is configured, a failing HSM at startup stops the proxy; there is no key-file fallback. HSM custody limits key theft, not a compromised host. Enabling the HSM on a database signed by another key is refused at startup: rotate to the HSM key on a new database.
+
+Halt stops what has not started. A stream in flight stops at its next chunk and is sealed `block` with `halted` and `upstream_error`. A non-streamed call already forwarded to the model completes and is sealed `allow` after the `halted` record.
+
+A streamed answer is sealed after it reaches the client. If the signer fails at that moment (say the HSM session drops), the client has an answer the ledger does not hold.
 
 Read endpoints (`/api/records`, `/api/policy`, `/api/verify`, `/api/report`, and the dashboard at `/`) are unauthenticated in the pilot build and are expected behind the entity's SSO reverse proxy.
 

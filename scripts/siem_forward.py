@@ -67,7 +67,8 @@ def run(url: str, sink: tuple[str, int], state_path: Path, udp: bool = False, in
     """Forward records after the saved seq; returns the last forwarded seq.
 
     `once` drains the whole backlog then returns, and errors propagate. Otherwise the loop
-    retries forever: on OSError it sleeps, reconnects TCP, and resumes from the saved seq.
+    retries forever: on a network error or a response that is not the records JSON (e.g. an SSO
+    login page) it sleeps, reconnects TCP, and resumes from the saved seq.
     State advances only after a whole page has been sent.
     """
     state = _load_state(state_path)
@@ -88,7 +89,7 @@ def run(url: str, sink: tuple[str, int], state_path: Path, udp: bool = False, in
                     else:
                         conn.sendall((line + "\n").encode())
                     cursor = rec["seq"]
-            except OSError:
+            except (OSError, ValueError, KeyError):  # ValueError/KeyError: not the records API (e.g. SSO page)
                 if once:
                     raise
                 if conn is not None:

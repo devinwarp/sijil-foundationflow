@@ -105,3 +105,55 @@ def test_backlog_larger_than_one_page_forwards_contiguously(chain, tmp_path):
     seqs = [int(re.search(r" cn1=(\d+) ", line).group(1)) for line in received]
     assert seqs == list(range(1, 51))
     assert last == 50 and state.read_text() == "50"
+
+
+def test_daemon_survives_non_json_response(tmp_path, monkeypatch):
+    """An SSO proxy answering with an HTML login page must not kill the daemon; it retries."""
+    import pytest
+    served = []
+
+    class LoginThenRecords(BaseHTTPRequestHandler):
+        def do_GET(self):
+            served.append(self.path)
+            if len(served) == 1:
+                body, ctype = b"<html>Sign in</html>", "text/html"
+            else:
+                after = int(parse_qs(urlparse(self.path).query)["after"][0])
+                body, ctype = json.dumps({"records": [REC] if after < REC["seq"] else []}).encode(), "application/json"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    class Stop(Exception):
+        pass
+
+    sleeps = []
+
+    def sleep(_):                      # 1st: retry after the HTML page; 2nd: idle with nothing new, stop
+        sleeps.append(1)
+        if len(sleeps) == 2:
+            raise Stop
+
+    monkeypatch.setattr(siem.time, "sleep", sleep)
+    http = HTTPServer(("127.0.0.1", 0), LoginThenRecords)
+    threading.Thread(target=http.serve_forever, daemon=True).start()
+    sink = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sink.bind(("127.0.0.1", 0))
+    url, state = f"http://127.0.0.1:{http.server_port}", tmp_path / "siem.state"
+    try:
+        with pytest.raises(Stop):
+            siem.run(url, ("127.0.0.1", sink.getsockname()[1]), state, udp=True)
+        served.clear()
+        with pytest.raises(ValueError):  # once mode still propagates
+            siem.run(url, ("127.0.0.1", sink.getsockname()[1]), tmp_path / "other.state", udp=True, once=True)
+    finally:
+        http.shutdown()
+        http.server_close()
+    assert " cn1=7 " in sink.recv(65535).decode()
+    assert state.read_text() == "7"
+    sink.close()

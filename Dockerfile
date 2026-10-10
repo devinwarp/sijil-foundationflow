@@ -1,5 +1,5 @@
 FROM python:3.11-slim
-# weasyprint needs pango for the PDF report; sqlite3 CLI is used by scripts/tamper.sh demos
+# weasyprint needs pango for the PDF report; sqlite3 CLI takes consistent DB exports (INSTALL.txt step 6)
 RUN apt-get update && apt-get install -y --no-install-recommends libpango-1.0-0 libpangoft2-1.0-0 sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app

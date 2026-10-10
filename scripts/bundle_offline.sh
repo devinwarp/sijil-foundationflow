@@ -21,10 +21,12 @@ cat > "$OUT/INSTALL.txt" <<EOT
 4. Point agents' OpenAI base URL at http://<host>:8000/v1.
 5. SIEM: python3 scripts/siem_forward.py --url http://<host>:8000 --sink <siem>:514
    TCP is the default; add --udp for UDP-only syslog receivers.
-6. Copy the public key and DB out of the data volume (node.pub lives at /data/node.pub):
+6. Copy the public key and a consistent DB snapshot out of the data volume. The proxy may be writing,
+   so take an SQLite online backup first; a plain file copy can be torn and fail verification:
      docker run --rm -v sijil-data:/data --entrypoint cat sijil:$SHA /data/node.pub > node.pub
-     docker run --rm -v sijil-data:/data --entrypoint cat sijil:$SHA /data/sijill.db > sijill.db
-   Verify offline at any time: python3 verifier/sijill_verify.py --db sijill.db --pubkey node.pub
+     docker run --rm -v sijil-data:/data --entrypoint sqlite3 sijil:$SHA /data/sijill.db ".backup /data/export.db"
+     docker run --rm -v sijil-data:/data --entrypoint cat sijil:$SHA /data/export.db > export.db
+   Verify offline at any time: python3 verifier/sijill_verify.py --db export.db --pubkey node.pub
 EOT
 (cd dist && tar czf "sijil-$SHA.tar.gz" "sijil-$SHA")
 echo "dist/sijil-$SHA.tar.gz"
