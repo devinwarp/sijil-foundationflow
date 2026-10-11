@@ -47,7 +47,8 @@ entity's reverse proxy with SSO. The proxy host can still seal false records (RE
 HSM custody limits key theft, not a compromised host. A non-streamed call already forwarded to the model
 when the halt lands completes, and is sealed `allow` after the `halted` record. A streamed answer is
 sealed after it reaches the client, so a signer outage mid-stream leaves a delivered, unsealed answer.
-A stream halted mid-answer is sealed `block` with rule hits `halted` and `upstream_error` and an empty
-`output_hash`, even if part of the answer already reached the client. The record's decision enum is
-frozen, so auditors should read `block` with `halted` on a streamed call as "stopped mid-stream; partial
-output may have been delivered", not as "nothing was delivered".
+A stream halted mid-answer is sealed `block` with rule hits `halted` and `upstream_error`, even if part of
+the answer already reached the client. Its `output_hash` covers exactly the partial output delivered
+before the halt (empty if none was). The record's decision enum is frozen, so auditors should read `block`
+with `halted` on a streamed call as "stopped mid-stream; partial output may have been delivered", not as
+"nothing was delivered".

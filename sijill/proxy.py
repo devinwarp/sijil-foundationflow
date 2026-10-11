@@ -263,8 +263,11 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     if done and not errored and not halted:
                         sealed = {**body, "output_hash": record.output_hash("".join(parts))}
                     elif halted:
+                        # The halt is checked before each line is relayed, so `parts` is exactly the content
+                        # already delivered. Hash it like a completed stream; nothing delivered keeps "".
                         sealed = {**body, "decision": "block", "mode": "enforce", "rule_hits": policy.rule_hits_json(
-                            hits + [policy.HALT_HIT, policy.UPSTREAM_ERROR_HIT])}
+                            hits + [policy.HALT_HIT, policy.UPSTREAM_ERROR_HIT]),
+                            "output_hash": record.output_hash("".join(parts)) if parts else ""}
                     else:
                         sealed = {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT])}
                     # Shielded: a client hang-up cancels this task (anyio, level-triggered), but the call

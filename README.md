@@ -137,7 +137,7 @@ Sijill proves records haven't been altered since they were sealed. It doesn't pr
 
 HSM signing is optional over PKCS#11 (`SIJILL_PKCS11_*`). When it is configured, a failing HSM at startup stops the proxy; there is no key-file fallback. HSM custody limits key theft, not a compromised host. Enabling the HSM on a database signed by another key is refused at startup: rotate to the HSM key on a new database.
 
-Halt stops what has not started. A stream in flight stops at its next chunk and is sealed `block` with `halted` and `upstream_error`. Chunks relayed before the halt have already reached the client, so on a streamed call `block` with `halted` means stopped mid-stream, not nothing delivered. A non-streamed call already forwarded to the model completes and is sealed `allow` after the `halted` record.
+Halt stops what has not started. A stream in flight stops at its next chunk and is sealed `block` with `halted` and `upstream_error`. Chunks relayed before the halt have already reached the client, so on a streamed call `block` with `halted` means stopped mid-stream, not nothing delivered. Its `output_hash` covers that delivered partial output. A non-streamed call already forwarded to the model completes and is sealed `allow` after the `halted` record.
 
 A streamed answer is sealed after it reaches the client. If the signer fails at that moment (say the HSM session drops), the client has an answer the ledger does not hold.
 
