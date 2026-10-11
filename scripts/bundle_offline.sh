@@ -10,7 +10,7 @@ rm -rf "$OUT" && mkdir -p "$OUT"
 docker build -t "sijil:$SHA" .
 docker save "sijil:$SHA" | gzip > "$OUT/sijil-image-$SHA.tar.gz"
 cp -r policy.yaml verifier docs/OPERATOR_GUIDE.html "$OUT/"
-mkdir -p "$OUT/scripts" && cp scripts/siem_forward.py "$OUT/scripts/"
+mkdir -p "$OUT/scripts" && cp scripts/siem_forward.py scripts/migrate_v2.py "$OUT/scripts/"
 cat > "$OUT/INSTALL.txt" <<EOT
 Full install and day-to-day operation: open OPERATOR_GUIDE.html in any browser (works offline).
 
@@ -29,6 +29,13 @@ Full install and day-to-day operation: open OPERATOR_GUIDE.html in any browser (
      docker run --rm -v sijil-data:/data --entrypoint sqlite3 sijil:$SHA /data/sijill.db ".backup /data/export.db"
      docker run --rm -v sijil-data:/data --entrypoint cat sijil:$SHA /data/export.db > export.db
    Verify offline at any time: python3 verifier/sijill_verify.py --db export.db --pubkey node.pub
+
+Upgrading an existing install (M1 -> v2 schema): the new image refuses to open an M1 database until it is migrated.
+   a. Stop and remove the old container (docker stop <name> && docker rm <name>).
+   b. Back up first, using the ".backup" command from step 6 (write it to /data/pre-v2.db and copy it out).
+   c. Migrate in place (safe to repeat):
+     docker run --rm -v sijil-data:/data --entrypoint python sijil:$SHA scripts/migrate_v2.py /data/sijill.db
+   d. Start the new container with the command from step 3, then check /api/verify.
 EOT
 (cd dist && tar czf "sijil-$SHA.tar.gz" "sijil-$SHA")
 echo "dist/sijil-$SHA.tar.gz"

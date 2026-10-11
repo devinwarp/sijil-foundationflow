@@ -118,7 +118,8 @@ class Node:
     def body(self, pol: policy.Policy, type_: str, **fields) -> dict:
         base = dict(type=type_, model_id="", model_digest="", node_id=pol.node_id, node_region=self.region,
                     policy_id=pol.policy_id, policy_hash=pol.hash, approval_ref=pol.approval_ref,
-                    mode="record", decision="allow", rule_hits="[]", input_hash="", output_hash="")
+                    mode="record", decision="allow", rule_hits="[]", input_hash="", output_hash="",
+                    **{f: "" for f in record.EXT_FIELDS})   # v2 columns; set by the rows that use them
         return {**base, **fields}
 
     async def seal(self, body: dict) -> dict:

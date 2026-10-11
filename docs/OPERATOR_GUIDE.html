@@ -314,6 +314,7 @@ docker run --rm -v sijil-data:/data --entrypoint cat sijil:&lt;sha&gt; /data/sie
   <h2>Upgrades and key changes</h2>
   <ul>
     <li><strong>Upgrade:</strong> load the new bundle's image, then replace the container with the same volume, network and settings. The chain continues; run the health check after.</li>
+    <li><strong>Upgrading from an M1 install (v2 schema):</strong> the new image refuses to open an M1 database until it is migrated. Stop and remove the old container, take a backup with the <code>.backup</code> command from the export step, then run <code>docker run --rm -v sijil-data:/data --entrypoint python sijil:&lt;tag&gt; scripts/migrate_v2.py /data/sijill.db</code> (safe to repeat). Start the new container and run the health check.</li>
     <li><strong>Moving to an HSM:</strong> Sijil refuses to start if the HSM key differs from the key that signed the existing records. Export and archive the old chain with its <code>node.pub</code>, then start the HSM-backed node on a new volume.</li>
     <li><strong>New model version:</strong> fingerprint the new weights, add the digest to <code>approved_models</code>, reload the policy. Remove the old digest when the old model is retired.</li>
   </ul>

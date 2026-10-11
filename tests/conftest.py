@@ -22,10 +22,16 @@ ADMIN_TOKEN = "test-admin"
 ADMIN = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
-def verify(db, pub) -> tuple[int, str]:
-    r = subprocess.run([sys.executable, str(VERIFIER), "--db", str(db), "--pubkey", str(pub), "--plain"],
+def verify(db, pub, *flags) -> tuple[int, str]:
+    r = subprocess.run([sys.executable, str(VERIFIER), "--db", str(db), "--pubkey", str(pub), "--plain", *flags],
                        capture_output=True, text=True)
     return r.returncode, r.stdout.strip()
+
+
+def verify_json(db, pub, *flags) -> tuple[int, dict]:
+    r = subprocess.run([sys.executable, str(VERIFIER), "--db", str(db), "--pubkey", str(pub), "--json", *flags],
+                       capture_output=True, text=True)
+    return r.returncode, json.loads(r.stdout)
 
 
 def sqlite(db, sql: str) -> str:
@@ -45,7 +51,8 @@ def make_chain(db: Path, key, n: int = 50) -> None:
     for seq in range(1, n + 1):
         decision, mode, hits = [("allow", "record", []), ("flag", "record", ["sensitive_terms"]),
                                 ("block", "enforce", ["residency"])][seq % 3]
-        body = dict(type="inference", ts=record.now_ts(), model_id=MODEL, model_digest=APPROVED_DIGEST,
+        body = dict(**{f: "" for f in record.EXT_FIELDS},
+                    type="inference", ts=record.now_ts(), model_id=MODEL, model_digest=APPROVED_DIGEST,
                     node_id="auh-node-01", node_region="AE-AZ", policy_id="gov-assistant", policy_hash="a" * 64,
                     approval_ref="APR-0147", mode=mode, decision=decision, rule_hits=json.dumps(hits),
                     input_hash=record.input_hash([{"role": "user", "content": f"question {seq} سؤال"}]),
