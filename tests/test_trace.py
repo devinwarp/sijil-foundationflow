@@ -101,3 +101,26 @@ def test_trace_imports_nothing_from_sijill():
     names = [a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names]
     names += [n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
     assert not [m for m in names if m == "sijill" or m.startswith("sijill.")]
+
+
+def test_read_rows_is_lazy(tmp_path):
+    import sqlite3
+    sys.path.insert(0, str(ROOT / "verifier"))
+    import sijill_verify
+    db, _ = v2chain.demo().write(tmp_path)
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    rows = sijill_verify.read_rows(conn)
+    assert iter(rows) is rows and not isinstance(rows, list)
+    conn.close()
+
+
+def test_cyclic_parent_seq_terminates_under_no_verify(tmp_path):
+    sys.path.insert(0, str(ROOT / "verifier"))
+    import sijill_trace
+    recs = sijill_trace.load(v2chain.demo().write(tmp_path)[0])
+    recs[9]["parent_seq"] = "9"                       # self-reference
+    recs[8]["parent_seq"] = "9"; recs[9]["parent_seq"] = "8"   # 2-cycle
+    tr = sijill_trace.trace(recs, 9)
+    assert 9 not in tr["children"] and 8 in tr["children"]
+    sijill_trace.render(recs, tr, "UNVERIFIED")

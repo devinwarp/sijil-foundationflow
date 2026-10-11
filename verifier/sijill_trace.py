@@ -88,11 +88,15 @@ def trace(recs, n):
         path.add(s)
         todo += [p for p in [ref(recs[s]["parent_seq"])] if p]
         todo += [c for c in recs[s]["_ext"].get("context_seqs", []) if isinstance(c, int)]
-    children, frontier = [], [(n, 0)]
-    while frontier:                               # downward, breadth-first
+    kids = {}
+    for s, r in recs.items():
+        kids.setdefault(ref(r["parent_seq"]), []).append(s)
+    children, frontier, seen = [], [(n, 0)], {n}
+    while frontier:                               # downward, breadth-first; a seq is expanded once (cycles)
         parent, depth = frontier.pop(0)
-        for s, r in recs.items():
-            if ref(r["parent_seq"]) == parent:
+        for s in kids.get(parent, []):
+            if s not in seen:
+                seen.add(s)
                 children.append((s, depth))
                 frontier.append((s, depth + 1))
     return {"seq": n, "task": task_seq if task else None, "task_end": task_end, "delegation": delegation,

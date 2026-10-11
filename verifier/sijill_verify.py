@@ -378,14 +378,14 @@ def counts(d):
 
 
 def read_rows(conn):
-    """All records in seq order as full-width FIELDS dicts (v1 and v2.0 stores: missing columns are "").
-    None when the database has no records table."""
+    """Lazy iterator of records in seq order as full-width FIELDS dicts (v1 and v2.0 stores: missing
+    columns are ""). None when the database has no records table."""
     have = {r["name"] for r in conn.execute("PRAGMA table_info(records)")}
     if not have:
         return None
     cols = [f for f in FIELDS if f in have]
-    return [{**dict.fromkeys(FIELDS, ""), **dict(row)}
-            for row in conn.execute(f"SELECT {', '.join(cols)} FROM records ORDER BY seq ASC")]
+    return ({**dict.fromkeys(FIELDS, ""), **dict(row)}
+            for row in conn.execute(f"SELECT {', '.join(cols)} FROM records ORDER BY seq ASC"))
 
 
 def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated=False):
