@@ -17,7 +17,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import record
+from . import policy, record, rulepack
 
 SPIFFE = re.compile(r"spiffe://[a-z0-9.-]+/agent/[a-z0-9._-]+")      # verifier check I2
 ID_SYNTAX = {"spiffe": r"spiffe://[a-z0-9.-]+/\S+", "wimse": r"wimse://[a-z0-9.-]+/\S+", "did": r"did:[a-z0-9]+:\S+",
@@ -25,6 +25,9 @@ ID_SYNTAX = {"spiffe": r"spiffe://[a-z0-9.-]+/\S+", "wimse": r"wimse://[a-z0-9.-
 PUBKEY = HEX64 = re.compile(r"[0-9a-f]{64}")
 DECIMAL = re.compile(r"[1-9][0-9]*")
 OUTCOMES = ("completed", "aborted", "blocked", "error", "timeout")
+SEALABLE = ("tool_call", "tool_result", "egress", "integrity_baseline", "integrity_drift")   # row 5; approval: 18g
+PARENT_TYPE = {"tool_call": "inference", "tool_result": "tool_call", "egress": "tool_call",
+               "integrity_drift": "integrity_baseline"}
 COUNTS = ("inference", "tool_calls", "blocked", "confirmed", "denied", "flagged", "egress")
 NONCE_TTL_S = 60
 PURPOSES = ("session", "register", "rotate")
@@ -188,6 +191,27 @@ def identity(sess: dict | None, task: dict | None) -> dict:
     return {"agent_id": "", "principal": "", "task_seq": ""}
 
 
+def check_parent(store, body: dict, ext: dict) -> None:
+    """What the verifier's A, A2, B2, B3, C and H3 would refuse later, refused before sealing."""
+    t, p = body["type"], body["parent_seq"]
+    if not p:
+        return                                     # record.py decides whether "" is allowed (correlation none)
+    parent = store.get(int(p)) if isinstance(p, str) and DECIMAL.fullmatch(p) else None
+    if parent is None or parent["type"] != PARENT_TYPE[t]:
+        raise HTTPException(400, f"parent_seq must be the seq of an earlier {PARENT_TYPE[t]}")
+    if t != "integrity_drift" and parent["task_seq"] != body["task_seq"]:
+        raise HTTPException(400, "parent in a different task")
+    if t == "tool_call":
+        uses = json.loads(parent["ext"]).get("tool_uses", []) if parent["ext"] else []
+        if not any(u.get("args_hash") == body["input_hash"] and ext.get("tool_use_id", u.get("id")) == u.get("id")
+                   for u in uses if isinstance(u, dict)):
+            raise HTTPException(400, "tool_call args not requested by parent")
+    if t == "tool_result" and store.has_child("tool_result", p):
+        raise HTTPException(409, f"duplicate tool_result for parent {p}")
+    if t == "integrity_drift" and body["input_hash"] != parent["input_hash"]:
+        raise HTTPException(400, "drift baseline mismatch")
+
+
 def task_counts(store, task_seq: int) -> dict:
     """task_end counts, as ints, with the verifier's L2 meanings; last_seq is the task_start when empty."""
     c, last = dict.fromkeys(COUNTS, 0), task_seq
@@ -345,6 +369,76 @@ def router(require_admin) -> APIRouter:
             x["reason"] = b["reason"][:128]
         return await seal_agent(n, "agent_revoke", aid, revoked_by, "", x, mode="enforce", decision="block",
                                 check=lambda: n.agents.current(aid, old))
+
+    @r.post("/api/agent/seal")
+    async def seal(request: Request, sess: dict = Depends(require_session)):
+        b = await body_of(request)
+        n, t = node(request), b.get("type")
+        if t not in SEALABLE:
+            raise HTTPException(400, f"type must be one of {SEALABLE}")
+        hits, x = b.get("rule_hits", []), b.get("ext", {})
+        if not isinstance(hits, list) or not all(isinstance(h, str) for h in hits) or not isinstance(x, dict):
+            raise HTTPException(400, "rule_hits must be a list of strings and ext an object")
+        if not isinstance(b.get("rulepack_hash"), str):
+            raise HTTPException(400, "rulepack_hash must be a string")
+        task = task_for(n, sess, b.get("task_seq"))
+        if task is None and t in record.TASK_REQUIRED:
+            raise HTTPException(409, "no open task in this agent session")
+        fields = {k: b.get(k, d) for k, d in (("parent_seq", ""), ("source_label", ""), ("mode", "record"),
+                                              ("decision", "allow"), ("input_hash", ""), ("output_hash", ""))}
+        if n.halted and t in ("tool_call", "tool_result", "egress"):   # the operator halt stops agents too
+            fields.update(mode="enforce", decision="block")
+            hits = [*hits, policy.HALT_HIT]
+        # agent_id and principal come from the task (or the session), never from the body (check I).
+        body = n.body(n.policy, t, rule_hits=policy.rule_hits_json(hits), ext=cj(x) if x else "",
+                      rulepack_hash=b["rulepack_hash"], **fields, **identity(sess, task))
+
+        def build() -> dict:
+            if b["rulepack_hash"] != n.rulepack_hash:      # under the lock: a reload cannot slip in after this
+                raise HTTPException(409, "rulepack mismatch")
+            n.agents.active(sess["agent_id"])
+            if task is not None and n.store.task_ended(task["seq"]):
+                raise HTTPException(409, "task already ended")
+            check_parent(n.store, body, x)
+            return body
+        try:
+            rec = await n.seal(build)
+        except rulepack.Mismatch:
+            raise HTTPException(409, "rulepack mismatch")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {"seq": rec["seq"], "record_hash": rec["record_hash"], "ts": rec["ts"], "decision": rec["decision"]}
+
+    @r.get("/api/agent/parent")
+    async def parent(request: Request, tool_use_id: str = "", name: str = "", args_hash: str = "",
+                     sess: dict = Depends(require_session)):
+        n = node(request)
+        task = task_for(n, sess, request.headers.get("x-sijil-task-seq"))
+        if task is None:
+            raise HTTPException(409, "no open task in this agent session")
+        if not tool_use_id and not (name and args_hash):
+            raise HTTPException(400, "tool_use_id, or name and args_hash, required")
+        hit = n.store.tool_use(str(task["seq"]), tool_use_id, name, args_hash)
+        if hit is None:   # mechanism 3 (window) never yields a parent: B2 would fail it (spec §5.4)
+            raise HTTPException(404, {"correlation": "none"})
+        return {**hit, "correlation": "tool_use_id" if tool_use_id else "args_hash"}
+
+    @r.get("/api/agent/context")
+    async def context(request: Request, before_seq: int, window: str = "session",
+                      sess: dict = Depends(require_session)):
+        n = node(request)
+        task = task_for(n, sess, request.headers.get("x-sijil-task-seq"))
+        if task is None:
+            raise HTTPException(409, "no open task in this agent session")
+        if window not in ("session", "turn"):
+            raise HTTPException(400, "window must be session or turn")
+        rows = [r for r in n.store.in_task(task["seq"]) if r["seq"] < before_seq]
+        since = 0
+        if window == "turn":   # after the last inference that requested no tools: the user's previous turn
+            since = max((r["seq"] for r in rows if r["type"] == "inference"
+                         and not (json.loads(r["ext"]).get("tool_uses") if r["ext"] else None)), default=0)
+        results = [r for r in rows if r["type"] == "tool_result" and r["seq"] > since]
+        return {"labels": sorted({r["source_label"] for r in results}), "seqs": [r["seq"] for r in results]}
 
     @r.post("/api/agent/task/start")
     async def task_start(request: Request, sess: dict = Depends(require_session)):

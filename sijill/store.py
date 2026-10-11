@@ -118,9 +118,28 @@ class Store:
                                  (str(task_seq),)).fetchone() is not None
 
     def in_task(self, task_seq: int) -> list[dict]:
-        rows = self.conn.execute("SELECT seq, type, decision, ext FROM records WHERE task_seq = ? ORDER BY seq",
+        rows = self.conn.execute("SELECT seq, type, decision, source_label, ext FROM records WHERE task_seq = ? "
+                                 "ORDER BY seq",
                                  (str(task_seq),)).fetchall()
         return [dict(r) for r in rows]
+
+    def has_child(self, type_: str, parent_seq: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM records WHERE type = ? AND parent_seq = ?",
+                                 (type_, parent_seq)).fetchone() is not None
+
+    def tool_use(self, task_seq: str, tool_use_id: str = "", name: str = "", args_hash: str = "") -> dict | None:
+        """Newest tool_use_index entry of an inference in this task: by id, or by (name, args_hash) among
+        entries no tool_call has consumed yet (spec §5.4 mechanisms 1 and 2)."""
+        if tool_use_id:
+            where, args = "i.tool_use_id = ?", (task_seq, tool_use_id)
+        else:
+            where = ("i.name = ? AND i.args_hash = ? AND NOT EXISTS (SELECT 1 FROM records c WHERE c.type = "
+                     "'tool_call' AND c.parent_seq = CAST(i.seq AS TEXT) AND c.input_hash = i.args_hash)")
+            args = (task_seq, name, args_hash)
+        row = self.conn.execute("SELECT i.tool_use_id, i.seq, i.name, i.args_hash FROM tool_use_index i JOIN records r "
+                                f"ON r.seq = i.seq WHERE r.task_seq = ? AND {where} ORDER BY i.seq DESC LIMIT 1",
+                                args).fetchone()
+        return dict(row) if row else None
 
     def count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
