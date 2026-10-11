@@ -3,7 +3,9 @@
 import asyncio
 import json
 
+import httpx
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from agentkit import (AGENT, AGENT_KEY, HDR, NEW_KEY, NODE_ID, OPS, agent_node, nonce, proof, pub, register,
                       session)
@@ -163,3 +165,51 @@ def test_concurrent_registrations_of_one_id_seal_once(tmp_path):
         results = client.portal.call(both)
     assert sorted(type(r).__name__ for r in results) == ["HTTPException", "dict"]
     assert len(rows(s.db_path)) == 1
+
+
+THIRD_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(96, 128)))
+
+
+def _rotate_body(client, new_key):
+    n = nonce(client, purpose="rotate")
+    msg = {"agent_id": AGENT, "new_pubkey": pub(new_key), "nonce": n, "old_pubkey": pub(AGENT_KEY)}
+    return {"agent_id": AGENT, "new_pubkey": pub(new_key), "nonce": n, "rotated_by": OPS,
+            "proof_old": proof(AGENT_KEY, msg), "proof_new": proof(new_key, msg)}
+
+
+def _race(client, calls):
+    """POST each (path, json, headers) while another seal holds the lock, so all queue on it."""
+    n = client.app.state.node
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app), base_url="http://t") as c:
+            async with n.lock:
+                tasks = [asyncio.create_task(c.post(p, json=j, headers=h)) for p, j, h in calls]
+                await asyncio.sleep(0.2)
+            return [r.status_code for r in await asyncio.gather(*tasks)]
+    return client.portal.call(go)
+
+
+def test_concurrent_rotations_seal_once(tmp_path):
+    """Both rotations pass their pre-checks with the old key; the second must fail the check under the lock."""
+    client, s = agent_node(tmp_path)
+    with client:
+        register(client)
+        calls = [("/api/agent/rotate", _rotate_body(client, k), HDR) for k in (NEW_KEY, THIRD_KEY)]
+        codes = _race(client, calls)
+    assert sorted(codes) == [200, 409]
+    assert [r["type"] for r in rows(s.db_path)] == ["agent_register", "agent_rotate"]
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_concurrent_rotate_and_revoke_seal_once(tmp_path):
+    client, s = agent_node(tmp_path)
+    with client:
+        register(client)
+        admin = {k: v for k, v in client.headers.items() if k.lower() == "authorization"}
+        calls = [("/api/agent/rotate", _rotate_body(client, NEW_KEY), HDR),
+                 ("/api/agent/revoke", {"agent_id": AGENT, "revoked_by": OPS}, admin)]
+        codes = _race(client, calls)
+    assert sorted(codes) == [200, 409]
+    assert len(rows(s.db_path)) == 2
+    assert verify(s.db_path, s.pubkey_path)[0] == 0

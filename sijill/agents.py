@@ -223,19 +223,20 @@ def router(require_admin) -> APIRouter:
         b = await body_of(request)
         n, aid = node(request), b.get("agent_id")
         a = n.agents.active(aid)
+        old = a.pubkey      # a is the registry's live Agent: capture the key the proofs were made for
         if a.auth != "key":
             raise HTTPException(409, "only a key agent rotates")
         rotated_by, new = principal_arg(b, "rotated_by"), b.get("new_pubkey")
         if not isinstance(new, str) or not PUBKEY.fullmatch(new):
             raise HTTPException(400, "new_pubkey must be 32 bytes, lower-case hex")
         n.agents.burn(b.get("nonce"), aid, "rotate")
-        msg = {"agent_id": aid, "new_pubkey": new, "nonce": b["nonce"], "old_pubkey": a.pubkey}
-        if not (proof_ok(a.pubkey, b.get("proof_old"), msg) and proof_ok(new, b.get("proof_new"), msg)):
+        msg = {"agent_id": aid, "new_pubkey": new, "nonce": b["nonce"], "old_pubkey": old}
+        if not (proof_ok(old, b.get("proof_old"), msg) and proof_ok(new, b.get("proof_new"), msg)):
             raise HTTPException(401, "proof invalid")
-        x = {"old_pubkey": a.pubkey, "new_pubkey": new, "nonce": b["nonce"], "proof_old": b["proof_old"],
+        x = {"old_pubkey": old, "new_pubkey": new, "nonce": b["nonce"], "proof_old": b["proof_old"],
              "proof_new": b["proof_new"], "rotated_by": rotated_by, "principal_auth": "none"}
         return await seal_agent(n, "agent_rotate", aid, rotated_by, digest(msg), x,
-                                check=lambda: n.agents.current(aid, a.pubkey))
+                                check=lambda: n.agents.current(aid, old))
 
     @r.post("/api/agent/revoke", dependencies=[Depends(require_admin)])
     async def revoke(request: Request):
@@ -244,13 +245,14 @@ def router(require_admin) -> APIRouter:
         a = n.agents.agents.get(aid)
         if a is None:
             raise HTTPException(404, "agent not registered")
-        n.agents.current(aid, a.pubkey)
+        old = a.pubkey
+        n.agents.current(aid, old)
         revoked_by = principal_arg(b, "revoked_by")
-        x = {"pubkey": a.pubkey, "revoked_by": revoked_by, "principal_auth": "key"}
+        x = {"pubkey": old, "revoked_by": revoked_by, "principal_auth": "key"}
         if isinstance(b.get("reason"), str) and b["reason"]:
             x["reason"] = b["reason"][:128]
         return await seal_agent(n, "agent_revoke", aid, revoked_by, "", x, mode="enforce", decision="block",
-                                check=lambda: n.agents.current(aid, a.pubkey))
+                                check=lambda: n.agents.current(aid, old))
 
     return r
 
