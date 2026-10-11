@@ -82,3 +82,21 @@ def test_empty_and_missing_database(tmp_path, chain):
                                                      "api+tee:0,none:0 agent_auth=key:0,mtls:0,oidc:0,relay:0,none:0")
     code, out = verify(tmp_path / "nope.db", pub)
     assert code == 1 and out.startswith("FAIL database not found")
+
+
+def test_directory_as_db_is_one_fail_line(chain, tmp_path):
+    import json
+    _, pub = chain
+    code, out = verify(tmp_path, pub)
+    assert code == 1 and out.startswith("FAIL ") and "database unreadable" in out and "\n" not in out
+    code, out = verify(tmp_path, pub, "--json")
+    assert code == 1 and json.loads(out)["code"] == "database_unreadable"
+
+
+def test_blob_column_is_content_altered(chain):
+    import json
+    db, pub = chain
+    sqlite(db, "UPDATE records SET output_hash = X'00' WHERE seq = 17;")
+    assert verify(db, pub) == (1, "FAIL seq=17 content altered")
+    code, out = verify(db, pub, "--json")
+    assert code == 1 and json.loads(out)["code"] == "content_altered"

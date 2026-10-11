@@ -10,6 +10,7 @@ COPY verifier verifier
 COPY report report
 COPY dashboard dashboard
 COPY scripts/siem_forward.py scripts/siem_forward.py
+COPY scripts/migrate_v2.py scripts/migrate_v2.py
 # OpenShift runs an arbitrary UID in group 0: make /data group-writable
 RUN mkdir /data /config && chgrp 0 /data && chmod g=u /data
 ENV DATABASE_PATH=/data/sijill.db POLICY_PATH=/config/policy.yaml \

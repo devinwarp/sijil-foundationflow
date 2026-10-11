@@ -23,7 +23,10 @@ def migrate(path: str) -> list[str]:
         raise SystemExit(f"migrate_v2: no database at {path}")
     conn = sqlite3.connect(path, isolation_level=None)
     try:
-        have = {row[1] for row in conn.execute("PRAGMA table_info(records)")}
+        try:
+            have = {row[1] for row in conn.execute("PRAGMA table_info(records)")}
+        except sqlite3.DatabaseError as e:
+            raise SystemExit(f"migrate_v2: {path} is not a readable SQLite database: {e}")
         if not have:
             raise SystemExit(f"migrate_v2: {path} has no records table")
         added = [f for f in EXT_FIELDS if f not in have]

@@ -103,3 +103,12 @@ def test_forge_matches_the_writer_on_non_ascii_ext(tmp_path):
     tamper(db, "forge", "42")
     row = rows(db, "seq = 42")[0]
     assert row["record_hash"] == record.compute_record_hash(row) != rec["record_hash"]
+
+
+def test_migrate_non_sqlite_file_exits_one_line(tmp_path):
+    db = tmp_path / "junk.db"
+    db.write_bytes(b"this is not a database" * 50)
+    r = migrate(db)
+    assert r.returncode != 0
+    assert "Traceback" not in r.stderr and r.stderr.strip().count("\n") == 0
+    assert "not a readable SQLite database" in r.stderr

@@ -406,9 +406,10 @@ def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated
     except (OSError, ValueError) as e:
         return fail(None, "public_key_unreadable", f"public key unreadable: {e}")
 
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = None
     try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
         rows = read_rows(conn)
         if rows is None:
             return fail(None, "database_unreadable", "database unreadable: no records table")
@@ -418,7 +419,11 @@ def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated
             try:
                 if seq != prev_seq + 1:
                     raise Fail("gap", "gap")
-                if record_hash(record) != record["record_hash"]:
+                try:
+                    computed = record_hash(record)
+                except (TypeError, ValueError):  # e.g. a BLOB where text belongs
+                    computed = None
+                if computed != record["record_hash"]:
                     raise Fail("content_altered", "content altered")
                 if record["prev_hash"] != prev_hash:
                     raise Fail("chain_broken", "chain broken")
@@ -434,7 +439,8 @@ def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated
     except sqlite3.Error as e:
         return fail(None, "database_unreadable", f"database unreadable: {e}")
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     line = (f"PASS records={res['records']} first={first_ts or '-'} last={last_ts or '-'} "
             f"attestation={counts(st.attestation)} agent_auth={counts(st.agent_auth)}")
     if allow_orphans and st.orphans:

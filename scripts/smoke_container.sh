@@ -58,6 +58,11 @@ docker run --rm --entrypoint sh "$IMAGE" -c 'test ! -e /app/node.key' \
   || fail "/app/node.key exists in the image"
 echo "no-key"
 
+# The migration script ships in the image (M1 installs are told to run it).
+docker run --rm --entrypoint sh "$IMAGE" -c 'test -f /app/scripts/migrate_v2.py' \
+  || fail "scripts/migrate_v2.py missing from the image"
+echo "migrate-script-ok"
+
 # An arbitrary UID in group 0 can write /data.
 docker run --rm --user 12345:0 --entrypoint sh "$IMAGE" -c 'touch /data/uid-probe && rm /data/uid-probe' \
   || fail "arbitrary UID in group 0 cannot write /data"
