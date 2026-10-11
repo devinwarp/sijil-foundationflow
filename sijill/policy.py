@@ -23,6 +23,25 @@ GOV_HITS = ("principal-missing", "principal-invalid", "principal-expired", "prin
 RESERVED_IDS = (UPSTREAM_ERROR_HIT, HALT_HIT, RESUME_HIT, *GOV_HITS)
 RESERVED_PREFIXES = ("budget:",)
 ATTESTATION_MODES = ("weights", "api")    # spec §3.1
+REGISTER_POLICIES = ("open", "closed")   # spec §5.6; principal_oidc needs principals: (row 5d)
+
+
+@dataclass(frozen=True)
+class AgentsConfig:
+    """policy.yaml `agents:` (spec §5.8.5). Absent block: registrations need the admin token (secure default)."""
+    register_policy: str = "closed"
+    session_ttl_s: int = 28800
+
+
+def load_agents(doc) -> AgentsConfig:
+    if doc is None:
+        return AgentsConfig()
+    if not isinstance(doc, dict) or doc.get("register_policy", "closed") not in REGISTER_POLICIES:
+        raise ValueError(f"agents.register_policy must be one of {REGISTER_POLICIES}")
+    ttl = doc.get("session_ttl_s", 28800)
+    if type(ttl) is not int or not 60 <= ttl <= 86400:
+        raise ValueError("agents.session_ttl_s must be an integer from 60 to 86400")
+    return AgentsConfig(register_policy=doc.get("register_policy", "closed"), session_ttl_s=ttl)
 
 # Each rule type must carry one list-of-strings key; keyword terms must be non-empty.
 REQUIRED_KEYS = {
@@ -42,6 +61,7 @@ class Policy:
     rules: tuple[dict, ...]
     hash: str
     attestation: str = "weights"
+    agents: AgentsConfig = AgentsConfig()
 
     def modes(self) -> dict[str, str]:
         return {r["id"]: r["mode"] for r in self.rules}
@@ -81,6 +101,7 @@ def load(path: str | Path) -> Policy:
         rules=rules,
         hash=sha256_hex(raw),
         attestation=attestation,
+        agents=load_agents(doc.get("agents")),
     )
 
 

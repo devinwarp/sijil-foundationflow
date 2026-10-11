@@ -85,6 +85,25 @@ class Store:
             "INSERT OR IGNORE INTO tool_use_index (tool_use_id, seq, name, args_hash) VALUES (?, ?, ?, ?)",
             [(u["id"], seq, u["name"], u["args_hash"]) for u in uses if u["id"]])
 
+    def get(self, seq: int) -> dict | None:
+        row = self.conn.execute(f"SELECT {COLUMNS} FROM records WHERE seq = ?", (seq,)).fetchone()
+        return dict(row) if row else None
+
+    def of_types(self, *types: str) -> list[dict]:
+        rows = self.conn.execute(f"SELECT {COLUMNS} FROM records WHERE type IN ({', '.join('?' * len(types))}) "
+                                 f"ORDER BY seq", types).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_session(self, row: dict) -> None:
+        """agent_sessions: side table, not evidence (spec §5.8.2)."""
+        self.conn.execute("INSERT INTO agent_sessions (agent_session, agent_id, principal, agent_auth, "
+                          "principal_auth, remote_addr, expires_at, jti) VALUES (:agent_session, :agent_id, "
+                          ":principal, :agent_auth, :principal_auth, :remote_addr, :expires_at, :jti)", row)
+
+    def session(self, agent_session: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM agent_sessions WHERE agent_session = ?", (agent_session,)).fetchone()
+        return dict(row) if row else None
+
     def count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
 

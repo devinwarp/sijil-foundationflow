@@ -26,7 +26,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from . import chat, keys, policy, record, rulepack
+from . import agents, chat, keys, policy, record, rulepack
 from .digest import DigestResolver
 from .store import Store
 
@@ -52,6 +52,7 @@ class Settings:
     default_model: str = "llama-3.2-3b-instruct"
     upstream_timeout: float = 120.0
     admin_token: str = ""
+    agent_token: str = ""              # X-Sijil-Token for /api/agent/*; "" disables those endpoints
     pkcs11_module: str = ""
     pkcs11_token: str = ""
     pkcs11_key: str = ""
@@ -74,6 +75,7 @@ class Settings:
             default_model=e("SIJILL_MODEL", cls.default_model),
             upstream_timeout=float(e("UPSTREAM_TIMEOUT", cls.upstream_timeout)),
             admin_token=e("SIJILL_ADMIN_TOKEN", ""),
+            agent_token=e("SIJILL_TOKEN", ""),
             pkcs11_module=e("SIJILL_PKCS11_MODULE", ""),
             pkcs11_token=e("SIJILL_PKCS11_TOKEN", ""),
             pkcs11_key=e("SIJILL_PKCS11_KEY", ""),
@@ -121,6 +123,7 @@ class Node:
         # The writer trusts its own memory of the head, not the database: a record
         # deleted or edited at the tail while running still shows up as a break.
         self.head = self.store.head()
+        self.agents = agents.Registry(self.store)
         self.lock = asyncio.Lock()
         self.halted = Path(settings.halt_path).exists()
         self.resolver = resolver or DigestResolver(cache_path=settings.digest_cache)
@@ -143,8 +146,12 @@ class Node:
                     **{f: "" for f in record.EXT_FIELDS})   # v2 columns; set by the rows that use them
         return {**base, **fields}
 
-    async def seal(self, body: dict) -> dict:
+    async def seal(self, body) -> dict:
+        """`body` may be a callable that builds it under the lock, for bodies whose checks read state that a
+        concurrent seal could change (agent registry, task_end counts)."""
         async with self.lock:
+            if callable(body):
+                body = body()
             if body["type"] != "rulepack_change":
                 # Stamped under the lock so no record lands between a rulepack_change and its hash (check E).
                 if body["rulepack_hash"] not in ("", self.rulepack_hash):
@@ -220,6 +227,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         supplied = request.headers.get("authorization", "").encode()
         if not hmac.compare_digest(supplied, f"Bearer {settings.admin_token}".encode()):
             raise HTTPException(401, "admin token required")
+
+    app.include_router(agents.router(require_admin))
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
