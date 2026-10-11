@@ -38,12 +38,17 @@ case "$CMD" in
   forge)
     seq_arg "${2:-}"; S="$2"
     q "UPDATE records SET output_hash='$(sha "a forged answer")' WHERE seq=$S;"
-    # Canonical form: every field except record_hash and signature, keys sorted, no whitespace.
-    CANON=$(q "SELECT json_object(
-      'approval_ref',approval_ref,'decision',decision,'input_hash',input_hash,'mode',mode,
-      'model_digest',model_digest,'model_id',model_id,'node_id',node_id,'node_region',node_region,
-      'output_hash',output_hash,'policy_hash',policy_hash,'policy_id',policy_id,'prev_hash',prev_hash,
-      'rule_hits',rule_hits,'seq',seq,'ts',ts,'type',type) FROM records WHERE seq=$S;")
+    # Canonical form v2 (spec §2.2): every field except record_hash and signature, keys sorted, no
+    # whitespace; the seven v2 columns only when non-empty. Needs sqlite3 >= 3.44 (aggregate ORDER BY).
+    SQL=""
+    for c in approval_ref decision input_hash mode model_digest model_id node_id node_region output_hash \
+             policy_hash policy_id prev_hash rule_hits seq ts type; do
+      SQL+="SELECT '$c' AS k, $c AS v FROM records WHERE seq=$S UNION ALL "
+    done
+    for c in agent_id ext parent_seq principal rulepack_hash source_label task_seq; do
+      SQL+="SELECT '$c', $c FROM records WHERE seq=$S AND $c<>'' UNION ALL "
+    done
+    CANON=$(q "SELECT json_group_object(k, v ORDER BY k) FROM (${SQL% UNION ALL });")
     H=$(sha "$CANON")
     q "UPDATE records SET record_hash='$H' WHERE seq=$S;"
     printf 'forge    seq %s: content changed, record_hash recomputed (%s…), no private key\n' "$S" "${H:0:12}"
