@@ -1,4 +1,6 @@
-"""Append-only SQLite access. This module only ever SELECTs and INSERTs (plus CREATE ... IF NOT EXISTS for the schema)."""
+"""Append-only SQLite access. This module only ever SELECTs and INSERTs
+(plus CREATE ... IF NOT EXISTS for the schema).
+"""
 
 import sqlite3
 
