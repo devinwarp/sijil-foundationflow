@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from . import record
 
 ALGS = ("RS256", "EdDSA")      # never none, never HMAC (§17.2.3 step 1). ponytail: ES256 when an IdP needs it
+MAX_TOKEN = 16384              # characters; longer is refused before any decoding
 SKEW_S = 60                    # on nbf only
 FORCED_REFRESH_S = 300         # unknown kid: at most one forced refresh per issuer per 300 s
 JWKS_DEFAULT = {"mode": "fetch", "refresh_s": 3600, "max_stale_s": 86400}
@@ -141,11 +142,13 @@ class Verified:
 
 
 def decode(token):
+    if isinstance(token, str) and len(token) > MAX_TOKEN:
+        raise OidcError("malformed")
     try:
         head, body, sig = token.split(".")
         header, claims = json.loads(b64d(head)), json.loads(b64d(body))
         signature = b64d(sig)
-    except (AttributeError, ValueError, TypeError):
+    except (AttributeError, ValueError, TypeError, RecursionError):
         raise OidcError("malformed")
     if not isinstance(header, dict) or not isinstance(claims, dict):
         raise OidcError("malformed")

@@ -215,3 +215,15 @@ def test_oidc_binding_with_a_non_string_issuer_is_400(tmp_path):
             "agent_id": AGENT, "registered_by": "local:" + "a" * 64,
             "oidc_binding": {"issuer": [ENTRA_ISS], "sub_pattern": "x"}})
         assert r.status_code == 400
+
+
+@pytest.mark.parametrize("token", [
+    b64u(b"[" * 10000) + ".e30.AA",                       # deeply nested header: RecursionError in json.loads, under the cap
+    f"{_raw({'alg': 'RS256', 'kid': 'k'})}." + b64u(b"[" * 10000) + ".AA",       # deeply nested body
+    "a" * 16385,                                            # over 16 KB
+])
+def test_deep_nesting_and_oversize_tokens_are_401_malformed(tmp_path, token):
+    client, _ = workload_node(tmp_path)
+    with client:
+        r = client.post("/api/agent/session", json={"oidc_token": token}, headers=HDR)
+        assert r.status_code == 401 and r.json()["detail"].endswith("malformed"), r.text
