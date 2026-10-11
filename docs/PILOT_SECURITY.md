@@ -12,7 +12,7 @@ Each line is checked by a command or a test. Run before every pilot install.
 | Records append-only in application code | `pytest tests/test_claims.py` |
 | Every streamed call sealed, including hang-ups (after delivery: a signer outage mid-stream leaves a delivered, unsealed answer) | `pytest tests/test_streaming.py` |
 | SOC receives blocks as CEF severity 8 | `pytest tests/test_siem.py`; manual SIEM check below |
-| Chain verifies offline with the Apache-2.0 verifier | `python3 verifier/sijill_verify.py --db sijill.db --pubkey node.pub`; see below |
+| Chain verifies offline with the Apache-2.0 verifier | `python3 verifier/sijill_verify.py --db export.db --pubkey node.pub`; see below |
 | Operator can halt every call, halt survives restart; a stream in flight stops and seals as `halted` | `pytest tests/test_halt.py tests/test_streaming.py` |
 
 `scripts/smoke_container.sh [image]` starts the image with the policy mounted read-only and a token set,
@@ -30,11 +30,15 @@ python3 scripts/siem_forward.py --url http://127.0.0.1:8000 --sink 127.0.0.1:551
 
 Expect CEF lines (`CEF:0|FoundationFlow|Sijil|...`). The blocked call's line carries severity `|8|`.
 
-**Verifier.** For a container deployment, copy `node.pub` and `sijill.db` out of the data volume first
-(INSTALL.txt, step 6), then from the repo root:
+**Verifier.** For a container deployment, copy the public key and a consistent DB snapshot out of the
+data volume (INSTALL.txt, step 6). The proxy may be writing, so take an SQLite online backup first; a plain
+file copy can be torn and fail verification:
 
 ```bash
-python3 verifier/sijill_verify.py --db sijill.db --pubkey node.pub   # PASS, exit 0
+docker run --rm -v sijil-data:/data --entrypoint cat sijil:<sha> /data/node.pub > node.pub
+docker run --rm -v sijil-data:/data --entrypoint sqlite3 sijil:<sha> /data/sijill.db ".backup /data/export.db"
+docker run --rm -v sijil-data:/data --entrypoint cat sijil:<sha> /data/export.db > export.db
+python3 verifier/sijill_verify.py --db export.db --pubkey node.pub   # PASS, exit 0
 ```
 
 Known limits to state to the entity: read endpoints (`/api/records`, `/api/policy`, `/api/verify`,
