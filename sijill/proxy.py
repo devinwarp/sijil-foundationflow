@@ -8,6 +8,7 @@ Admin endpoints require `Authorization: Bearer $SIJILL_ADMIN_TOKEN`; with no tok
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import os
@@ -25,7 +26,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from . import keys, policy, record
+from . import chat, keys, policy, record
 from .digest import DigestResolver
 from .store import Store
 
@@ -46,6 +47,7 @@ class Settings:
     pubkey_path: str = "node.pub"
     upstream: str = "http://localhost:1234/v1"
     upstream_token: str = ""
+    upstream_provider: str = ""        # <provider> in api:<provider>:<model> (spec §3.1: from the route)
     default_model: str = "llama-3.2-3b-instruct"
     upstream_timeout: float = 120.0
     admin_token: str = ""
@@ -66,6 +68,7 @@ class Settings:
             pubkey_path=e("NODE_PUBKEY_PATH", cls.pubkey_path),
             upstream=e("LMSTUDIO_BASE_URL", cls.upstream),
             upstream_token=e("LM_API_TOKEN", ""),
+            upstream_provider=e("SIJILL_UPSTREAM_PROVIDER", ""),
             default_model=e("SIJILL_MODEL", cls.default_model),
             upstream_timeout=float(e("UPSTREAM_TIMEOUT", cls.upstream_timeout)),
             admin_token=e("SIJILL_ADMIN_TOKEN", ""),
@@ -103,6 +106,7 @@ class Node:
         else:
             self.key = keys.load_or_generate(settings.key_path, settings.pubkey_path)
         self.policy = policy.load(settings.policy_path)
+        self.check_attestation(self.policy)
         last = self.store.last()
         self.region = last["node_region"] if last else self.policy.node_region
         # The writer trusts its own memory of the head, not the database: a record
@@ -114,6 +118,14 @@ class Node:
         headers = {"Authorization": f"Bearer {settings.upstream_token}"} if settings.upstream_token else {}
         self.client = httpx.AsyncClient(base_url=settings.upstream, headers=headers,
                                         timeout=settings.upstream_timeout, transport=transport)
+
+    def check_attestation(self, pol: policy.Policy) -> None:
+        """attestation: api needs the provider of the upstream route; it is never taken from the request."""
+        if pol.attestation == "api" and not chat.PROVIDER.fullmatch(self.settings.upstream_provider):
+            raise ValueError("attestation: api needs SIJILL_UPSTREAM_PROVIDER ([a-z0-9-]+), the upstream's provider")
+
+    def api_digest(self, model: str) -> str:
+        return f"api:{self.settings.upstream_provider}:{model}"
 
     def body(self, pol: policy.Policy, type_: str, **fields) -> dict:
         base = dict(type=type_, model_id="", model_digest="", node_id=pol.node_id, node_region=self.region,
@@ -189,26 +201,52 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             raise HTTPException(400, "`messages` must be a list")
 
         model_id = str(payload.get("model") or settings.default_model)
-        digest = await asyncio.to_thread(n.resolver.resolve, model_id)
         pol, region = n.policy, n.region
-        decision, mode, hits = policy.evaluate(pol, region, digest, payload["messages"])
+        api = pol.attestation == "api"
+        if api:
+            if not chat.MODEL.fullmatch(model_id):
+                raise HTTPException(400, "`model` must be 1-256 characters without whitespace")
+            digest = n.api_digest(model_id)   # until the provider names the model that answered
+        else:
+            digest = await asyncio.to_thread(n.resolver.resolve, model_id)
+        # In api mode the allowlist is checked against the model that answered (spec §3.1), after the call.
+        skip = ("model_allowlist",) if api else ()
+        decision, mode, hits = policy.evaluate(pol, region, digest, payload["messages"], skip=skip)
         if n.halted:
             decision, mode, hits = "block", "enforce", [policy.HALT_HIT]
+        request_hash = record.sha256_hex(record.canonical_json(payload))
+
+        def ext(**answer) -> str:
+            x = chat.ext(pol.attestation, request_hash=request_hash, **answer)
+            return record.canonical_json(x).decode() if x else ""
+
         body = n.body(pol, "inference", model_id=model_id, model_digest=digest, mode=mode, decision=decision,
-                      rule_hits=policy.rule_hits_json(hits), input_hash=record.input_hash(payload["messages"]))
+                      rule_hits=policy.rule_hits_json(hits), input_hash=record.input_hash(payload["messages"]),
+                      ext=ext())
+
+        def answered(model) -> tuple[dict, list[str]] | None:
+            """api mode: digest and post-call evaluation for the model the provider says answered."""
+            if not (isinstance(model, str) and chat.MODEL.fullmatch(model)):
+                return None
+            d = n.api_digest(model)
+            post_decision, post_mode, post_hits = policy.evaluate(pol, region, d, payload["messages"])
+            return {"model_digest": d, "decision": post_decision, "mode": post_mode,
+                    "rule_hits": policy.rule_hits_json(post_hits)}, post_hits
 
         def headers(rec: dict, upstream_ms: float) -> dict:
             overhead = (perf_counter() - t0) * 1000 - upstream_ms
             return {"X-Sijill-Seq": str(rec["seq"]), "X-Sijill-Decision": rec["decision"],
                     "X-Sijill-Record-Hash": rec["record_hash"], "X-Sijill-Overhead-Ms": f"{overhead:.3f}"}
 
-        if decision == "block":
-            rec = await n.seal(body)
-            return JSONResponse(status_code=403, headers=headers(rec, 0.0), content={
-                "error": {"message": f"Blocked by Sijill policy: {', '.join(hits)}",
+        def blocked(rec: dict, block_hits: list[str], upstream_ms: float = 0.0):
+            return JSONResponse(status_code=403, headers=headers(rec, upstream_ms), content={
+                "error": {"message": f"Blocked by Sijill policy: {', '.join(block_hits)}",
                           "type": "policy_block", "code": "sijill_block"},
-                "sijill": {"seq": rec["seq"], "decision": "block", "rule_hits": hits,
+                "sijill": {"seq": rec["seq"], "decision": "block", "rule_hits": block_hits,
                            "record_hash": rec["record_hash"]}})
+
+        if decision == "block":
+            return blocked(await n.seal(body), hits)
 
         async def upstream_failed(status: int, content: dict, upstream_ms: float):
             """Seal the call marked with the reserved upstream-error hit and respond."""
@@ -235,7 +273,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 return await upstream_failed(resp.status_code, content, (perf_counter() - t1) * 1000)
 
             async def relay():
-                parts, done, errored, rec = [], False, False, None
+                parts, calls, relayed = [], chat.StreamCalls(), hashlib.sha256()
+                done, errored, refused, post, finish, rec = False, False, False, None, "", None
                 try:
                     async for line in resp.aiter_lines():
                         if n.halted:  # operator halt lands mid-stream: stop relaying now
@@ -250,25 +289,44 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                                 event = None
                             if isinstance(event, dict) and "error" in event:
                                 errored = True  # in-stream failure (vLLM), even if [DONE] follows
+                            if api and post is None and isinstance(event, dict) and "model" in event:
+                                post = answered(event["model"])
+                                if post is None:
+                                    errored = True
+                                    break
+                                if post[0]["decision"] == "block":   # nothing of the answer is relayed
+                                    refused = True
+                                    break
                             try:
-                                delta = event["choices"][0].get("delta") or {}
+                                choice = event["choices"][0]
+                                delta = choice.get("delta") or {}
+                                finish = choice.get("finish_reason") or finish
                             except (KeyError, IndexError, TypeError, AttributeError):
                                 delta = {}
-                            if isinstance(delta.get("content"), str):
-                                parts.append(delta["content"])
+                            if isinstance(delta, dict):
+                                if isinstance(delta.get("content"), str):
+                                    parts.append(delta["content"])
+                                calls.add(delta)
+                        relayed.update((line + "\n").encode())
                         yield (line + "\n").encode()
                 finally:
                     # Read the halt flag here, with no await before the seal: a halt that has flipped
                     # it has its `halted` record sealed or queued ahead of ours on the lock.
                     halted = n.halted
-                    if done and not errored and not halted:
-                        sealed = {**body, "output_hash": record.output_hash("".join(parts))}
+                    uses = calls.tool_uses()
+                    ok = done and not errored and not halted and not (api and post is None)
+                    if ok:
+                        sealed = {**body, "output_hash": record.output_hash("".join(parts)), **(post[0] if post else {}),
+                                  "ext": ext(response_hash=relayed.hexdigest(), stop_reason=str(finish),
+                                             tool_uses=uses)}
                     elif halted:
                         # The halt is checked before each line is relayed, so `parts` is exactly the content
                         # already delivered. Hash it like a completed stream; nothing delivered keeps "".
                         sealed = {**body, "decision": "block", "mode": "enforce", "rule_hits": policy.rule_hits_json(
                             hits + [policy.HALT_HIT, policy.UPSTREAM_ERROR_HIT]),
                             "output_hash": record.output_hash("".join(parts)) if parts else ""}
+                    elif refused:
+                        sealed = {**body, **post[0]}
                     else:
                         sealed = {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT])}
                     # Shielded: a client hang-up cancels this task (anyio, level-triggered), but the call
@@ -277,6 +335,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     with anyio.CancelScope(shield=True):
                         try:
                             rec = await n.seal(sealed)
+                            if ok and rec["decision"] != "block":
+                                n.store.index_tool_uses(rec["seq"], uses)
                         finally:
                             await resp.aclose()
                 yield (f": sijill seq={rec['seq']} decision={rec['decision']} "
@@ -305,19 +365,32 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         # `content` absent or null is a valid OpenAI shape (tool calls): hash "".
         try:
             data = resp.json()
-            message = data["choices"][0]["message"]
+            choice = data["choices"][0]
+            message = choice["message"]
             if not isinstance(message, dict):
                 raise TypeError("malformed choice")
             text = message.get("content")
             text = "" if text is None else text
             if not isinstance(text, str):
                 raise TypeError("message content is not a string or null")
-        except (ValueError, KeyError, IndexError, TypeError):
+            post = answered(data.get("model")) if api else None
+            if api and post is None:
+                raise TypeError("api attestation needs the response's model")
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
             return await upstream_failed(
                 502, {"error": {"message": "model runtime returned a malformed response",
                                 "type": UPSTREAM_ERROR_TYPE}}, upstream_ms)
 
-        rec = await n.seal({**body, "output_hash": record.output_hash(text)})
+        uses = chat.tool_uses(message)
+        sealed = {**body, "output_hash": record.output_hash(text), **(post[0] if post else {}),
+                  "ext": ext(response_hash=record.sha256_hex(resp.content),
+                             provider_request_id=resp.headers.get("x-request-id", ""),
+                             stop_reason=str(choice.get("finish_reason") or ""), tool_uses=uses)}
+        if post and post[0]["decision"] == "block":
+            # The provider answered, but not with an approved model: the answer is withheld.
+            return blocked(await n.seal({**sealed, "output_hash": ""}), post[1], upstream_ms)
+        rec = await n.seal(sealed)
+        n.store.index_tool_uses(rec["seq"], uses)
         return JSONResponse(content=data, headers=headers(rec, upstream_ms))
 
     @app.get("/api/records")
@@ -352,6 +425,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         n = node(request)
         try:
             new = policy.load(settings.policy_path)
+            n.check_attestation(new)
         except Exception as e:
             raise HTTPException(400, f"policy not loaded: {e}")
         old = n.policy

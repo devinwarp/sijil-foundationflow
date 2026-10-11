@@ -79,6 +79,12 @@ class Store:
         placeholders = ", ".join(f":{f}" for f in FIELDS)
         self.conn.execute(f"INSERT INTO records ({COLUMNS}) VALUES ({placeholders})", record)
 
+    def index_tool_uses(self, seq: int, uses: list[dict]) -> None:
+        """tool_use_index rows for one sealed inference (spec §5.4: a lookup cache, rebuildable from ext)."""
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO tool_use_index (tool_use_id, seq, name, args_hash) VALUES (?, ?, ?, ?)",
+            [(u["id"], seq, u["name"], u["args_hash"]) for u in uses if u["id"]])
+
     def count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
 

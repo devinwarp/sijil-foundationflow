@@ -22,6 +22,7 @@ GOV_HITS = ("principal-missing", "principal-invalid", "principal-expired", "prin
             "http-task-ambiguous", "approval-timeout")
 RESERVED_IDS = (UPSTREAM_ERROR_HIT, HALT_HIT, RESUME_HIT, *GOV_HITS)
 RESERVED_PREFIXES = ("budget:",)
+ATTESTATION_MODES = ("weights", "api")    # spec §3.1
 
 # Each rule type must carry one list-of-strings key; keyword terms must be non-empty.
 REQUIRED_KEYS = {
@@ -40,6 +41,7 @@ class Policy:
     node_region: str
     rules: tuple[dict, ...]
     hash: str
+    attestation: str = "weights"
 
     def modes(self) -> dict[str, str]:
         return {r["id"]: r["mode"] for r in self.rules}
@@ -67,6 +69,9 @@ def load(path: str | Path) -> Policy:
     ids = [r["id"] for r in rules]
     if len(ids) != len(set(ids)):
         raise ValueError(f"duplicate rule ids in {path}")
+    attestation = doc.get("attestation", "weights")
+    if attestation not in ATTESTATION_MODES:
+        raise ValueError(f"attestation must be one of {ATTESTATION_MODES} in {path}")
     return Policy(
         policy_id=str(doc["policy_id"]),
         version_label=str(doc.get("version_label", "")),
@@ -75,6 +80,7 @@ def load(path: str | Path) -> Policy:
         node_region=str(doc["node"]["region"]),
         rules=rules,
         hash=sha256_hex(raw),
+        attestation=attestation,
     )
 
 
@@ -98,10 +104,11 @@ def _fires(rule: dict, region: str, model_digest: str, text: str) -> bool:
     return any(term.lower() in text for term in rule["terms"])
 
 
-def evaluate(policy: Policy, region: str, model_digest: str, messages) -> tuple[str, str, list[str]]:
-    """Returns (decision, mode, rule_hits)."""
+def evaluate(policy: Policy, region: str, model_digest: str, messages,
+             skip: tuple[str, ...] = ()) -> tuple[str, str, list[str]]:
+    """Returns (decision, mode, rule_hits). Rules whose type is in `skip` are not evaluated."""
     text = message_text(messages).lower()
-    fired = [r for r in policy.rules if _fires(r, region, model_digest, text)]
+    fired = [r for r in policy.rules if r["type"] not in skip and _fires(r, region, model_digest, text)]
     hits = [r["id"] for r in fired]
     if any(r["mode"] == "enforce" for r in fired):
         return "block", "enforce", hits
