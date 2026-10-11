@@ -9,9 +9,11 @@ OUT=dist/sijil-$SHA
 rm -rf "$OUT" && mkdir -p "$OUT"
 docker build -t "sijil:$SHA" .
 docker save "sijil:$SHA" | gzip > "$OUT/sijil-image-$SHA.tar.gz"
-cp -r policy.yaml verifier "$OUT/"
+cp -r policy.yaml verifier docs/OPERATOR_GUIDE.html "$OUT/"
 mkdir -p "$OUT/scripts" && cp scripts/siem_forward.py "$OUT/scripts/"
 cat > "$OUT/INSTALL.txt" <<EOT
+Full install and day-to-day operation: open OPERATOR_GUIDE.html in any browser (works offline).
+
 1. docker load < sijil-image-$SHA.tar.gz   (or: podman load -i ...)
 2. Edit policy.yaml (node id, region, approved model digests).
 3. docker run -d -p 8000:8000 -v \$PWD/policy.yaml:/config/policy.yaml:ro -v sijil-data:/data \\
