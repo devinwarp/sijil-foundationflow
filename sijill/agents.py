@@ -282,12 +282,17 @@ def router(require_admin) -> APIRouter:
             raise HTTPException(401, "X-Sijil-Agent-Session required")
         return sess
 
-    def registrar(request: Request) -> str:
-        """principal_auth for register: open -> none; closed -> the admin bearer token, an operator key."""
-        if node(request).policy.agents.register_policy == "closed":
+    async def registrar(request: Request) -> tuple[str | None, str]:
+        """(registered_by or None to take the body's, principal_auth): open -> none; closed -> the admin
+        bearer token, an operator key; principal_oidc -> a validated human principal token (spec §5.6)."""
+        n = node(request)
+        if n.policy.agents.register_policy == "closed":
             require_admin(request)
-            return "key"
-        return "none"
+            return None, "key"
+        if n.policy.agents.register_policy == "principal_oidc":
+            h = await principal_or_refuse(n, request, required=True)
+            return h["principal"], "oidc"
+        return None, "none"
 
     def principal_arg(b: dict, key: str) -> str:
         p = b.get(key)
@@ -327,11 +332,11 @@ def router(require_admin) -> APIRouter:
         if "oidc_binding" in b:
             require_admin(request)        # an operator act, whatever register_policy says (spec §5.8.5)
             return await register_oidc(n, aid, b, principal_arg(b, "registered_by"))
-        principal_auth = registrar(request)
+        registered_by, principal_auth = await registrar(request)
         if not n.agents.id_ok(aid):
             raise HTTPException(422, "agent_id must be spiffe://<trust-domain>/agent/<name> or declared on the chain")
         n.agents.unregistered(aid)
-        registered_by = principal_arg(b, "registered_by")
+        registered_by = registered_by or principal_arg(b, "registered_by")
         pub = b.get("agent_pubkey")
         if not isinstance(pub, str) or not PUBKEY.fullmatch(pub):
             raise HTTPException(400, "agent_pubkey must be 32 bytes, lower-case hex")
@@ -473,12 +478,17 @@ def router(require_admin) -> APIRouter:
         x.update({k: b[k] for k in ("cwd", "config_digest") if isinstance(b.get(k), str) and b[k]})
         if not all(isinstance(v, str) for v in x.values()):
             raise HTTPException(400, "task fields must be strings")
-        # Stamped by the ledger from the session, never taken from the request (spec §5.8.1).
+        # Stamped by the ledger from the session, never taken from the request (spec §5.8.1). A principal
+        # token fixes a human principal for the whole task (§17.2.8); its refusal is not sealed (Ruling 12).
+        principal, principal_auth = sess["principal"], sess["principal_auth"]
+        h = await principal_or_refuse(n, request, required=False)
+        if h is not None:
+            principal, principal_auth, x["principal_claims"] = h["principal"], "oidc", h["claims"]
         x.update(intent_hash=intent, delegated_from=d, agent_auth=sess["agent_auth"],
-                 principal_auth=sess["principal_auth"], agent_session=sess["agent_session"])
+                 principal_auth=principal_auth, agent_session=sess["agent_session"])
         def build() -> dict:   # under the seal lock: a revoke cannot land between this check and the seal
             n.agents.active(sess["agent_id"])
-            return n.body(n.policy, "task_start", agent_id=sess["agent_id"], principal=sess["principal"],
+            return n.body(n.policy, "task_start", agent_id=sess["agent_id"], principal=principal,
                           input_hash=intent, ext=cj(x))
         try:
             rec = await n.seal(build)
@@ -500,6 +510,17 @@ def router(require_admin) -> APIRouter:
                                                                           if k != "outcome"}}
 
     return r
+
+
+async def principal_or_refuse(n, request: Request, required: bool) -> dict | None:
+    """Validated human principal from the request's principal token; HTTP refusal (unsealed) otherwise."""
+    try:
+        h = await n.human(request, None)
+        if required and h is None:
+            raise oidc.OidcError("missing")
+        return h
+    except oidc.OidcError as e:
+        raise HTTPException(e.status, {"principal_error": e.code, "rule_hits": [oidc.hit(e.code)]})
 
 
 async def oidc_session(n, request: Request, token) -> dict:

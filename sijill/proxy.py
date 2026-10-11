@@ -137,7 +137,25 @@ class Node:
 
     def keys_for(self, pol: policy.Policy) -> dict:
         """JWKS caches for every issuer the policy names; a pinned file that fails its sha256 raises."""
-        return oidc.build_jwks(pol.agents.oidc_issuers, self.settings.jwks_dir, self.idp)
+        humans = pol.principals.issuers if pol.principals else ()
+        return oidc.build_jwks([*pol.agents.oidc_issuers, *humans], self.settings.jwks_dir, self.idp)
+
+    async def human(self, request: Request, task: dict | None) -> dict | None:
+        """The validated human principal of a call (spec §17.2), bound to its task (§17.2.8). None when no
+        principals: block is configured, or a token is optional and absent. Raises oidc.OidcError."""
+        pcfg = self.policy.principals
+        if pcfg is None:
+            return None
+        token = oidc.token_of(pcfg, request.headers)
+        bound = task is not None and task["principal"].startswith("human:")
+        if token is None and not pcfg.require and not bound:
+            return None
+        h = await oidc.human(pcfg, self.jwks, token, agents.clock())
+        if task is not None and h["principal"] != task["principal"]:
+            raise oidc.OidcError("task_principal", 409, h["principal"])
+        if h["display"]:
+            self.store.index_principal(h["principal"], h["display"])
+        return h
 
     def check_attestation(self, pol: policy.Policy) -> None:
         """attestation: api needs the provider of the upstream route; it is never taken from the request."""
@@ -269,20 +287,47 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             digest = n.api_digest(model_id)   # until the provider names the model that answered
         else:
             digest = await asyncio.to_thread(n.resolver.resolve, model_id)
+        request_hash = record.sha256_hex(record.canonical_json(payload))
+        input_hash = record.input_hash(payload["messages"])
+        extra = {}
+
+        def ext(**answer) -> str:
+            x = chat.ext(pol.attestation, request_hash=request_hash, **{"session_id": session_id, **extra, **answer})
+            return record.canonical_json(x).decode() if x else ""
+
+        def headers(rec: dict, upstream_ms: float) -> dict:
+            overhead = (perf_counter() - t0) * 1000 - upstream_ms
+            return {"X-Sijill-Seq": str(rec["seq"]), "X-Sijill-Decision": rec["decision"],
+                    "X-Sijill-Record-Hash": rec["record_hash"], "X-Sijill-Overhead-Ms": f"{overhead:.3f}"}
+
+        try:
+            human = await n.human(request, task)
+        except oidc.OidcError as e:
+            # Sealed like the halt, outside any task so check I holds (spec §17.2.7); nothing is forwarded.
+            refused = oidc.hit(e.code)
+            rec = await n.seal(n.body(pol, "inference", model_id=model_id, model_digest=digest, mode="enforce",
+                                      decision="block", rule_hits=policy.rule_hits_json([refused]),
+                                      input_hash=input_hash, ext=ext(principal_error=e.code, session_id=""),
+                                      agent_id=who["agent_id"], principal=e.principal))
+            return JSONResponse(status_code=e.status, headers=headers(rec, 0.0), content={
+                "error": {"message": f"Sijil principal refused: {e.code}", "type": "principal_refused",
+                          "code": refused},
+                "sijill": {"seq": rec["seq"], "decision": "block", "rule_hits": [refused],
+                           "record_hash": rec["record_hash"]}})
+        if human is not None:
+            if task is None:
+                who["principal"] = human["principal"]
+                extra["principal_claims"] = human["claims"]
+            elif n.store.token_in_force(task["seq"]) != human["claims"]["token_hash"]:
+                extra["principal_claims"] = human["claims"]    # a refreshed token in the task (§17.2.8)
+
         # In api mode the allowlist is checked against the model that answered (spec §3.1), after the call.
         skip = ("model_allowlist",) if api else ()
         decision, mode, hits = policy.evaluate(pol, region, digest, payload["messages"], skip=skip)
         if n.halted:
             decision, mode, hits = "block", "enforce", [policy.HALT_HIT]
-        request_hash = record.sha256_hex(record.canonical_json(payload))
-
-        def ext(**answer) -> str:
-            x = chat.ext(pol.attestation, request_hash=request_hash, session_id=session_id, **answer)
-            return record.canonical_json(x).decode() if x else ""
-
         body = n.body(pol, "inference", model_id=model_id, model_digest=digest, mode=mode, decision=decision,
-                      rule_hits=policy.rule_hits_json(hits), input_hash=record.input_hash(payload["messages"]),
-                      ext=ext(), **who)
+                      rule_hits=policy.rule_hits_json(hits), input_hash=input_hash, ext=ext(), **who)
 
         def settled(b: dict):
             """Seal-time body: a task that ended while the call was in flight is not written into, so the
@@ -292,6 +337,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     x = json.loads(b["ext"]) if b["ext"] else {}
                     if "session_id" in x:
                         x["session_id"] = ""
+                    x.pop("principal_claims", None)    # claims belong to the task (Ruling 24)
                     return {**b, "task_seq": "", "agent_id": sess["agent_id"], "principal": sess["principal"],
                             "ext": record.canonical_json(x).decode() if x else ""}
                 return b
@@ -305,11 +351,6 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             post_decision, post_mode, post_hits = policy.evaluate(pol, region, d, payload["messages"])
             return {"model_digest": d, "decision": post_decision, "mode": post_mode,
                     "rule_hits": policy.rule_hits_json(post_hits)}, post_hits
-
-        def headers(rec: dict, upstream_ms: float) -> dict:
-            overhead = (perf_counter() - t0) * 1000 - upstream_ms
-            return {"X-Sijill-Seq": str(rec["seq"]), "X-Sijill-Decision": rec["decision"],
-                    "X-Sijill-Record-Hash": rec["record_hash"], "X-Sijill-Overhead-Ms": f"{overhead:.3f}"}
 
         def blocked(rec: dict, block_hits: list[str], upstream_ms: float = 0.0):
             return JSONResponse(status_code=403, headers=headers(rec, upstream_ms), content={

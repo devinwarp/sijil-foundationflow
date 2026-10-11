@@ -6,6 +6,7 @@ Error codes are the §17.2.7 `principal_error` values; the status is the HTTP st
 
 import base64
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,9 +32,21 @@ def ts_at(epoch: float) -> str:
 
 
 class OidcError(Exception):
-    def __init__(self, code: str, status: int = 401):
+    """`principal` is the validated principal when the token was valid but refused (assurance, task)."""
+
+    def __init__(self, code: str, status: int = 401, principal: str = ""):
         super().__init__(code)
-        self.code, self.status = code, status
+        self.code, self.status, self.principal = code, status, principal
+
+
+# §17.2.7: principal_error code -> the reserved rule id sealed in rule_hits (everything else is principal-invalid)
+HITS = {"missing": "principal-missing", "expired": "principal-expired", "not_yet_valid": "principal-expired",
+        "jwks_stale": "principal-jwks-unavailable", "assurance": "principal-assurance-low",
+        "task_principal": "principal-task-mismatch"}
+
+
+def hit(code: str) -> str:
+    return HITS.get(code, "principal-invalid")
 
 
 def b64d(s: str) -> bytes:
@@ -94,6 +107,7 @@ class Jwks:
             if record.sha256_hex(raw) != self.cfg["sha256"]:
                 raise ValueError(f"pinned JWKS {self.cfg['path']} does not match jwks.sha256 in the policy")
             self.doc = check_jwks(json.loads(raw))
+            self.snapshot()                           # jwks_hash is the canonical hash, so its file must exist (U2)
 
     async def refresh(self, now: float) -> None:
         try:
@@ -102,10 +116,13 @@ class Jwks:
         except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
             return                                    # keep the last snapshot until max_stale_s
         self.doc, self.fetched = doc, now
+        self.snapshot()
+
+    def snapshot(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
-        snap = self.dir / f"{jwks_hash(doc)}.json"
+        snap = self.dir / f"{jwks_hash(self.doc)}.json"
         if not snap.exists():
-            snap.write_bytes(record.canonical_json(doc))
+            snap.write_bytes(record.canonical_json(self.doc))
 
     async def key(self, kid, now: float):
         """(jwks document, public key) for `kid`, refreshing as §17.2.6 says."""
@@ -192,6 +209,92 @@ async def validate(token, issuers: dict, jwks: dict, now: float) -> Verified:
     if now < nbf - SKEW_S:
         raise OidcError("not_yet_valid")
     return Verified(cfg, header, claims, jwks_hash(doc))
+
+
+PROFILES = ("entra", "oidc")   # uaepass: userinfo only today (§17.2.4); brokered UAE PASS is profile oidc
+ISSUER_ID = re.compile(r"[a-z0-9-]{1,32}")
+GUID = re.compile(r"[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}")
+LEVELS = record.PRINCIPAL_ASSURANCE
+CONDITIONS = ("acrs_any", "amr_any", "claim_equals")
+
+
+def principal_issuer(d, where: str) -> dict:
+    """One principals.issuers entry (spec §17.2.2), defaults filled in."""
+    if not isinstance(d, dict) or not isinstance(d.get("id"), str) or not ISSUER_ID.fullmatch(d["id"]):
+        raise ValueError(f"{where}: id must match [a-z0-9-]{{1,32}}")
+    if d.get("profile") not in PROFILES or d.get("mode", "jwt") != "jwt":
+        raise ValueError(f"{where}: profile must be one of {PROFILES} with mode jwt (userinfo is not built)")
+    cfg = issuer_cfg(d, where)
+    entra = d["profile"] == "entra"
+    if entra and not (isinstance(d.get("tenant"), str) and GUID.fullmatch(d["tenant"])):
+        raise ValueError(f"{where}: an entra issuer needs tenant (the tid GUID)")
+    rules = d.get("assurance")
+    if (not isinstance(rules, list) or not rules
+            or any(not isinstance(r, dict) or r.get("level") not in LEVELS or set(r) - {"when", "level"}
+                   or not set(r.get("when") or {}) <= set(CONDITIONS) for r in rules)):
+        raise ValueError(f"{where}: assurance must be a list of {{when?, level}} rules, level in {LEVELS}")
+    for r in rules:
+        w = r.get("when") or {}
+        if (not isinstance(w, dict) or not all(isinstance(w.get(k, []), list) for k in ("acrs_any", "amr_any"))
+                or not isinstance(w.get("claim_equals", {}), dict)):
+            raise ValueError(f"{where}: assurance `when` needs acrs_any/amr_any lists and a claim_equals map")
+    if not all(isinstance(d.get(k, ""), str) for k in ("display_claim", "subject_claim")):
+        raise ValueError(f"{where}: display_claim and subject_claim are claim names")
+    return {**cfg, "subject_claim": d.get("subject_claim", "oid" if entra else "sub"),
+            "require_delegated": d.get("require_delegated", entra), "tenant": d.get("tenant", "")}
+
+
+def assurance(rules: list, claims: dict) -> tuple[str, int]:
+    """First matching rule wins (§17.2.2); a rule with no `when` always matches."""
+    def has(name, wanted):
+        got = claims.get(name)
+        return bool(set(got if isinstance(got, list) else [got]) & set(wanted))
+    for i, r in enumerate(rules):
+        w = r.get("when") or {}
+        if (("acrs_any" not in w or has("acrs", w["acrs_any"])) and ("amr_any" not in w or has("amr", w["amr_any"]))
+                and all(claims.get(k) == v for k, v in (w.get("claim_equals") or {}).items())):
+            return r["level"], i
+    raise OidcError("assurance", 403)
+
+
+def token_of(pcfg, headers) -> str | None:
+    """The principal token: the configured header, else (accept_authorization) a Bearer Authorization."""
+    token = headers.get(pcfg.header)
+    auth = headers.get("authorization", "")
+    if token is None and pcfg.accept_authorization and auth.startswith("Bearer "):
+        token = auth[7:]
+    return token
+
+
+async def human(pcfg, jwks: dict, token, now: float) -> dict:
+    """§17.2.3 steps 1-8 for validation: jwt. Returns {principal, claims, display}; raises OidcError."""
+    if token is None:
+        raise OidcError("missing")
+    v = await validate(token, {i["issuer"]: i for i in pcfg.issuers}, jwks, now)
+    c, i = v.claims, v.cfg
+    if i["profile"] == "entra" and c.get("ver") != "2.0":
+        raise OidcError("issuer")                      # v1.0 tokens carry another iss (§17.2.3 step 2)
+    if i["profile"] == "entra" and c.get("tid") != i["tenant"]:
+        raise OidcError("tenant")
+    delegated = "scp" in c and c.get("idtyp") != "app"
+    if i["require_delegated"] and not delegated:
+        raise OidcError("not_delegated")
+    subject = c.get(i["subject_claim"])
+    if not isinstance(subject, str) or not subject:
+        raise OidcError("malformed")
+    level, rule = assurance(i["assurance"], c)
+    principal = f"human:{i['id']}:{record.sha256_hex(record.canonical_json({'iss': c['iss'], 'sub': subject}))}"
+    claims = {"issuer_id": i["id"], "profile": i["profile"], "validation": "jwt", "iss": c["iss"],
+              "aud": i["audience"], "tenant": c["tid"] if i["profile"] == "entra" else "", "assurance": level,
+              "assurance_rule": rule, "delegated": delegated, "token_hash": record.sha256_hex(token.encode()),
+              "kid": v.header["kid"], "alg": v.header["alg"], "jwks_hash": v.jwks_hash,
+              "nbf": ts_at(c.get("nbf", c.get("iat"))), "exp": ts_at(c["exp"])}
+    if isinstance(c.get("amr"), list) and all(isinstance(a, str) for a in c["amr"]):
+        claims["amr"] = sorted(set(c["amr"]))
+    if LEVELS.index(level) < LEVELS.index(pcfg.min_assurance):
+        raise OidcError("assurance", 403, principal)
+    display = c.get(i["display_claim"]) if i.get("display_claim") else None
+    return {"principal": principal, "claims": claims, "display": display if isinstance(display, str) else None}
 
 
 def build_jwks(cfgs, snapshot_dir: str, http: httpx.AsyncClient) -> dict:

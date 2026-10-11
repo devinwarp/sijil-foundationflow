@@ -144,6 +144,19 @@ class Store:
                                 args).fetchone()
         return dict(row) if row else None
 
+    def token_in_force(self, task_seq: int) -> str | None:
+        """token_hash of the principal_claims in force in a task: the newest record of it that carried them."""
+        row = self.conn.execute(
+            "SELECT json_extract(CASE ext WHEN '' THEN '{}' ELSE ext END, '$.principal_claims.token_hash') AS h "
+            "FROM records WHERE (seq = ? OR task_seq = ?) AND h IS NOT NULL ORDER BY seq DESC LIMIT 1",
+            (task_seq, str(task_seq))).fetchone()
+        return row["h"] if row else None
+
+    def index_principal(self, principal: str, display: str) -> None:
+        """principal_index: display names for the report; side table, not evidence (spec §2.1)."""
+        self.conn.execute("INSERT OR IGNORE INTO principal_index (principal, display) VALUES (?, ?)",
+                          (principal, display))
+
     def count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
 
