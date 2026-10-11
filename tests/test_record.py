@@ -11,12 +11,14 @@ KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
 BODY = dict(type="inference", ts="2026-09-25T10:00:00.000Z", model_id="llama-3.2-3b-instruct",
             model_digest="sha256:" + "0" * 64, node_id="auh-node-01", node_region="AE-AZ",
             policy_id="gov-assistant", policy_hash="a" * 64, approval_ref="APR-0147", mode="record",
-            decision="flag", rule_hits='["sensitive_terms"]', input_hash="b" * 64, output_hash="c" * 64)
+            decision="flag", rule_hits='["sensitive_terms"]', input_hash="b" * 64, output_hash="c" * 64,
+            **{f: "" for f in record.EXT_FIELDS})   # v1-shaped: every v2 column empty, so the v1 hash holds
 
 
 def test_canonical_form():
     rec = record.seal(BODY, 1, record.GENESIS_HASH, KEY)
-    canon = record.canonical_json({k: v for k, v in rec.items() if k not in ("record_hash", "signature")})
+    canon = record.canonical_json({k: v for k, v in rec.items() if k not in ("record_hash", "signature")
+                                   and not (k in record.EXT_FIELDS and v == "")})   # §2.2 omit-if-empty
     assert canon.startswith(b'{"approval_ref":"APR-0147","decision":"flag",')
     assert b'"seq":1,' in canon and b" " not in canon
 

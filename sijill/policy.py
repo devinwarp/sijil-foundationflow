@@ -16,7 +16,12 @@ UPSTREAM_ERROR_HIT = "upstream_error"
 # Reserved pseudo-rule ids for the operator halt switch.
 HALT_HIT = "halted"
 RESUME_HIT = "resumed"
-RESERVED_IDS = (UPSTREAM_ERROR_HIT, HALT_HIT, RESUME_HIT)
+# v2.4 (spec §17.1): rule ids the ledger and guard seal themselves; a rule pack may not reuse them.
+GOV_HITS = ("principal-missing", "principal-invalid", "principal-expired", "principal-assurance-low",
+            "principal-task-mismatch", "principal-jwks-unavailable", "http-operation-unknown",
+            "http-task-ambiguous", "approval-timeout")
+RESERVED_IDS = (UPSTREAM_ERROR_HIT, HALT_HIT, RESUME_HIT, *GOV_HITS)
+RESERVED_PREFIXES = ("budget:",)
 
 # Each rule type must carry one list-of-strings key; keyword terms must be non-empty.
 REQUIRED_KEYS = {
@@ -50,7 +55,7 @@ def load(path: str | Path) -> Policy:
     for r in rules:
         if r.get("type") not in RULE_TYPES or r.get("mode") not in MODES or not r.get("id"):
             raise ValueError(f"invalid rule in {path}: {r}")
-        if r["id"] in RESERVED_IDS:
+        if r["id"] in RESERVED_IDS or str(r["id"]).startswith(RESERVED_PREFIXES):
             raise ValueError(f"rule id {r['id']!r} is reserved in {path}")
         key, non_empty = REQUIRED_KEYS[r["type"]]
         vals = r.get(key)
