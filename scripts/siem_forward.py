@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import socket
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -68,12 +69,13 @@ def run(url: str, sink: tuple[str, int], state_path: Path, udp: bool = False, in
 
     `once` drains the whole backlog then returns, and errors propagate. Otherwise the loop
     retries forever: on a network error or a response that is not the records JSON (e.g. an SSO
-    login page) it sleeps, reconnects TCP, and resumes from the saved seq.
+    login page) it logs one line to stderr, sleeps, reconnects TCP, and resumes from the saved seq.
     State advances only after a whole page has been sent.
     """
     state = _load_state(state_path)
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     conn = None
+    failures = 0                     # consecutive failed attempts, for the log line only
     try:
         while True:
             try:
@@ -89,14 +91,18 @@ def run(url: str, sink: tuple[str, int], state_path: Path, udp: bool = False, in
                     else:
                         conn.sendall((line + "\n").encode())
                     cursor = rec["seq"]
-            except (OSError, ValueError, KeyError):  # ValueError/KeyError: not the records API (e.g. SSO page)
+            except (OSError, ValueError, KeyError) as e:  # ValueError/KeyError: not the records API (e.g. SSO page)
                 if once:
                     raise
+                failures += 1
+                print(f"siem_forward: {type(e).__name__}: {e} (after seq {state}); "
+                      f"attempt {failures} failed, retrying in {interval}s", file=sys.stderr, flush=True)
                 if conn is not None:
                     conn.close()
                     conn = None
                 time.sleep(interval)
                 continue
+            failures = 0
             if recs:
                 _save_state(state_path, cursor)
                 state = cursor
