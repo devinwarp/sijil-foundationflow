@@ -6,6 +6,7 @@ from pathlib import Path
 
 import yaml
 
+from . import oidc
 from .record import MODES, sha256_hex
 
 RULE_TYPES = ("region_allowlist", "model_allowlist", "keyword_flag")
@@ -31,6 +32,7 @@ class AgentsConfig:
     """policy.yaml `agents:` (spec §5.8.5). Absent block: registrations need the admin token (secure default)."""
     register_policy: str = "closed"
     session_ttl_s: int = 28800
+    oidc_issuers: tuple[dict, ...] = ()       # workload token issuers (spec §5.8.5)
 
 
 def load_agents(doc) -> AgentsConfig:
@@ -41,7 +43,11 @@ def load_agents(doc) -> AgentsConfig:
     ttl = doc.get("session_ttl_s", 28800)
     if type(ttl) is not int or not 60 <= ttl <= 86400:
         raise ValueError("agents.session_ttl_s must be an integer from 60 to 86400")
-    return AgentsConfig(register_policy=doc.get("register_policy", "closed"), session_ttl_s=ttl)
+    issuers = doc.get("oidc_issuers") or []
+    if not isinstance(issuers, list):
+        raise ValueError("agents.oidc_issuers must be a list")
+    return AgentsConfig(register_policy=doc.get("register_policy", "closed"), session_ttl_s=ttl,
+                        oidc_issuers=tuple(oidc.issuer_cfg(d, "agents.oidc_issuers") for d in issuers))
 
 # Each rule type must carry one list-of-strings key; keyword terms must be non-empty.
 REQUIRED_KEYS = {

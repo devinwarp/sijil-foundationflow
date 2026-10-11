@@ -11,13 +11,14 @@ import re
 import secrets
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import policy, record, rulepack
+from . import oidc, policy, record, rulepack
+from .oidc import ts_at
 
 SPIFFE = re.compile(r"spiffe://[a-z0-9.-]+/agent/[a-z0-9._-]+")      # verifier check I2
 ID_SYNTAX = {"spiffe": r"spiffe://[a-z0-9.-]+/\S+", "wimse": r"wimse://[a-z0-9.-]+/\S+", "did": r"did:[a-z0-9]+:\S+",
@@ -35,11 +36,6 @@ PURPOSES = ("session", "register", "rotate")
 
 def clock() -> float:
     return time.time()
-
-
-def ts_at(epoch: float) -> str:
-    """record.now_ts() form for any instant."""
-    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def cj(obj) -> str:
@@ -116,6 +112,15 @@ class Registry:
             raise HTTPException(409, "agent already revoked")
         if a.pubkey != pubkey:
             raise HTTPException(409, "agent key changed; retry")
+
+    def by_binding(self, issuer: str, sub: str) -> str | None:
+        """The oidc agent whose binding matches (exact sub_pattern, or a prefix ending in *); first registered wins."""
+        for aid, a in self.agents.items():
+            p = a.oidc_binding.get("sub_pattern", "")
+            if (a.auth == "oidc" and not a.revoked and a.oidc_binding.get("issuer") == issuer
+                    and (sub.startswith(p[:-1]) if p.endswith("*") else sub == p)):
+                return aid
+        return None
 
     def active(self, agent_id: str) -> Agent:
         a = self.agents.get(agent_id)
@@ -304,6 +309,8 @@ def router(require_admin) -> APIRouter:
     async def session(request: Request):
         b = await body_of(request)
         n, aid = node(request), b.get("agent_id")
+        if "oidc_token" in b:
+            return await oidc_session(n, request, b["oidc_token"])
         n.agents.burn(b.get("nonce"), aid, "session")
         a = n.agents.active(aid)
         if a.auth != "key":
@@ -317,6 +324,9 @@ def router(require_admin) -> APIRouter:
     async def register(request: Request):
         b = await body_of(request)
         n, aid = node(request), b.get("agent_id")
+        if "oidc_binding" in b:
+            require_admin(request)        # an operator act, whatever register_policy says (spec §5.8.5)
+            return await register_oidc(n, aid, b, principal_arg(b, "registered_by"))
         principal_auth = registrar(request)
         if not n.agents.id_ok(aid):
             raise HTTPException(422, "agent_id must be spiffe://<trust-domain>/agent/<name> or declared on the chain")
@@ -490,6 +500,42 @@ def router(require_admin) -> APIRouter:
                                                                           if k != "outcome"}}
 
     return r
+
+
+async def oidc_session(n, request: Request, token) -> dict:
+    """Workload token -> session for the registered oidc agent whose binding matches its sub (spec §5.8.5)."""
+    issuers = {c["issuer"]: c for c in n.policy.agents.oidc_issuers}
+    try:
+        v = await oidc.validate(token, issuers, n.jwks, clock())
+    except oidc.OidcError as e:
+        raise HTTPException(e.status, f"oidc token refused: {e.code}")
+    jti, sub = v.claims.get("jti") or v.claims.get("uti"), v.claims.get("sub")
+    if not isinstance(jti, str) or not jti:
+        raise HTTPException(401, "oidc token refused: no jti or uti")
+    if n.store.jti_used(jti):
+        raise HTTPException(401, "oidc token refused: replayed")
+    if not isinstance(sub, str) or not re.fullmatch(r"\S{1,256}", sub):
+        raise HTTPException(401, "oidc token refused: sub")
+    aid = n.agents.by_binding(v.cfg["issuer"], sub)
+    if aid is None:
+        raise HTTPException(401, "no oidc agent registered for this sub")
+    principal = f"oidc:{urlsplit(v.cfg['issuer']).hostname}:{sub}"
+    return open_session(n, request, aid, principal, "oidc", "oidc", jti)
+
+
+async def register_oidc(n, aid, b: dict, registered_by: str) -> dict:
+    if not n.agents.id_ok(aid):
+        raise HTTPException(422, "agent_id must be spiffe://<trust-domain>/agent/<name> or declared on the chain")
+    n.agents.unregistered(aid)
+    binding = b["oidc_binding"]
+    if (not isinstance(binding, dict) or set(binding) != {"issuer", "sub_pattern"}
+            or not isinstance(binding["issuer"], str)
+            or binding["issuer"] not in {c["issuer"] for c in n.policy.agents.oidc_issuers}
+            or not isinstance(binding["sub_pattern"], str) or not binding["sub_pattern"]):
+        raise HTTPException(400, "oidc_binding must be {issuer, sub_pattern} for an issuer in agents.oidc_issuers")
+    x = {"auth": "oidc", "oidc_binding": binding, "registered_by": registered_by, "principal_auth": "key",
+         "id_form": "spiffe"}
+    return await seal_agent(n, "agent_register", aid, registered_by, "", x, check=lambda: n.agents.unregistered(aid))
 
 
 def open_session(n, request: Request, agent_id: str, principal: str, agent_auth: str, principal_auth: str,

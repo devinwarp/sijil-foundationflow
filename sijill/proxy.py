@@ -26,7 +26,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from . import agents, chat, keys, policy, record, rulepack
+from . import agents, chat, keys, oidc, policy, record, rulepack
 from .digest import DigestResolver
 from .store import Store
 
@@ -59,6 +59,7 @@ class Settings:
     pkcs11_pin: str = ""
     halt_path: str = "sijill.halt"
     digest_cache: str = ".sijill_digests.json"
+    jwks_dir: str = "jwks"             # JWKS snapshots by hash (spec §17.2.6); not evidence
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -82,6 +83,7 @@ class Settings:
             pkcs11_pin=e("SIJILL_PKCS11_PIN", ""),
             halt_path=e("SIJILL_HALT_PATH", cls.halt_path),
             digest_cache=e("SIJILL_DIGEST_CACHE", cls.digest_cache),
+            jwks_dir=e("SIJILL_JWKS_DIR", cls.jwks_dir),
         )
 
 
@@ -89,7 +91,7 @@ class Node:
     """Runtime state: the chain head, the policy and rule pack in force and the node's current region."""
 
     def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None,
-                 resolver: DigestResolver | None = None):
+                 resolver: DigestResolver | None = None, idp_transport: httpx.AsyncBaseTransport | None = None):
         self.settings = settings
         self.store = Store(settings.db_path)
         if settings.pkcs11_module:
@@ -130,6 +132,12 @@ class Node:
         headers = {"Authorization": f"Bearer {settings.upstream_token}"} if settings.upstream_token else {}
         self.client = httpx.AsyncClient(base_url=settings.upstream, headers=headers,
                                         timeout=settings.upstream_timeout, transport=transport)
+        self.idp = httpx.AsyncClient(timeout=10.0, transport=idp_transport)   # discovery and JWKS only
+        self.jwks = self.keys_for(self.policy)
+
+    def keys_for(self, pol: policy.Policy) -> dict:
+        """JWKS caches for every issuer the policy names; a pinned file that fails its sha256 raises."""
+        return oidc.build_jwks(pol.agents.oidc_issuers, self.settings.jwks_dir, self.idp)
 
     def check_attestation(self, pol: policy.Policy) -> None:
         """attestation: api needs the provider of the upstream route; it is never taken from the request."""
@@ -194,6 +202,7 @@ class Node:
 
     async def aclose(self) -> None:
         await self.client.aclose()
+        await self.idp.aclose()
         self.store.close()
         close = getattr(self.key, "close", None)  # HSM signer only; file keys have none
         if close:
@@ -201,12 +210,13 @@ class Node:
 
 
 def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTransport | None = None,
-               resolver: DigestResolver | None = None) -> FastAPI:
+               resolver: DigestResolver | None = None,
+               idp_transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.node = Node(settings, transport, resolver)
+        app.state.node = Node(settings, transport, resolver, idp_transport)
         n = app.state.node
         if n.rulepack:   # before any policy_change, so that record already carries the new hash
             await n.adopt_rulepack(n.rulepack, "startup", old=None)
@@ -494,9 +504,11 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         try:
             new = policy.load(settings.policy_path)
             n.check_attestation(new)
+            jwks = n.keys_for(new)
         except Exception as e:
             raise HTTPException(400, f"policy not loaded: {e}")
         old = n.policy
+        n.jwks = jwks
         rec = await n.adopt_policy(new, old_hash=old.hash, old=old)
         changed = policy.mode_changes(old, new)
         return {"changed": changed, "seq": rec and rec["seq"], "policy_hash": new.hash}

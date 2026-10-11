@@ -141,13 +141,16 @@ def rows(db, where: str = "1=1") -> list[dict]:
     return out
 
 
-def make_node(tmp_path, handler, policy_text: str | None = None, **overrides):
-    """A proxy on tmp_path with its own policy text and Settings overrides. Returns (TestClient, Settings);
-    enter the client with `with client:`. Each call on the same tmp_path sees the previous chain."""
+def make_node(tmp_path, handler, policy_text: str | None = None, idp=None, **overrides):
+    """A proxy on tmp_path with its own policy text and Settings overrides; `idp` answers discovery and JWKS
+    requests. Returns (TestClient, Settings); enter the client with `with client:`. Each call on the same
+    tmp_path sees the previous chain."""
     (tmp_path / "policy.yaml").write_text(policy_text or (ROOT / "policy.yaml").read_text())
     settings = Settings(**{**dict(db_path=str(tmp_path / "sijill.db"), policy_path=str(tmp_path / "policy.yaml"),
                                   key_path=str(tmp_path / "node.key"), pubkey_path=str(tmp_path / "node.pub"),
                                   upstream="http://model.test/v1", admin_token=ADMIN_TOKEN,
-                                  halt_path=str(tmp_path / "sijill.halt")), **overrides})
-    app = create_app(settings, transport=httpx.MockTransport(handler), resolver=StubResolver())
+                                  halt_path=str(tmp_path / "sijill.halt"), jwks_dir=str(tmp_path / "jwks")),
+                           **overrides})
+    app = create_app(settings, transport=httpx.MockTransport(handler), resolver=StubResolver(),
+                     idp_transport=httpx.MockTransport(idp) if idp else None)
     return TestClient(app, headers=ADMIN), settings

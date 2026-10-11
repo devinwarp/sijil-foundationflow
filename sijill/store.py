@@ -100,6 +100,9 @@ class Store:
                           "principal_auth, remote_addr, expires_at, jti) VALUES (:agent_session, :agent_id, "
                           ":principal, :agent_auth, :principal_auth, :remote_addr, :expires_at, :jti)", row)
 
+    def jti_used(self, jti: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM agent_sessions WHERE jti = ?", (jti,)).fetchone() is not None
+
     def session(self, agent_session: str) -> dict | None:
         row = self.conn.execute("SELECT * FROM agent_sessions WHERE agent_session = ?", (agent_session,)).fetchone()
         return dict(row) if row else None
