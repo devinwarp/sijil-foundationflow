@@ -24,7 +24,7 @@ SPIFFE = re.compile(r"spiffe://[a-z0-9.-]+/agent/[a-z0-9._-]+")      # verifier 
 ID_SYNTAX = {"spiffe": r"spiffe://[a-z0-9.-]+/\S+", "wimse": r"wimse://[a-z0-9.-]+/\S+", "did": r"did:[a-z0-9]+:\S+",
              "entra": r"[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}", "cloud-native": r"\S{1,512}", "other": r"\S{1,512}"}
 PUBKEY = HEX64 = re.compile(r"[0-9a-f]{64}")
-DECIMAL = re.compile(r"[1-9][0-9]*")
+DECIMAL = re.compile(r"[1-9][0-9]{0,17}")      # fits SQLite INTEGER
 OUTCOMES = ("completed", "aborted", "blocked", "error", "timeout")
 SEALABLE = ("tool_call", "tool_result", "egress", "integrity_baseline", "integrity_drift")   # row 5; approval: 18g
 PARENT_TYPE = {"tool_call": "inference", "tool_result": "tool_call", "egress": "tool_call",
@@ -398,6 +398,8 @@ def router(require_admin) -> APIRouter:
             raise HTTPException(400, "rule_hits must be a list of strings and ext an object")
         if not isinstance(b.get("rulepack_hash"), str):
             raise HTTPException(400, "rulepack_hash must be a string")
+        if any(h in policy.RESERVED_IDS or h.startswith(policy.RESERVED_PREFIXES) for h in hits):
+            raise HTTPException(400, "rule_hits may not carry reserved ids; the node adds those itself")
         task = task_for(n, sess, b.get("task_seq"))
         if task is None and t in record.TASK_REQUIRED:
             raise HTTPException(409, "no open task in this agent session")

@@ -85,10 +85,18 @@ def check_jwks(doc) -> dict:
     keys = doc.get("keys") if isinstance(doc, dict) else None
     if not isinstance(keys, list) or not keys:
         raise ValueError("JWKS has no keys")
+    usable = 0
     for k in keys:
-        need = {"RSA": ("n", "e"), "OKP": ("crv", "x")}.get(k.get("kty") if isinstance(k, dict) else None)
-        if need is None or not isinstance(k.get("kid"), str) or not all(isinstance(k.get(f), str) for f in need):
+        if not isinstance(k, dict):
             raise ValueError(f"JWKS key malformed: {k!r}")
+        need = {"RSA": ("n", "e"), "OKP": ("crv", "x")}.get(k.get("kty"))
+        if need is None:
+            continue                                  # an IdP may publish other key types (EC); we never select them
+        if not isinstance(k.get("kid"), str) or not all(isinstance(k.get(f), str) for f in need):
+            raise ValueError(f"JWKS key malformed: {k!r}")
+        usable += 1
+    if not usable:
+        raise ValueError("JWKS has no RSA or OKP key")
     return doc
 
 
@@ -107,7 +115,11 @@ class Jwks:
             if record.sha256_hex(raw) != self.cfg["sha256"]:
                 raise ValueError(f"pinned JWKS {self.cfg['path']} does not match jwks.sha256 in the policy")
             self.doc = check_jwks(json.loads(raw))
-            self.snapshot()                           # jwks_hash is the canonical hash, so its file must exist (U2)
+            try:
+                self.snapshot(self.doc)               # jwks_hash is the canonical hash, so its file must exist (U2)
+            except OSError as e:
+                raise ValueError(f"cannot write JWKS snapshot to {self.dir} (set SIJILL_JWKS_DIR to a writable "
+                                 f"directory): {e}") from e
 
     async def refresh(self, now: float) -> None:
         try:
@@ -115,14 +127,17 @@ class Jwks:
             doc = check_jwks((await self.http.get(conf.raise_for_status().json()["jwks_uri"])).raise_for_status().json())
         except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
             return                                    # keep the last snapshot until max_stale_s
+        try:
+            self.snapshot(doc)                        # before the cache changes: no hash is sealed without its file
+        except OSError:
+            raise OidcError("jwks_stale", 503)
         self.doc, self.fetched = doc, now
-        self.snapshot()
 
-    def snapshot(self) -> None:
+    def snapshot(self, doc: dict) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
-        snap = self.dir / f"{jwks_hash(self.doc)}.json"
+        snap = self.dir / f"{jwks_hash(doc)}.json"
         if not snap.exists():
-            snap.write_bytes(record.canonical_json(self.doc))
+            snap.write_bytes(record.canonical_json(doc))
 
     async def key(self, kid, now: float):
         """(jwks document, public key) for `kid`, refreshing as §17.2.6 says."""

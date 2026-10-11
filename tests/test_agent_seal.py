@@ -232,3 +232,26 @@ def test_malformed_bodies_are_400_and_seal_nothing(flow, change):
                     headers={**h, "Content-Type": "application/json"})
     assert r.status_code == 400
     assert len(rows(s.db_path)) == before
+
+
+@pytest.mark.parametrize("hit", ["halted", "principal-missing", "approval-timeout", "budget:case-agent:tool_calls"])
+def test_reserved_rule_hits_in_the_body_are_refused(flow, hit):
+    client, s, sess, task, h = flow
+    before = len(rows(s.db_path))
+    r = seal(client, h, **TOOL_CALL, parent_seq=str(task + 1), rule_hits=["ok-rule", hit])
+    assert r.status_code == 400
+    assert len(rows(s.db_path)) == before
+
+
+def test_under_halt_a_normal_body_seals_halted_exactly_once(flow):
+    client, s, sess, task, h = flow
+    client.post("/api/admin/halt", json={"halted": True})
+    assert seal(client, h, **TOOL_CALL, parent_seq=str(task + 1), rule_hits=["ok-rule"]).status_code == 200
+    assert json.loads(rows(s.db_path)[-1]["rule_hits"]).count("halted") == 1
+
+
+def test_a_25_digit_sequence_number_is_a_4xx_not_a_500(flow):
+    client, s, sess, task, h = flow
+    assert 400 <= seal(client, h, **TOOL_CALL, parent_seq="9" * 25).status_code < 500
+    assert 400 <= seal(client, h, **TOOL_CALL, parent_seq=str(task + 1), task_seq="9" * 25).status_code < 500
+    assert 400 <= chat(client, sess, "x", task_seq="9" * 25).status_code < 500

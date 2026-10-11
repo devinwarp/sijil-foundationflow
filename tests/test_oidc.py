@@ -227,3 +227,57 @@ def test_deep_nesting_and_oversize_tokens_are_401_malformed(tmp_path, token):
     with client:
         r = client.post("/api/agent/session", json={"oidc_token": token}, headers=HDR)
         assert r.status_code == 401 and r.json()["detail"].endswith("malformed"), r.text
+
+
+def test_an_unwritable_snapshot_dir_refuses_the_token_and_seals_nothing(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    token = jws(claims(sub=MI, jti="j-snap"))
+    client, s = agent_node(tmp_path, policy_text=WORKLOAD_POLICY, idp=Idp({"keys": [rsa_jwk()]}),
+                           jwks_dir=str(blocker / "jwks"))
+    with client:
+        assert register_oidc(client).status_code == 200
+        before = len(rows(s.db_path))
+        r = client.post("/api/agent/session", json={"oidc_token": token}, headers=HDR)
+        assert r.status_code == 503 and "jwks_stale" in r.text
+        assert len(rows(s.db_path)) == before
+        assert all(j.doc is None and j.fetched is None for j in client.app.state.node.jwks.values())
+    good = tmp_path / "good"
+    client, s = agent_node(tmp_path, policy_text=WORKLOAD_POLICY, idp=Idp({"keys": [rsa_jwk()]}), jwks_dir=str(good))
+    with client:
+        r = client.post("/api/agent/session", json={"oidc_token": token}, headers=HDR)
+        assert r.status_code == 200
+        start_task(client, r.json())
+    (snap,) = good.iterdir()
+    assert snap.stem == record.sha256_hex(snap.read_bytes())
+    assert snap.stem == oidc.jwks_hash({"keys": [rsa_jwk()]})      # the hash a human-principal record would seal
+
+
+def test_pinned_jwks_with_an_unwritable_dir_refuses_to_start_naming_it(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    sha = record.sha256_hex(FIXTURE_JWKS.read_bytes())
+    policy = OPEN_POLICY.replace("agents:\n", f"""agents:
+  oidc_issuers:
+    - issuer: {ENTRA_ISS}
+      audience: {AUDIENCE}
+      algs: [EdDSA]
+      jwks: {{mode: pinned, path: "{FIXTURE_JWKS}", sha256: "{sha}"}}
+""")
+    client, _ = agent_node(tmp_path, policy_text=policy, jwks_dir=str(blocker / "jwks"))
+    with pytest.raises(ValueError, match="cannot write JWKS snapshot.*file/jwks"):
+        with client:
+            pass
+
+
+EC_JWK = {"kty": "EC", "kid": "ec-1", "crv": "P-256", "x": "AA", "y": "AA"}
+
+
+def test_unsupported_key_types_are_skipped_but_a_jwks_with_nothing_usable_is_refused(tmp_path):
+    v = check(jws(claims(sub="mi-1")), Idp({"keys": [EC_JWK, rsa_jwk()]}), tmp_path)
+    assert v.claims["sub"] == "mi-1"
+    with pytest.raises(oidc.OidcError) as e:
+        check(jws(claims(sub="mi-1")), Idp({"keys": [EC_JWK]}), tmp_path / "other")
+    assert e.value.status == 503
+    with pytest.raises(ValueError):
+        oidc.check_jwks({"keys": [{"kty": "RSA", "kid": "x"}]})
