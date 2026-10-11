@@ -48,6 +48,14 @@ AGENT_AUTH = ("key", "mtls", "oidc", "relay", "none")
 DECIMAL = re.compile(r"[1-9][0-9]*")
 SOURCE_LABEL = re.compile(r"user|repo|telemetry|web|memory|mcp:[a-z0-9_-]{1,32}|http:[a-z0-9_-]{1,32}")
 MODEL_DIGEST = re.compile(r"sha256:[0-9a-f]{64}|api:[a-z0-9-]+:\S+|")
+AGENT_ID = re.compile(r"spiffe://[a-z0-9.-]+/agent/[a-z0-9._-]+")
+PRINCIPAL = re.compile(r"oidc:[a-z0-9.-]+:[^\s]+|email:[0-9a-f]{64}|local:[0-9a-f]{64}"
+                       r"|human:[a-z0-9-]{1,32}:[0-9a-f]{64}")
+ID_SYNTAX = {"spiffe": r"spiffe://[a-z0-9.-]+/\S+", "wimse": r"wimse://[a-z0-9.-]+/\S+", "did": r"did:[a-z0-9]+:\S+",
+             "entra": r"[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}", "cloud-native": r"\S{1,512}", "other": r"\S{1,512}"}
+CONTINUITY = ("logical_agent_id", "responsible_entity", "lifecycle_class", "runtime_identities", "derived_from")
+REGISTER_AUTH = {"key": ("key", "mtls"), "oidc": ("oidc",), "relay": ("relay",)}   # N: register auth -> agent_auth
+TASK_COUNTS = ("inference", "tool_calls", "blocked", "confirmed", "denied", "flagged", "egress")
 
 BANNER_FONT = {
     "P": ["█████ ", "██  ██", "█████ ", "██    ", "██    "],
@@ -135,6 +143,9 @@ class State:
         self.attestation = dict.fromkeys(ATTESTATION, 0)
         self.agent_auth = dict.fromkeys(AGENT_AUTH, 0)
         self.orphans = self.unauthenticated = 0
+        self.agents = {}                # agent_id -> {registered_seq, current_pubkey, auth, revoked}
+        self.tasks = {}                 # task_start seq -> {agent_id, principal, ended, counts, last_seq}
+        self.declared = set()           # runtime identities declared by agent_register / agent_identity_update
 
 
 def check_record(st, rec):
@@ -188,6 +199,7 @@ def check_record(st, rec):
         raise Fail("source_label_invalid", "source_label invalid")
     if t == "inference":
         st.attestation[attestation(rec["model_digest"], x)] += 1
+    identity_checks(st, rec, x, parent)
     st.seen[seq] = Seen(t, x, rec["input_hash"], rec["task_seq"])
 
 
@@ -201,6 +213,164 @@ def attestation(digest, x):
     if claimed is not None and claimed not in allowed:
         raise Fail("attestation_mismatch", "attestation mismatch")
     return "api+tee" if claimed == "api+tee" else kind
+
+
+def proof_valid(pubkey_hex, signature_hex, digest_hex):
+    """Agent proofs (K, K2): Ed25519 over the 32 raw bytes of sha256(canonical_json(message))."""
+    try:
+        key = ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(pubkey_hex))
+    except (ValueError, TypeError):
+        return False
+    return signature_valid(key, digest_hex, signature_hex)
+
+
+def declare(st, identity):
+    """Record a runtime identity whose identifier matches its scheme's syntax (I2, spec §2.4.12)."""
+    if isinstance(identity, dict) and isinstance(identity.get("identifier"), str):
+        syntax = ID_SYNTAX.get(identity.get("scheme"))
+        if syntax and re.fullmatch(syntax, identity["identifier"]):
+            st.declared.add(identity["identifier"])
+
+
+def registered(st, agent_id):
+    a = st.agents.get(agent_id)
+    if a is None:
+        raise Fail("agent_not_registered", "agent not registered")
+    if a["revoked"]:
+        raise Fail("agent_revoked", "agent revoked")
+    return a
+
+
+def identity_checks(st, rec, x, parent):
+    """Checks H-N (spec §4.2): tasks, identity columns, the agent registry and its offline proofs."""
+    seq, t, task_seq = rec["seq"], rec["type"], rec["task_seq"]
+    aid, principal = rec["agent_id"], rec["principal"]
+    task = None
+    if task_seq:                                                                       # H
+        if not DECIMAL.fullmatch(task_seq):
+            raise Fail("task_missing", "task missing")
+        n = int(task_seq)
+        if n >= seq:
+            raise Fail("task_not_earlier", "task not earlier")
+        if n not in st.seen:
+            raise Fail("task_missing", "task missing")
+        if st.seen[n].type != "task_start":
+            raise Fail("task_type", f"task type {st.seen[n].type} expected task_start")
+        task = st.tasks[n]
+    if not task_seq and t in ("tool_call", "tool_result", "egress"):                 # H2
+        raise Fail("record_outside_task", "record outside task")
+    if not task_seq and t == "task_end":                                              # L, its own wording
+        raise Fail("task_end_without_task_start", "task_end without task_start")
+    if task_seq and (t in ("task_start", "policy_change", "rulepack_change") or t.startswith("agent_")):
+        raise Fail("task_seq_not_allowed", f"task_seq not allowed on {t}")
+    if parent is not None and t != "integrity_drift" and parent.task_seq != task_seq:  # H3
+        raise Fail("parent_in_different_task", "parent in different task")
+    if task is not None:                                                              # I
+        if aid != task["agent_id"]:
+            raise Fail("agent_id_differs", "agent_id differs from task")
+        if principal != task["principal"]:
+            raise Fail("principal_differs", "principal differs from task")
+    own = x.get("runtime_identities") if t == "agent_register" else None
+    if own and isinstance(own, list):
+        for identity in own:
+            declare(st, identity)
+    if aid and not (AGENT_ID.fullmatch(aid) or aid in st.declared):                   # I2
+        raise Fail("agent_id_malformed", "agent_id malformed")
+    if principal and not PRINCIPAL.fullmatch(principal):
+        raise Fail("principal_malformed", "principal malformed")
+    if t == "task_start":
+        start_task(st, rec, x)
+    elif t == "agent_register":
+        register_agent(st, rec, x)
+    elif t == "agent_rotate":                                                         # K2
+        a = registered(st, aid)
+        if a["auth"] != "key" or x.get("old_pubkey") != a["current_pubkey"]:
+            raise Fail("rotation_key_mismatch", "rotation key mismatch")
+        msg = {"agent_id": aid, "new_pubkey": x.get("new_pubkey"), "nonce": x.get("nonce"),
+               "old_pubkey": x.get("old_pubkey")}
+        digest = sha256(canonical_json(msg)).hexdigest()
+        if (None in msg.values() or digest != rec["input_hash"]
+                or not proof_valid(msg["old_pubkey"], str(x.get("proof_old", "")), digest)
+                or not proof_valid(msg["new_pubkey"], str(x.get("proof_new", "")), digest)):
+            raise Fail("agent_rotation_proof_invalid", "agent rotation proof invalid")
+        a["current_pubkey"] = msg["new_pubkey"]
+    elif t == "agent_revoke":                                                         # K3
+        a = st.agents.get(aid)
+        if a is None:
+            raise Fail("agent_not_registered", "agent not registered")
+        if a["revoked"]:
+            raise Fail("agent_already_revoked", "agent already revoked")
+        if x.get("pubkey") != a["current_pubkey"]:
+            raise Fail("revoke_key_mismatch", "revoke key mismatch")
+        a["revoked"] = True
+    elif t == "agent_identity_update" and x.get("action") == "add":                  # S1 itself: a later row
+        declare(st, x.get("runtime_identity"))
+    elif t == "task_end":                                                             # L, L2
+        if task["ended"]:
+            raise Fail("duplicate_task_end", "duplicate task_end")
+        want = {**task["counts"], "last_seq": task["last_seq"]}
+        if {k: x.get(k) for k in want} != want:
+            raise Fail("task_end_counts_mismatch", "task_end counts mismatch")
+        task["ended"] = True
+    if task is not None and t != "task_end":
+        c, decision = task["counts"], rec["decision"]
+        confirmation = x.get("confirmation") if t == "tool_call" else None
+        c["inference"] += t == "inference"
+        c["tool_calls"] += t == "tool_call"
+        c["blocked"] += decision == "block"
+        c["flagged"] += decision == "flag"
+        c["egress"] += t == "egress"
+        c["confirmed"] += confirmation == "granted"
+        c["denied"] += confirmation in ("denied", "unavailable")
+        task["last_seq"] = seq
+
+
+def start_task(st, rec, x):
+    """N (enum, none), J, N (consistency with the registration), M; then open the task."""
+    seq, auth = rec["seq"], x.get("agent_auth")
+    if auth not in AGENT_AUTH or x.get("principal_auth") not in ("oidc", "key", "none"):
+        raise Fail("unauthenticated_agent", "unauthenticated agent")
+    if auth == "none":
+        if not st.allow_unauthenticated:
+            raise Fail("unauthenticated_agent", "unauthenticated agent")
+        st.unauthenticated += 1
+    else:
+        a = registered(st, rec["agent_id"])
+        if auth not in REGISTER_AUTH[a["auth"]]:
+            raise Fail("agent_auth_inconsistent", "agent_auth inconsistent with registration")
+    d = x.get("delegated_from", "")
+    if d and not (isinstance(d, str) and DECIMAL.fullmatch(d) and int(d) < seq
+                  and getattr(st.seen.get(int(d)), "type", None) == "task_start"):
+        raise Fail("delegated_from_missing", "delegated_from missing")
+    st.agent_auth[auth] += 1
+    st.tasks[seq] = {"agent_id": rec["agent_id"], "principal": rec["principal"], "ended": False,
+                     "counts": dict.fromkeys(TASK_COUNTS, 0), "last_seq": seq}
+
+
+def register_agent(st, rec, x):
+    """K: structure per auth, and for auth=key the self-proof over the v2.1 or v2.2 message."""
+    seq, aid, auth = rec["seq"], rec["agent_id"], x.get("auth")
+    if aid in st.agents:
+        raise Fail("agent_already_registered", "agent already registered")
+    if auth == "key":
+        msg = {"agent_id": aid, "agent_pubkey": x.get("agent_pubkey"), "nonce": x.get("nonce"),
+               "registered_by": x.get("registered_by")}
+        msg.update({k: x[k] for k in CONTINUITY if k in x})              # v2.2 form when present (§2.4.7)
+        if None in msg.values() or not isinstance(x.get("self_proof"), str):
+            raise Fail("agent_register_malformed", "agent register malformed")
+        digest = sha256(canonical_json(msg)).hexdigest()
+        if digest != rec["input_hash"] or not proof_valid(msg["agent_pubkey"], x["self_proof"], digest):
+            raise Fail("agent_self_proof_invalid", "agent self-proof invalid")
+        key = msg["agent_pubkey"]
+    elif auth in ("oidc", "relay"):
+        binding, keys = (x.get("oidc_binding"), ("issuer", "sub_pattern")) if auth == "oidc" else \
+            (x.get("relay_binding"), ("platform", "endpoint_host", "agent_name"))
+        if not isinstance(binding, dict) or not all(binding.get(k) for k in keys) or "agent_pubkey" in x:
+            raise Fail("agent_register_malformed", "agent register malformed")
+        key = ""
+    else:
+        raise Fail("agent_register_malformed", "agent register malformed")
+    st.agents[aid] = {"registered_seq": seq, "current_pubkey": key, "auth": auth, "revoked": False}
 
 
 def counts(d):
@@ -263,7 +433,9 @@ def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated
         line += f" orphans={st.orphans}"
     if allow_unauthenticated and st.unauthenticated:
         line += f" unauthenticated={st.unauthenticated}"
-    res.update(ok=True, line=line, orphans=st.orphans, unauthenticated=st.unauthenticated)
+    res.update(ok=True, line=line, orphans=st.orphans, unauthenticated=st.unauthenticated,
+               agents={k: {f: a[f] for f in ("registered_seq", "current_pubkey", "revoked")}
+                       for k, a in st.agents.items()})
     return res
 
 
