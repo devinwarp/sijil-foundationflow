@@ -22,10 +22,16 @@ ADMIN_TOKEN = "test-admin"
 ADMIN = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
 
-def verify(db, pub) -> tuple[int, str]:
-    r = subprocess.run([sys.executable, str(VERIFIER), "--db", str(db), "--pubkey", str(pub), "--plain"],
+def verify(db, pub, *flags) -> tuple[int, str]:
+    r = subprocess.run([sys.executable, str(VERIFIER), "--db", str(db), "--pubkey", str(pub), "--plain", *flags],
                        capture_output=True, text=True)
     return r.returncode, r.stdout.strip()
+
+
+def verify_json(db, pub, *flags) -> tuple[int, dict]:
+    r = subprocess.run([sys.executable, str(VERIFIER), "--db", str(db), "--pubkey", str(pub), "--json", *flags],
+                       capture_output=True, text=True)
+    return r.returncode, json.loads(r.stdout)
 
 
 def sqlite(db, sql: str) -> str:

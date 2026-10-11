@@ -78,6 +78,7 @@ def test_empty_and_missing_database(tmp_path, chain):
            "model_id TEXT, model_digest TEXT, node_id TEXT, node_region TEXT, policy_id TEXT, policy_hash TEXT, "
            "approval_ref TEXT, mode TEXT, decision TEXT, rule_hits TEXT, input_hash TEXT, output_hash TEXT, "
            "prev_hash TEXT, record_hash TEXT, signature TEXT);")
-    assert verify(tmp_path / "empty.db", pub) == (0, "PASS records=0 first=- last=-")
+    assert verify(tmp_path / "empty.db", pub) == (0, "PASS records=0 first=- last=- attestation=weights:0,api:0,"
+                                                     "api+tee:0,none:0 agent_auth=key:0,mtls:0,oidc:0,relay:0,none:0")
     code, out = verify(tmp_path / "nope.db", pub)
     assert code == 1 and out.startswith("FAIL database not found")
