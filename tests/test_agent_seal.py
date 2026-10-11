@@ -218,3 +218,17 @@ def test_task_end_between_check_and_seal_seals_nothing_into_the_task(flow):
     assert r.status_code == 409 and r.json()["detail"] == "task already ended"
     assert [x["type"] for x in rows(s.db_path)][-1] == "task_end"
     assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+@pytest.mark.parametrize("change", [
+    {"mode": 1}, {"parent_seq": None}, {"output_hash": [1]}, {"ext": {"x": "\\ud800"}},   # JSON-escaped lone surrogate, sent as raw bytes
+    {"type": "integrity_baseline", "parent_seq": "2"},
+])
+def test_malformed_bodies_are_400_and_seal_nothing(flow, change):
+    client, s, sess, task, h = flow
+    before = len(rows(s.db_path))
+    body = {**TOOL_CALL, "parent_seq": str(task + 1), **change}
+    r = client.post("/api/agent/seal", content=json.dumps(body).replace("\\\\ud800", "\\ud800"),
+                    headers={**h, "Content-Type": "application/json"})
+    assert r.status_code == 400
+    assert len(rows(s.db_path)) == before

@@ -197,6 +197,8 @@ def check_parent(store, body: dict, ext: dict) -> None:
     if not p:
         return                                     # record.py decides whether "" is allowed (correlation none)
     parent = store.get(int(p)) if isinstance(p, str) and DECIMAL.fullmatch(p) else None
+    if t not in PARENT_TYPE:
+        raise HTTPException(400, f"{t} takes no parent_seq")
     if parent is None or parent["type"] != PARENT_TYPE[t]:
         raise HTTPException(400, f"parent_seq must be the seq of an earlier {PARENT_TYPE[t]}")
     if t != "integrity_drift" and parent["task_seq"] != body["task_seq"]:
@@ -389,8 +391,14 @@ def router(require_admin) -> APIRouter:
         if n.halted and t in ("tool_call", "tool_result", "egress"):   # the operator halt stops agents too
             fields.update(mode="enforce", decision="block")
             hits = [*hits, policy.HALT_HIT]
+        if not all(isinstance(v, str) for v in fields.values()):
+            raise HTTPException(400, "parent_seq, source_label, mode, decision, input_hash and output_hash must be strings")
+        try:
+            ext_json = cj(x) if x else ""
+        except UnicodeEncodeError:
+            raise HTTPException(400, "ext is not valid unicode")
         # agent_id and principal come from the task (or the session), never from the body (check I).
-        body = n.body(n.policy, t, rule_hits=policy.rule_hits_json(hits), ext=cj(x) if x else "",
+        body = n.body(n.policy, t, rule_hits=policy.rule_hits_json(hits), ext=ext_json,
                       rulepack_hash=b["rulepack_hash"], **fields, **identity(sess, task))
 
         def build() -> dict:
