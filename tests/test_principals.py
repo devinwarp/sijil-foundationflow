@@ -11,7 +11,7 @@ import vectors_v2
 from agentkit import AGENT, AGENT_KEY, HDR, OPEN_POLICY, agent_node, nonce, proof, pub, register, session
 from conftest import rows, sqlite, verify
 from jwtkit import AUDIENCE, ENTRA_ISS, TENANT, Idp, claims, jws, rsa_jwk
-from sijill import oidc, policy, record
+from sijill import agents, oidc, policy, record
 
 HERE = Path(__file__).parent
 FIXTURE_JWKS = HERE / "tokens" / "7178fa37eccd7fa82260bd6faaca752e357381418c594ac5f736df5b725df546.json"
@@ -237,3 +237,29 @@ def test_policy_refuses_malformed_principal_claims_config(tmp_path, change):
     (tmp_path / "p.yaml").write_text(POLICY.replace(*change))
     with pytest.raises(ValueError):
         policy.load(tmp_path / "p.yaml")
+
+
+def test_task_ended_mid_call_keeps_the_validated_human_and_claims(tmp_path):
+    client, s = node(tmp_path)
+    token = officer()
+    with client:
+        n = client.app.state.node
+        register(client)
+        sess = session(client)
+        h = {"X-Sijil-Agent-Session": sess["agent_session"], "X-Sijil-Principal-Token": token}
+        t = client.post("/api/agent/task/start", json={"intent_hash": "f" * 64, "harness": "http-agent",
+                                                       "session_id": "conv-1"}, headers=h).json()["seq"]
+        loop = client.portal.call(asyncio.get_running_loop)
+        real = n.resolver.resolve
+
+        def resolve_then_end(model):
+            n.resolver.resolve = real
+            asyncio.run_coroutine_threadsafe(agents.end_task(n, n.store.get(t), "timeout"), loop).result()
+            return real(model)
+        n.resolver.resolve = resolve_then_end
+        assert chat(client, token, sess).status_code == 200
+    inf = rows(s.db_path)[-1]
+    assert (inf["type"], inf["task_seq"], inf["agent_id"], inf["principal"]) == ("inference", "", AGENT, HUMAN)
+    c = json.loads(inf["ext"])["principal_claims"]
+    assert c["token_hash"] == record.sha256_hex(token.encode()) and c["assurance"] == "substantial"
+    assert verify(s.db_path, s.pubkey_path)[0] == 0

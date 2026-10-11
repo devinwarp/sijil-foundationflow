@@ -337,8 +337,13 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     x = json.loads(b["ext"]) if b["ext"] else {}
                     if "session_id" in x:
                         x["session_id"] = ""
-                    x.pop("principal_claims", None)    # claims belong to the task (Ruling 24)
-                    return {**b, "task_seq": "", "agent_id": sess["agent_id"], "principal": sess["principal"],
+                    # The token was validated in this request: seal the no-task human shape (§17.2.5).
+                    if human is not None:
+                        x["principal_claims"] = human["claims"]
+                    else:
+                        x.pop("principal_claims", None)
+                    return {**b, "task_seq": "", "agent_id": sess["agent_id"],
+                            "principal": human["principal"] if human is not None else sess["principal"],
                             "ext": record.canonical_json(x).decode() if x else ""}
                 return b
             return build
