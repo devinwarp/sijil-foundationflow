@@ -377,6 +377,17 @@ def counts(d):
     return ",".join(f"{k}:{v}" for k, v in d.items())
 
 
+def read_rows(conn):
+    """All records in seq order as full-width FIELDS dicts (v1 and v2.0 stores: missing columns are "").
+    None when the database has no records table."""
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(records)")}
+    if not have:
+        return None
+    cols = [f for f in FIELDS if f in have]
+    return [{**dict.fromkeys(FIELDS, ""), **dict(row)}
+            for row in conn.execute(f"SELECT {', '.join(cols)} FROM records ORDER BY seq ASC")]
+
+
 def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated=False):
     """Walk the chain in seq order, stop at the first failure. Returns the --json object."""
     st = State(allow_orphans, allow_unauthenticated)
@@ -398,14 +409,11 @@ def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        have = {r["name"] for r in conn.execute("PRAGMA table_info(records)")}
-        if not have:
+        rows = read_rows(conn)
+        if rows is None:
             return fail(None, "database_unreadable", "database unreadable: no records table")
-        cols = [f for f in FIELDS if f in have]          # v1 (18) and v2.0 (22) stores: missing columns are ""
-        rows = conn.execute(f"SELECT {', '.join(cols)} FROM records ORDER BY seq ASC")
         prev_seq, prev_hash, first_ts, last_ts = 0, GENESIS, None, None
-        for row in rows:
-            record = {**dict.fromkeys(FIELDS, ""), **dict(row)}
+        for record in rows:
             seq = record["seq"]
             try:
                 if seq != prev_seq + 1:
