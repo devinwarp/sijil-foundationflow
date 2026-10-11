@@ -52,3 +52,6 @@ the answer already reached the client. Its `output_hash` covers exactly the part
 before the halt (empty if none was). The record's decision enum is frozen, so auditors should read `block`
 with `halted` on a streamed call as "stopped mid-stream; partial output may have been delivered", not as
 "nothing was delivered".
+When the client disconnects or the model fails mid-stream, the record's `output_hash` is empty even if
+part of the answer was delivered: on a disconnect the last chunk may not have reached the client, so the
+sent bytes are not a reliable record of what was received.
