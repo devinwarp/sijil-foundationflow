@@ -147,7 +147,8 @@ def test_client_disconnect_still_seals_one_record(node_with):
 
 
 def test_halt_mid_stream_ends_stream_and_seals_it_halted(node_with):
-    """A stream already relaying when the operator halts stops; nothing is sealed `allow` after `halted`."""
+    """A stream already relaying when the operator halts stops; nothing is sealed `allow` after `halted`.
+    The `block` record's output_hash covers exactly the content delivered before the halt."""
     client, s = node_with(slow)
 
     async def halt(other):
@@ -165,7 +166,11 @@ def test_halt_mid_stream_ends_stream_and_seals_it_halted(node_with):
     between = recs[start + 1:end]
     assert [r for r in between if r["decision"] == "allow"] == []
     [rec] = [r for r in recs if r["type"] == "inference"]
-    assert {HALT_HIT, UPSTREAM_ERROR_HIT} <= set(json.loads(rec["rule_hits"])) and rec["output_hash"] == ""
+    assert {HALT_HIT, UPSTREAM_ERROR_HIT} <= set(json.loads(rec["rule_hits"]))
+    delivered = [json.loads(line[6:])["choices"][0]["delta"]["content"]
+                 for line in text.splitlines() if line.startswith("data: {")]
+    assert delivered                                  # halted after partial output reached the client
+    assert rec["output_hash"] == record.output_hash("".join(delivered))
     assert f"record_hash={rec['record_hash']}" in text
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 

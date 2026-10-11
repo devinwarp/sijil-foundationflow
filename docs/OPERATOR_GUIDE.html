@@ -302,8 +302,9 @@ docker run --rm -v sijil-data:/data --entrypoint cat sijil:&lt;sha&gt; /data/nod
     <div class="op">
       <h3>Watch the SOC feed</h3>
       <pre><code>docker ps --filter name=sijil-siem
+docker logs --tail 20 sijil-siem
 docker run --rm -v sijil-data:/data --entrypoint cat sijil:&lt;sha&gt; /data/siem_state</code></pre>
-      <p>The forwarder retries through outages and resumes from its saved position. It does not log its retries yet, so if the SIEM shows a gap, check that the container is running and that the saved sequence number keeps rising.</p>
+      <p>The forwarder retries through outages and resumes from its saved position. Each failed attempt logs one line naming the error, the attempt count and the retry delay; a healthy forwarder logs nothing. If the SIEM shows a gap, read the log, then check that the saved sequence number keeps rising.</p>
     </div>
   </div>
 </section>

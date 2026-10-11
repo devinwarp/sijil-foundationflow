@@ -12,8 +12,8 @@ Each line is checked by a command or a test. Run before every pilot install.
 | Records append-only in application code | `pytest tests/test_claims.py` |
 | Every streamed call sealed, including hang-ups (after delivery: a signer outage mid-stream leaves a delivered, unsealed answer) | `pytest tests/test_streaming.py` |
 | SOC receives blocks as CEF severity 8 | `pytest tests/test_siem.py`; manual SIEM check below |
-| Chain verifies offline with the Apache-2.0 verifier | `python3 verifier/sijill_verify.py --db sijill.db --pubkey node.pub`; see below |
-| Operator can halt every call, halt survives restart; a stream in flight stops and seals as `halted` | `pytest tests/test_halt.py tests/test_streaming.py` |
+| Chain verifies offline with the Apache-2.0 verifier | `python3 verifier/sijill_verify.py --db export.db --pubkey node.pub`; see below |
+| Operator can halt every call, halt survives restart; a stream in flight stops and seals `block` with `halted` | `pytest tests/test_halt.py tests/test_streaming.py` |
 
 `scripts/smoke_container.sh [image]` starts the image with the policy mounted read-only and a token set,
 then checks the admin auth mode, `/api/verify`, the 401 on an unauthenticated admin call, the absence of
@@ -30,11 +30,15 @@ python3 scripts/siem_forward.py --url http://127.0.0.1:8000 --sink 127.0.0.1:551
 
 Expect CEF lines (`CEF:0|FoundationFlow|Sijil|...`). The blocked call's line carries severity `|8|`.
 
-**Verifier.** For a container deployment, copy `node.pub` and `sijill.db` out of the data volume first
-(INSTALL.txt, step 6), then from the repo root:
+**Verifier.** For a container deployment, copy the public key and a consistent DB snapshot out of the
+data volume (INSTALL.txt, step 6). The proxy may be writing, so take an SQLite online backup first; a plain
+file copy can be torn and fail verification:
 
 ```bash
-python3 verifier/sijill_verify.py --db sijill.db --pubkey node.pub   # PASS, exit 0
+docker run --rm -v sijil-data:/data --entrypoint cat sijil:<sha> /data/node.pub > node.pub
+docker run --rm -v sijil-data:/data --entrypoint sqlite3 sijil:<sha> /data/sijill.db ".backup /data/export.db"
+docker run --rm -v sijil-data:/data --entrypoint cat sijil:<sha> /data/export.db > export.db
+python3 verifier/sijill_verify.py --db export.db --pubkey node.pub   # PASS, exit 0
 ```
 
 Known limits to state to the entity: read endpoints (`/api/records`, `/api/policy`, `/api/verify`,
@@ -43,3 +47,11 @@ entity's reverse proxy with SSO. The proxy host can still seal false records (RE
 HSM custody limits key theft, not a compromised host. A non-streamed call already forwarded to the model
 when the halt lands completes, and is sealed `allow` after the `halted` record. A streamed answer is
 sealed after it reaches the client, so a signer outage mid-stream leaves a delivered, unsealed answer.
+A stream halted mid-answer is sealed `block` with rule hits `halted` and `upstream_error`, even if part of
+the answer already reached the client. Its `output_hash` covers exactly the partial output delivered
+before the halt (empty if none was). The record's decision enum is frozen, so auditors should read `block`
+with `halted` on a streamed call as "stopped mid-stream; partial output may have been delivered", not as
+"nothing was delivered".
+When the client disconnects or the model fails mid-stream, the record's `output_hash` is empty even if
+part of the answer was delivered: on a disconnect the last chunk may not have reached the client, so the
+sent bytes are not a reliable record of what was received.

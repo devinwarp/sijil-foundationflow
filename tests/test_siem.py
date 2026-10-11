@@ -107,8 +107,8 @@ def test_backlog_larger_than_one_page_forwards_contiguously(chain, tmp_path):
     assert last == 50 and state.read_text() == "50"
 
 
-def test_daemon_survives_non_json_response(tmp_path, monkeypatch):
-    """An SSO proxy answering with an HTML login page must not kill the daemon; it retries."""
+def test_daemon_survives_non_json_response(tmp_path, monkeypatch, capsys):
+    """An SSO proxy answering with an HTML login page must not kill the daemon; it retries and says so."""
     import pytest
     served = []
 
@@ -148,6 +148,9 @@ def test_daemon_survives_non_json_response(tmp_path, monkeypatch):
     try:
         with pytest.raises(Stop):
             siem.run(url, ("127.0.0.1", sink.getsockname()[1]), state, udp=True)
+        err = capsys.readouterr().err.splitlines()
+        assert len(err) == 1 and "JSONDecodeError" in err[0]
+        assert "attempt 1" in err[0] and "retrying in 2.0s" in err[0]
         served.clear()
         with pytest.raises(ValueError):  # once mode still propagates
             siem.run(url, ("127.0.0.1", sink.getsockname()[1]), tmp_path / "other.state", udp=True, once=True)
