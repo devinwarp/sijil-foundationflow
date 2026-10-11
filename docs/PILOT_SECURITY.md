@@ -13,7 +13,7 @@ Each line is checked by a command or a test. Run before every pilot install.
 | Every streamed call sealed, including hang-ups (after delivery: a signer outage mid-stream leaves a delivered, unsealed answer) | `pytest tests/test_streaming.py` |
 | SOC receives blocks as CEF severity 8 | `pytest tests/test_siem.py`; manual SIEM check below |
 | Chain verifies offline with the Apache-2.0 verifier | `python3 verifier/sijill_verify.py --db export.db --pubkey node.pub`; see below |
-| Operator can halt every call, halt survives restart; a stream in flight stops and seals as `halted` | `pytest tests/test_halt.py tests/test_streaming.py` |
+| Operator can halt every call, halt survives restart; a stream in flight stops and seals `block` with `halted` | `pytest tests/test_halt.py tests/test_streaming.py` |
 
 `scripts/smoke_container.sh [image]` starts the image with the policy mounted read-only and a token set,
 then checks the admin auth mode, `/api/verify`, the 401 on an unauthenticated admin call, the absence of
@@ -47,3 +47,7 @@ entity's reverse proxy with SSO. The proxy host can still seal false records (RE
 HSM custody limits key theft, not a compromised host. A non-streamed call already forwarded to the model
 when the halt lands completes, and is sealed `allow` after the `halted` record. A streamed answer is
 sealed after it reaches the client, so a signer outage mid-stream leaves a delivered, unsealed answer.
+A stream halted mid-answer is sealed `block` with rule hits `halted` and `upstream_error` and an empty
+`output_hash`, even if part of the answer already reached the client. The record's decision enum is
+frozen, so auditors should read `block` with `halted` on a streamed call as "stopped mid-stream; partial
+output may have been delivered", not as "nothing was delivered".
