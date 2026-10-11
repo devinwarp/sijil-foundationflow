@@ -274,6 +274,19 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                       rule_hits=policy.rule_hits_json(hits), input_hash=record.input_hash(payload["messages"]),
                       ext=ext(), **who)
 
+        def settled(b: dict):
+            """Seal-time body: a task that ended while the call was in flight is not written into, so the
+            inference is sealed outside it (task_seq and ext.session_id empty), keeping the session identity."""
+            def build() -> dict:
+                if b["task_seq"] and n.store.task_ended(b["task_seq"]):
+                    x = json.loads(b["ext"]) if b["ext"] else {}
+                    if "session_id" in x:
+                        x["session_id"] = ""
+                    return {**b, "task_seq": "", "agent_id": sess["agent_id"], "principal": sess["principal"],
+                            "ext": record.canonical_json(x).decode() if x else ""}
+                return b
+            return build
+
         def answered(model) -> tuple[dict, list[str]] | None:
             """api mode: digest and post-call evaluation for the model the provider says answered."""
             if not (isinstance(model, str) and chat.MODEL.fullmatch(model)):
@@ -296,12 +309,12 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                            "record_hash": rec["record_hash"]}})
 
         if decision == "block":
-            return blocked(await n.seal(body), hits)
+            return blocked(await n.seal(settled(body)), hits)
 
         async def upstream_failed(status: int, content: dict, upstream_ms: float):
             """Seal the call marked with the reserved upstream-error hit and respond."""
-            rec = await n.seal({**body, "rule_hits": policy.rule_hits_json(
-                hits + [policy.UPSTREAM_ERROR_HIT])})
+            rec = await n.seal(settled({**body, "rule_hits": policy.rule_hits_json(
+                hits + [policy.UPSTREAM_ERROR_HIT])}))
             return JSONResponse(status_code=status, headers=headers(rec, upstream_ms), content=content)
 
         t1 = perf_counter()
@@ -389,7 +402,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     # runs even if the seal raises, so a signer outage does not leak the connection.
                     with anyio.CancelScope(shield=True):
                         try:
-                            rec = await n.seal(sealed)
+                            rec = await n.seal(settled(sealed))
                             if ok and rec["decision"] != "block":
                                 n.store.index_tool_uses(rec["seq"], uses)
                         finally:
@@ -443,8 +456,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                              stop_reason=str(choice.get("finish_reason") or ""), tool_uses=uses)}
         if post and post[0]["decision"] == "block":
             # The provider answered, but not with an approved model: the answer is withheld.
-            return blocked(await n.seal({**sealed, "output_hash": ""}), post[1], upstream_ms)
-        rec = await n.seal(sealed)
+            return blocked(await n.seal(settled({**sealed, "output_hash": ""})), post[1], upstream_ms)
+        rec = await n.seal(settled(sealed))
         n.store.index_tool_uses(rec["seq"], uses)
         return JSONResponse(content=data, headers=headers(rec, upstream_ms))
 

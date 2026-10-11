@@ -364,9 +364,12 @@ def router(require_admin) -> APIRouter:
         # Stamped by the ledger from the session, never taken from the request (spec §5.8.1).
         x.update(intent_hash=intent, delegated_from=d, agent_auth=sess["agent_auth"],
                  principal_auth=sess["principal_auth"], agent_session=sess["agent_session"])
+        def build() -> dict:   # under the seal lock: a revoke cannot land between this check and the seal
+            n.agents.active(sess["agent_id"])
+            return n.body(n.policy, "task_start", agent_id=sess["agent_id"], principal=sess["principal"],
+                          input_hash=intent, ext=cj(x))
         try:
-            rec = await n.seal(n.body(n.policy, "task_start", agent_id=sess["agent_id"], principal=sess["principal"],
-                                      input_hash=intent, ext=cj(x)))
+            rec = await n.seal(build)
         except ValueError as e:
             raise HTTPException(400, str(e))
         return {"seq": rec["seq"], "record_hash": rec["record_hash"]}

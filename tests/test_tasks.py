@@ -1,5 +1,6 @@
 """Row 5b, task half: task start/end with ledger counts, timeout close, and chat calls bound to their task."""
 
+import asyncio
 import json
 
 from agentkit import AGENT, INTENT, OPS, agent_node, chat, register, session, start_task
@@ -156,3 +157,50 @@ def test_task_endpoints_need_a_session(tmp_path):
     with client:
         opened(client)
         assert client.post("/api/agent/task/start", json={"intent_hash": INTENT}).status_code == 401
+
+
+def test_revoke_between_task_start_check_and_seal_seals_nothing(tmp_path, monkeypatch):
+    client, s = agent_node(tmp_path)
+    with client:
+        n = client.app.state.node
+        sess = opened(client)
+        real = agents.body_of
+
+        async def revoking(request):
+            b = await real(request)
+            monkeypatch.setattr(agents, "body_of", real)        # once
+            await agents.seal_agent(n, "agent_revoke", AGENT, OPS, "", {"pubkey": pub_of(n), "revoked_by": OPS,
+                                    "principal_auth": "key"}, mode="enforce", decision="block")
+            return b
+        monkeypatch.setattr(agents, "body_of", revoking)
+        r = client.post("/api/agent/task/start", json={"intent_hash": INTENT},
+                        headers={"X-Sijil-Agent-Session": sess["agent_session"]})
+    assert r.status_code == 401
+    assert [x["type"] for x in rows(s.db_path)] == ["agent_register", "agent_revoke"]
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def pub_of(n) -> str:
+    return n.agents.agents[AGENT].pubkey
+
+
+def test_task_ended_during_a_chat_call_seals_the_inference_outside_it(tmp_path):
+    client, s = agent_node(tmp_path)
+    with client:
+        n = client.app.state.node
+        sess = opened(client)
+        t = start_task(client, sess)
+        loop = client.portal.call(asyncio.get_running_loop)
+        real = n.resolver.resolve
+
+        def resolve_then_end(model):
+            n.resolver.resolve = real
+            asyncio.run_coroutine_threadsafe(agents.end_task(n, n.store.get(t), "timeout"), loop).result()
+            return real(model)
+        n.resolver.resolve = resolve_then_end
+        assert chat(client, sess, task_seq=t).status_code == 200
+    *_, end_, inf = rows(s.db_path)
+    assert (end_["type"], inf["type"]) == ("task_end", "inference")
+    assert (inf["task_seq"], inf["agent_id"], inf["principal"]) == ("", AGENT, OPS)
+    assert json.loads(end_["ext"])["inference"] == 0 and json.loads(end_["ext"])["last_seq"] == t
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
