@@ -26,7 +26,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from . import chat, keys, policy, record
+from . import chat, keys, policy, record, rulepack
 from .digest import DigestResolver
 from .store import Store
 
@@ -43,6 +43,7 @@ DASHBOARD = ROOT / "dashboard" / "index.html"
 class Settings:
     db_path: str = "sijill.db"
     policy_path: str = "policy.yaml"
+    rulepack_path: str = ""            # "" = no rule pack; records keep rulepack_hash "" (M1 behaviour)
     key_path: str = "node.key"
     pubkey_path: str = "node.pub"
     upstream: str = "http://localhost:1234/v1"
@@ -64,6 +65,7 @@ class Settings:
         return cls(
             db_path=e("DATABASE_PATH", cls.db_path),
             policy_path=e("POLICY_PATH", cls.policy_path),
+            rulepack_path=e("SIJILL_RULEPACK_PATH", ""),
             key_path=e("NODE_KEY_PATH", cls.key_path),
             pubkey_path=e("NODE_PUBKEY_PATH", cls.pubkey_path),
             upstream=e("LMSTUDIO_BASE_URL", cls.upstream),
@@ -82,7 +84,7 @@ class Settings:
 
 
 class Node:
-    """Runtime state: the chain head, the policy in force and the node's current region."""
+    """Runtime state: the chain head, the policy and rule pack in force and the node's current region."""
 
     def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None,
                  resolver: DigestResolver | None = None):
@@ -109,6 +111,13 @@ class Node:
         self.check_attestation(self.policy)
         last = self.store.last()
         self.region = last["node_region"] if last else self.policy.node_region
+        # The rule pack hash in force on the chain; it moves only when a rulepack_change is sealed.
+        self.rulepack_hash = last["rulepack_hash"] if last else ""
+        self.rulepack = rulepack.load(settings.rulepack_path) if settings.rulepack_path else None
+        if self.rulepack is None and self.rulepack_hash:
+            self.store.close()
+            raise RuntimeError(f"chain in {settings.db_path} is under rule pack {self.rulepack_hash[:12]}; set "
+                               f"SIJILL_RULEPACK_PATH (a record without rulepack_hash fails check E)")
         # The writer trusts its own memory of the head, not the database: a record
         # deleted or edited at the tail while running still shows up as a break.
         self.head = self.store.head()
@@ -136,11 +145,32 @@ class Node:
 
     async def seal(self, body: dict) -> dict:
         async with self.lock:
+            if body["type"] != "rulepack_change":
+                # Stamped under the lock so no record lands between a rulepack_change and its hash (check E).
+                if body["rulepack_hash"] not in ("", self.rulepack_hash):
+                    raise rulepack.Mismatch(self.rulepack_hash)
+                body = {**body, "rulepack_hash": self.rulepack_hash}
             seq, prev = self.head
             rec = record.seal({**body, "ts": record.now_ts()}, seq + 1, prev, self.key)
             self.store.append(rec)
             self.head = (rec["seq"], rec["record_hash"])
+            if rec["type"] == "rulepack_change":
+                self.rulepack_hash = rec["rulepack_hash"]
             return rec
+
+    async def adopt_rulepack(self, new: rulepack.RulePack, trigger: str,
+                             old: rulepack.RulePack | None) -> dict | None:
+        """Put `new` in force; seal a rulepack_change iff its hash differs from the chain's.
+        rules_changed: every rule on first adoption; [] at a restart, where the old pack is unknown."""
+        self.rulepack = new
+        before = self.rulepack_hash
+        if new.hash == before:
+            return None
+        changed = rulepack.changed(old, new) if old or not before else []
+        ext = {"rulepack_id": new.rulepack_id, "version": new.version, "path": new.path, "before": before,
+               "after": new.hash, "rules_changed": changed, "trigger": trigger}
+        return await self.seal(self.body(self.policy, "rulepack_change", rule_hits=policy.rule_hits_json(changed),
+                                         rulepack_hash=new.hash, ext=record.canonical_json(ext).decode()))
 
     async def adopt_policy(self, new: policy.Policy, old_hash: str,
                            old: policy.Policy | None) -> dict | None:
@@ -171,6 +201,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
     async def lifespan(app: FastAPI):
         app.state.node = Node(settings, transport, resolver)
         n = app.state.node
+        if n.rulepack:   # before any policy_change, so that record already carries the new hash
+            await n.adopt_rulepack(n.rulepack, "startup", old=None)
         last = n.store.last()
         if last and last["policy_hash"] != n.policy.hash:
             await n.adopt_policy(n.policy, old_hash=last["policy_hash"], old=None)
@@ -437,6 +469,19 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         rec = await n.adopt_policy(new, old_hash=old.hash, old=old)
         changed = policy.mode_changes(old, new)
         return {"changed": changed, "seq": rec and rec["seq"], "policy_hash": new.hash}
+
+    @app.post("/api/admin/rulepack/reload", dependencies=[Depends(require_admin)])
+    async def reload_rulepack(request: Request):
+        n = node(request)
+        if not settings.rulepack_path:
+            raise HTTPException(400, "no rule pack configured: set SIJILL_RULEPACK_PATH")
+        try:
+            new = rulepack.load(settings.rulepack_path)
+        except Exception as e:
+            raise HTTPException(400, f"rule pack not loaded: {e}")
+        old = n.rulepack
+        rec = await n.adopt_rulepack(new, "reload", old)
+        return {"changed": rulepack.changed(old, new), "seq": rec and rec["seq"], "rulepack_hash": new.hash}
 
     @app.post("/api/admin/node/region", dependencies=[Depends(require_admin)])
     async def set_region(request: Request):
