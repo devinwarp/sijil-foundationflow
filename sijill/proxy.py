@@ -54,6 +54,7 @@ class Settings:
     pkcs11_key: str = ""
     pkcs11_pin: str = ""
     halt_path: str = "sijill.halt"
+    digest_cache: str = ".sijill_digests.json"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -73,6 +74,7 @@ class Settings:
             pkcs11_key=e("SIJILL_PKCS11_KEY", ""),
             pkcs11_pin=e("SIJILL_PKCS11_PIN", ""),
             halt_path=e("SIJILL_HALT_PATH", cls.halt_path),
+            digest_cache=e("SIJILL_DIGEST_CACHE", cls.digest_cache),
         )
 
 
@@ -108,7 +110,7 @@ class Node:
         self.head = self.store.head()
         self.lock = asyncio.Lock()
         self.halted = Path(settings.halt_path).exists()
-        self.resolver = resolver or DigestResolver()
+        self.resolver = resolver or DigestResolver(cache_path=settings.digest_cache)
         headers = {"Authorization": f"Bearer {settings.upstream_token}"} if settings.upstream_token else {}
         self.client = httpx.AsyncClient(base_url=settings.upstream, headers=headers,
                                         timeout=settings.upstream_timeout, transport=transport)
