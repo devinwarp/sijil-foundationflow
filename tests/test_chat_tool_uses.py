@@ -197,3 +197,31 @@ def test_switching_to_api_mode_is_a_sealed_policy_change(tmp_path):
         assert ask(client, model="gpt-4.1").status_code == 200
     assert [r["type"] for r in rows(s.db_path)] == ["inference", "policy_change", "inference"]
     assert "attestation=weights:1,api:1," in verify(s.db_path, s.pubkey_path)[1]
+
+
+LEAD = ('data: {"id": "", "model": "", "choices": [], "prompt_filter_results": '
+        '[{"prompt_index": 0, "content_filter_results": {}}]}\n\n')
+
+
+def test_api_mode_stream_leading_empty_model_chunk_does_not_latch(tmp_path):
+    chunks = (LEAD, chunk(role="assistant", content="Hello"), chunk(content=" there", finish="stop"))
+    client, s = make_node(tmp_path, streamed(*chunks), API_POLICY, **API)
+    with client, client.stream("POST", "/v1/chat/completions", json={
+            "model": "gpt-4.1", "stream": True, "messages": [{"role": "user", "content": "hi"}]}) as r:
+        assert [l for l in r.iter_lines() if l][-1] == "data: [DONE]"
+    [rec] = rows(s.db_path)
+    assert rec["model_digest"] == "api:azure-openai:" + DATED and rec["decision"] == "allow"
+    assert rec["output_hash"] == record.output_hash("Hello there")
+    assert ext(rec)["response_hash"] == record.sha256_hex("".join(chunks).encode())
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_api_mode_stream_leading_empty_model_chunk_then_unapproved_model_is_refused(tmp_path):
+    client, s = make_node(tmp_path, streamed(LEAD, chunk(model="gpt-5", content="hidden")), API_POLICY, **API)
+    with client, client.stream("POST", "/v1/chat/completions", json={
+            "model": "gpt-4.1", "stream": True, "messages": [{"role": "user", "content": "hi"}]}) as r:
+        body = "".join(r.iter_text())
+    assert "hidden" not in body and "decision=block" in body
+    [rec] = rows(s.db_path)
+    assert rec["model_digest"] == "api:azure-openai:gpt-5" and (rec["decision"], rec["output_hash"]) == ("block", "")
+    assert verify(s.db_path, s.pubkey_path)[0] == 0

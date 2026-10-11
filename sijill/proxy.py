@@ -289,7 +289,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                                 event = None
                             if isinstance(event, dict) and "error" in event:
                                 errored = True  # in-stream failure (vLLM), even if [DONE] follows
-                            if api and post is None and isinstance(event, dict) and "model" in event:
+                            if api and post is None and isinstance(event, dict) and event.get("model"):
+                                # An empty or absent model (Azure's leading prompt-filter chunk) does not latch.
                                 post = answered(event["model"])
                                 if post is None:
                                     errored = True
@@ -303,6 +304,10 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                                 finish = choice.get("finish_reason") or finish
                             except (KeyError, IndexError, TypeError, AttributeError):
                                 delta = {}
+                            if api and post is None and isinstance(delta, dict) and (
+                                    delta.get("content") or delta.get("tool_calls")):
+                                errored = True   # answer content before the answering model is named
+                                break
                             if isinstance(delta, dict):
                                 if isinstance(delta.get("content"), str):
                                     parts.append(delta["content"])
