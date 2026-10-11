@@ -46,3 +46,21 @@ def session(client, agent_id=AGENT, key=AGENT_KEY) -> dict:
                     headers=HDR)
     assert r.status_code == 200, r.text
     return r.json()
+
+
+INTENT = record.sha256_hex("Case MOI-2026-004211: review the salary certificate".encode())
+
+
+def start_task(client, sess: dict, **fields) -> int:
+    body = {"intent_hash": INTENT, "harness": "http-agent", "session_id": "conv-1", "repo": "", "commit": "",
+            "lockfile_hash": "", "delegated_from": "", **fields}
+    r = client.post("/api/agent/task/start", json=body, headers={"X-Sijil-Agent-Session": sess["agent_session"]})
+    assert r.status_code == 200, r.text
+    return r.json()["seq"]
+
+
+def chat(client, sess: dict | None = None, content="hello", task_seq=None, **headers):
+    h = {**({"X-Sijil-Agent-Session": sess["agent_session"]} if sess else {}),
+         **({"X-Sijil-Task-Seq": str(task_seq)} if task_seq else {}), **headers}
+    return client.post("/v1/chat/completions", headers=h, json={
+        "model": "llama-3.2-3b-instruct", "messages": [{"role": "user", "content": content}]})

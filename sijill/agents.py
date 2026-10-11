@@ -22,7 +22,10 @@ from . import record
 SPIFFE = re.compile(r"spiffe://[a-z0-9.-]+/agent/[a-z0-9._-]+")      # verifier check I2
 ID_SYNTAX = {"spiffe": r"spiffe://[a-z0-9.-]+/\S+", "wimse": r"wimse://[a-z0-9.-]+/\S+", "did": r"did:[a-z0-9]+:\S+",
              "entra": r"[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}", "cloud-native": r"\S{1,512}", "other": r"\S{1,512}"}
-PUBKEY = re.compile(r"[0-9a-f]{64}")
+PUBKEY = HEX64 = re.compile(r"[0-9a-f]{64}")
+DECIMAL = re.compile(r"[1-9][0-9]*")
+OUTCOMES = ("completed", "aborted", "blocked", "error", "timeout")
+COUNTS = ("inference", "tool_calls", "blocked", "confirmed", "denied", "flagged", "egress")
 NONCE_TTL_S = 60
 PURPOSES = ("session", "register", "rotate")
 
@@ -145,6 +148,87 @@ async def body_of(request: Request) -> dict:
     return b
 
 
+def session_of(n, request: Request) -> dict | None:
+    """The agent session named by X-Sijil-Agent-Session; None when the header is absent, 401 when it is bad."""
+    sid = request.headers.get("x-sijil-agent-session")
+    if sid is None:
+        return None
+    sess = n.store.session(sid)
+    if sess is None or sess["expires_at"] <= ts_at(clock()):
+        raise HTTPException(401, "agent session unknown or expired")
+    if sess["remote_addr"] != request.client.host:
+        raise HTTPException(401, "agent session bound to another address")
+    n.agents.active(sess["agent_id"])
+    return sess
+
+
+def task_for(n, sess: dict, task_seq) -> dict | None:
+    """The open task a call belongs to: the named one, which must be this session's, or else the session's
+    only open task, or None when it has none. Several open tasks and no name: 409 (spec §17.3.3)."""
+    if type(task_seq) is int:
+        task_seq = str(task_seq)
+    if task_seq not in (None, ""):
+        start = n.store.get(int(task_seq)) if isinstance(task_seq, str) and DECIMAL.fullmatch(task_seq) else None
+        if (start is None or start["type"] != "task_start" or n.store.task_ended(start["seq"])
+                or json.loads(start["ext"])["agent_session"] != sess["agent_session"]):
+            raise HTTPException(409, "task not open in this agent session")
+        return start
+    open_ = n.store.open_tasks(sess["agent_session"])
+    if len(open_) > 1:
+        raise HTTPException(409, "task ambiguous: send X-Sijil-Task-Seq")
+    return open_[0] if open_ else None
+
+
+def identity(sess: dict | None, task: dict | None) -> dict:
+    """Identity columns: a record inside a task carries the task's agent_id and principal (check I)."""
+    if task is not None:
+        return {"agent_id": task["agent_id"], "principal": task["principal"], "task_seq": str(task["seq"])}
+    if sess is not None:
+        return {"agent_id": sess["agent_id"], "principal": sess["principal"], "task_seq": ""}
+    return {"agent_id": "", "principal": "", "task_seq": ""}
+
+
+def task_counts(store, task_seq: int) -> dict:
+    """task_end counts, as ints, with the verifier's L2 meanings; last_seq is the task_start when empty."""
+    c, last = dict.fromkeys(COUNTS, 0), task_seq
+    for r in store.in_task(task_seq):
+        if r["type"] == "task_end":
+            continue
+        conf = json.loads(r["ext"]).get("confirmation") if r["type"] == "tool_call" and r["ext"] else None
+        c["inference"] += int(r["type"] == "inference")
+        c["tool_calls"] += int(r["type"] == "tool_call")
+        c["egress"] += int(r["type"] == "egress")
+        c["blocked"] += int(r["decision"] == "block")
+        c["flagged"] += int(r["decision"] == "flag")
+        c["confirmed"] += int(conf == "granted")
+        c["denied"] += int(conf in ("denied", "unavailable"))
+        last = r["seq"]
+    return {**c, "last_seq": last}
+
+
+async def end_task(n, start: dict, outcome: str) -> dict:
+    def build() -> dict:   # under the seal lock: no record of the task can land between count and seal
+        if n.store.task_ended(start["seq"]):
+            raise HTTPException(409, "task already ended")
+        x = {"outcome": outcome, **task_counts(n.store, start["seq"])}
+        return n.body(n.policy, "task_end", agent_id=start["agent_id"], principal=start["principal"],
+                      task_seq=str(start["seq"]), ext=cj(x))
+    return await n.seal(build)
+
+
+async def close_expired(n) -> None:
+    """Seal outcome=timeout for open tasks whose agent session expired or is unknown (spec §5.9).
+    ponytail: scans every open task per call; index by expiry if open tasks reach the thousands."""
+    now = ts_at(clock())
+    for start in n.store.open_tasks():
+        sess = n.store.session(json.loads(start["ext"])["agent_session"])
+        if sess is None or sess["expires_at"] <= now:
+            try:
+                await end_task(n, start, "timeout")
+            except HTTPException:
+                pass
+
+
 def router(require_admin) -> APIRouter:
     r = APIRouter()
 
@@ -158,6 +242,14 @@ def router(require_admin) -> APIRouter:
             raise HTTPException(503, "agent endpoints disabled: set SIJILL_TOKEN")
         if not hmac.compare_digest(request.headers.get("x-sijil-token", "").encode(), want.encode()):
             raise HTTPException(401, "X-Sijil-Token required")
+
+    async def require_session(request: Request) -> dict:
+        n = node(request)
+        await close_expired(n)
+        sess = session_of(n, request)
+        if sess is None:
+            raise HTTPException(401, "X-Sijil-Agent-Session required")
+        return sess
 
     def registrar(request: Request) -> str:
         """principal_auth for register: open -> none; closed -> the admin bearer token, an operator key."""
@@ -253,6 +345,44 @@ def router(require_admin) -> APIRouter:
             x["reason"] = b["reason"][:128]
         return await seal_agent(n, "agent_revoke", aid, revoked_by, "", x, mode="enforce", decision="block",
                                 check=lambda: n.agents.current(aid, old))
+
+    @r.post("/api/agent/task/start")
+    async def task_start(request: Request, sess: dict = Depends(require_session)):
+        b = await body_of(request)
+        n = node(request)
+        intent = b.get("intent_hash")
+        if not isinstance(intent, str) or not HEX64.fullmatch(intent):
+            raise HTTPException(400, "intent_hash must be 64 lower-case hex")
+        d = b.get("delegated_from", "")
+        parent = n.store.get(int(d)) if isinstance(d, str) and DECIMAL.fullmatch(d) else None
+        if d != "" and (parent is None or parent["type"] != "task_start"):
+            raise HTTPException(400, "delegated_from must be the seq of an earlier task_start")
+        x = {k: b.get(k, "") for k in ("harness", "session_id", "repo", "commit", "lockfile_hash")}
+        x.update({k: b[k] for k in ("cwd", "config_digest") if isinstance(b.get(k), str) and b[k]})
+        if not all(isinstance(v, str) for v in x.values()):
+            raise HTTPException(400, "task fields must be strings")
+        # Stamped by the ledger from the session, never taken from the request (spec §5.8.1).
+        x.update(intent_hash=intent, delegated_from=d, agent_auth=sess["agent_auth"],
+                 principal_auth=sess["principal_auth"], agent_session=sess["agent_session"])
+        try:
+            rec = await n.seal(n.body(n.policy, "task_start", agent_id=sess["agent_id"], principal=sess["principal"],
+                                      input_hash=intent, ext=cj(x)))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {"seq": rec["seq"], "record_hash": rec["record_hash"]}
+
+    @r.post("/api/agent/task/end")
+    async def task_end(request: Request, sess: dict = Depends(require_session)):
+        b = await body_of(request)
+        n = node(request)
+        if b.get("outcome") not in OUTCOMES:
+            raise HTTPException(400, f"outcome must be one of {OUTCOMES}")
+        start = task_for(n, sess, str(b.get("task_seq", "")))
+        if start is None:
+            raise HTTPException(409, "no open task in this agent session")
+        rec = await end_task(n, start, b["outcome"])
+        return {"seq": rec["seq"], "record_hash": rec["record_hash"], **{k: v for k, v in json.loads(rec["ext"]).items()
+                                                                          if k != "outcome"}}
 
     return r
 

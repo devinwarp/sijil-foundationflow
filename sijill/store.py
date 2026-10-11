@@ -104,6 +104,24 @@ class Store:
         row = self.conn.execute("SELECT * FROM agent_sessions WHERE agent_session = ?", (agent_session,)).fetchone()
         return dict(row) if row else None
 
+    def open_tasks(self, agent_session: str | None = None) -> list[dict]:
+        """task_start records with no task_end, optionally only those of one agent session."""
+        sql = (f"SELECT {COLUMNS} FROM records r WHERE type = 'task_start' AND NOT EXISTS (SELECT 1 FROM records e "
+               f"WHERE e.type = 'task_end' AND e.task_seq = CAST(r.seq AS TEXT))")
+        if agent_session is None:
+            return [dict(x) for x in self.conn.execute(sql + " ORDER BY seq")]
+        return [dict(x) for x in self.conn.execute(
+            sql + " AND json_extract(r.ext, '$.agent_session') = ? ORDER BY seq", (agent_session,))]
+
+    def task_ended(self, task_seq: int) -> bool:
+        return self.conn.execute("SELECT 1 FROM records WHERE type = 'task_end' AND task_seq = ?",
+                                 (str(task_seq),)).fetchone() is not None
+
+    def in_task(self, task_seq: int) -> list[dict]:
+        rows = self.conn.execute("SELECT seq, type, decision, ext FROM records WHERE task_seq = ? ORDER BY seq",
+                                 (str(task_seq),)).fetchall()
+        return [dict(r) for r in rows]
+
     def count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
 

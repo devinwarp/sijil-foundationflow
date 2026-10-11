@@ -213,6 +213,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         last = n.store.last()
         if last and last["policy_hash"] != n.policy.hash:
             await n.adopt_policy(n.policy, old_hash=last["policy_hash"], old=None)
+        await agents.close_expired(n)
         yield
         await app.state.node.aclose()
 
@@ -241,6 +242,14 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
             raise HTTPException(400, "`messages` must be a list")
 
+        # An agent's call is bound to its session and, when one is open, its task (spec §2.3, §17.2.8).
+        sess = agents.session_of(n, request)
+        if sess is None and request.headers.get("x-sijil-task-seq"):
+            raise HTTPException(401, "X-Sijil-Task-Seq needs X-Sijil-Agent-Session")
+        task = agents.task_for(n, sess, request.headers.get("x-sijil-task-seq")) if sess else None
+        who = agents.identity(sess, task)
+        session_id = json.loads(task["ext"])["session_id"] if task else ""
+
         model_id = str(payload.get("model") or settings.default_model)
         pol, region = n.policy, n.region
         api = pol.attestation == "api"
@@ -258,12 +267,12 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         request_hash = record.sha256_hex(record.canonical_json(payload))
 
         def ext(**answer) -> str:
-            x = chat.ext(pol.attestation, request_hash=request_hash, **answer)
+            x = chat.ext(pol.attestation, request_hash=request_hash, session_id=session_id, **answer)
             return record.canonical_json(x).decode() if x else ""
 
         body = n.body(pol, "inference", model_id=model_id, model_digest=digest, mode=mode, decision=decision,
                       rule_hits=policy.rule_hits_json(hits), input_hash=record.input_hash(payload["messages"]),
-                      ext=ext())
+                      ext=ext(), **who)
 
         def answered(model) -> tuple[dict, list[str]] | None:
             """api mode: digest and post-call evaluation for the model the provider says answered."""
