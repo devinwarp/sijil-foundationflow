@@ -11,7 +11,11 @@ import uuid
 
 import uvicorn
 
-from . import identity, mcp, task, unicode
+import sys
+from pathlib import Path
+
+from . import identity, integrity, mcp, rules, task, unicode
+from .canon import sha256_hex
 from .config import Config, Server
 from .ledger import Ledger, Refused, Unreachable
 from .pipeline import Call, Pipeline, Refusal
@@ -27,6 +31,10 @@ class Guard:
         self.sessions: set = set()
         self.upstream = None
         self.init: dict = {}
+        self.lock_bytes = Path(cfg.lockfile).read_bytes() if cfg.lockfile and Path(cfg.lockfile).exists() else None
+        self.lock_doc = integrity.read(cfg.lockfile) if self.lock_bytes is not None else None
+        self.removed: dict[str, list[str]] = {}      # tool -> the integrity rules that took it away
+        self.sealed_drift: set[str] = set()
 
     async def start(self) -> None:
         s = self.server
@@ -42,8 +50,51 @@ class Guard:
 
     async def upstream_note(self, method: str, params: dict) -> None:
         if method == "notifications/tools/list_changed":
+            live = [s for s in self.sessions if s.pipeline]
+            if live:
+                await self.check_tools(live[0])        # a rug-pull mid-session is caught before the next call
             for s in list(self.sessions):
                 await s.client.notify(method, params)
+
+    async def check_tools(self, session: "GuardSession") -> dict:
+        """tools/list upstream, drift against the lockfile, the removed set, and integrity_drift sealed once
+        per new state (spec §5.3, §7.3)."""
+        result = await self.upstream.request("tools/list")
+        tools = [t for t in result.get("tools", []) if isinstance(t, dict) and isinstance(t.get("name"), str)]
+        changed = integrity.changes(self.lock_doc, self.server.name, tools)
+        p = session.pipeline
+        self.removed = integrity.removed(p.pack, p.pins, changed)
+        if changed and self.lock_doc is not None:
+            await asyncio.to_thread(self.seal_drift, session, changed, tools)
+        return {**result, "tools": tools}
+
+    def seal_drift(self, session: "GuardSession", changed: list[dict], tools: list[dict]) -> None:
+        before = sha256_hex(self.lock_bytes)
+        after = sha256_hex(integrity.render(integrity.with_server(self.lock_doc, self.server.name, tools)))
+        if after in self.sealed_drift:
+            return
+        try:
+            base = self.ledger.call("GET", "/api/agent/baseline", session.agent_session, session.task_seq,
+                                    params={"lockfile_hash": before})["seq"]
+        except Refused:
+            print(f"sijil-guard: {self.cfg.lockfile} has no sealed baseline; drift enforced, not sealed",
+                  file=sys.stderr)
+            return
+        p = session.pipeline
+
+        def build() -> dict:
+            v = rules.evaluate(p.pack, rules.Facts("integrity", drift_kinds=sorted({c["kind"] for c in changed}),
+                                                   invisible_unicode=any(c["kind"] == "invisible_unicode"
+                                                                         for c in changed)), p.pins)
+            decision, mode = rules.outcome(v.action)       # confirm has no channel at tools/list: it blocks
+            ext = {"lockfile_hash_before": before, "lockfile_hash_after": after, "trigger": "tools_list",
+                   "changed": changed[:integrity.MAX_CHANGED],
+                   **({"truncated": True} if len(changed) > integrity.MAX_CHANGED else {})}
+            return {"type": "integrity_drift", "parent_seq": str(base), "mode": mode, "decision": decision,
+                    "rule_hits": v.hits, "input_hash": before, "output_hash": after,
+                    "rulepack_hash": p.pack.hash, "ext": ext}
+        p.seal(session.task_seq, build)
+        self.sealed_drift.add(after)
 
     def state(self) -> task.State:
         return task.shared(task.state_path(self.cfg), self.cfg.agent_id, self.open_session)
@@ -110,15 +161,22 @@ class GuardSession(mcp.Session):
             raise mcp.RpcError(mcp.SIJIL, f"Sijil: no agent session or task: {e}")
         self.agent_session = state.agent_session
         self.pipeline = Pipeline(self.guard.ledger, state.agent_session, self.guard.cfg)
+        try:
+            await self.guard.check_tools(self)
+        except (Unreachable, Refused) as e:
+            raise mcp.RpcError(mcp.SIJIL, f"Sijil ledger unreachable or refused the record: {e}")
         return {"protocolVersion": self.guard.init.get("protocolVersion", mcp.PROTOCOL),
                 "capabilities": {"tools": {"listChanged": True}},
                 "serverInfo": self.guard.init.get("serverInfo", {"name": self.guard.server.name, "version": "0"}),
                 "_meta": {"sijil": {"agent_session": state.agent_session, "task_seq": self.task_seq}}}
 
     async def tools_list(self, params: dict) -> dict:
-        result = await self.guard.upstream.request("tools/list", params or None)
-        tools = [t for t in result.get("tools", []) if isinstance(t, dict) and self.guard.server.allowed(t.get("name", ""))]
-        return {**result, "tools": tools}
+        try:
+            result = await self.guard.check_tools(self)
+        except (Unreachable, Refused) as e:
+            raise mcp.RpcError(mcp.SIJIL, f"Sijil ledger unreachable or refused the record: {e}")
+        g = self.guard
+        return {**result, "tools": [t for t in result["tools"] if g.server.allowed(t["name"]) and t["name"] not in g.removed]}
 
     def _confirm(self, rule) -> str:
         """Elicitation for a confirm rule (spec §5.7); runs on the pipeline's worker thread."""
@@ -139,12 +197,12 @@ class GuardSession(mcp.Session):
         call = Call(rule_tool=f"mcp:{s.name}:{name}", tool=name, server=s.name, args=args, harness=cfg.harness,
                     session_id=self.session_id, observed_by="mcp_guard", parent_names=[name, f"mcp__{s.name}__{name}"],
                     command_arg=s.command_arg, task_seq=self.task_seq)
-        forced = None if s.allowed(name) else [NOT_ALLOWLISTED]
+        forced = [NOT_ALLOWLISTED] if not s.allowed(name) else self.guard.removed.get(name)
         try:
             sealed = await asyncio.to_thread(self.pipeline.check, call, self._confirm if self.elicit else None, forced)
         except Refusal as r:
             self.last_blocked = r.seq is not None
-            code = mcp.METHOD_NOT_FOUND if forced else mcp.SIJIL
+            code = mcp.METHOD_NOT_FOUND if forced == [NOT_ALLOWLISTED] else mcp.SIJIL
             raise mcp.RpcError(code, str(r), {"sijil": {"seq": r.seq, "rule_hits": r.hits}})
         except (Unreachable, Refused) as e:
             raise mcp.RpcError(mcp.SIJIL, f"Sijil ledger unreachable or refused the record: {e}")
@@ -203,11 +261,38 @@ class GuardSession(mcp.Session):
                         task.save(st, path)
 
 
-async def run(cfg: Config, server_name: str, ledger: Ledger, http_listen: str = "") -> None:
-    server = next((s for s in cfg.servers if s.name == server_name), None)
+def server_named(cfg: Config, name: str) -> Server:
+    server = next((s for s in cfg.servers if s.name == name), None)
     if server is None:
-        raise ValueError(f"no server named {server_name!r} in {cfg.path}")
-    guard = Guard(cfg, server, ledger)
+        raise ValueError(f"no server named {name!r} in {cfg.path}")
+    return server
+
+
+async def pin(cfg: Config, server_name: str, ledger: Ledger) -> tuple[int, int]:
+    """`tools pin`: write this server's tools into the lockfile and seal integrity_baseline (spec §2.4.4).
+    Returns (seq, tools pinned)."""
+    if not cfg.lockfile:
+        raise ValueError(f"{cfg.path}: set lockfile: to pin tools")
+    guard = Guard(cfg, server_named(cfg, server_name), ledger)
+    await guard.start()
+    try:
+        tools = [t for t in (await guard.upstream.request("tools/list")).get("tools", [])
+                 if isinstance(t, dict) and isinstance(t.get("name"), str)]
+    finally:
+        await guard.aclose()
+    data, doc = integrity.pin(cfg.lockfile, server_name, tools)
+    h, state = sha256_hex(data), await asyncio.to_thread(guard.state)
+    p = Pipeline(ledger, state.agent_session, cfg)
+    ext = {"lockfile": os.path.relpath(os.path.realpath(cfg.lockfile), cfg.repo), "lockfile_hash": h,
+           "entries": len(doc["entries"]), "files": 0, "mcp_tools": len(doc["entries"]), "roots": [],
+           "tool": integrity.TOOL, "invisible_unicode_entries": 0}
+    r = await asyncio.to_thread(p.seal, None, lambda: {"type": "integrity_baseline", "input_hash": h,
+                                                       "rulepack_hash": p.pack.hash, "ext": ext})
+    return r["seq"], len(tools)
+
+
+async def run(cfg: Config, server_name: str, ledger: Ledger, http_listen: str = "") -> None:
+    guard = Guard(cfg, server_named(cfg, server_name), ledger)
     await guard.start()
     try:
         if http_listen:

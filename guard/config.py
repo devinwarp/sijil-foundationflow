@@ -12,7 +12,7 @@ import yaml
 
 PRINCIPAL = re.compile(r"oidc:[a-z0-9.-]+:\S+|email:[0-9a-f]{64}|local:[0-9a-f]{64}|human:[a-z0-9-]{1,32}:[0-9a-f]{64}")
 SECTIONS = {"version", "sijil", "identity", "task", "state_path", "repo", "rulepack", "egress", "context_window",
-            "correlation", "results", "servers", "allowed_command_dirs"}
+            "correlation", "results", "servers", "allowed_command_dirs", "lockfile"}
 SERVER_NAME = re.compile(r"[a-z0-9_-]{1,32}")                      # source_label mcp:<name> (spec §17.1)
 LABELS = ("telemetry", "web", "memory", "repo")                    # `user` cannot be assigned (spec §5.2)
 COMMAND_DIRS = ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "~/.nvm/versions/*/bin", "node_modules/.bin")
@@ -104,6 +104,7 @@ class Config:
     max_result_bytes: int
     invisible_unicode: str        # strip | block | record (spec §7.3)
     servers: tuple
+    lockfile: str                 # pinned tool definitions (spec §7.4); "" = none, only invisible Unicode is checked
 
 
 def _expand(p: str) -> str:
@@ -151,7 +152,7 @@ def load(path: str) -> Config:
                   require_parent=corr.get("require_parent", True),
                   max_result_bytes=res.get("max_result_bytes", 262144),
                   invisible_unicode=res.get("invisible_unicode", "strip"),
-                  servers=_servers(doc, path))
+                  servers=_servers(doc, path), lockfile=_expand(doc.get("lockfile", "")))
 
 
 def _servers(doc: dict, path: str) -> tuple:
