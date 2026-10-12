@@ -1,7 +1,13 @@
 """The guard's side of the tests: a ledger on tmp_path with the starter pack, and a guard.yaml for it."""
 
 import shutil
+import socket
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
+
+import uvicorn
 
 from agentkit import AGENT, OPEN_POLICY, TOKEN, agent_node
 from conftest import ROOT, stub_model
@@ -51,3 +57,21 @@ def guard_session(tmp_path, client, extra: str = ""):
     state = task.from_session(identity.open_session(ledger, cfg, key), cfg.agent_id)
     task.start(ledger, state, cfg.intent, cfg.harness, "conv-1")
     return cfg, state
+
+
+@contextmanager
+def live(app):
+    """The app on a real loopback port, in a thread; yields its base URL (for guard subprocesses)."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    while not server.started:
+        time.sleep(0.01)
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(5)
