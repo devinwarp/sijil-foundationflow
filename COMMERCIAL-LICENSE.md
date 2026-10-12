@@ -4,8 +4,9 @@ Sijil is **source-available**. The code is public, and you can read, run, modify
 
 | Part | License | Commercial use |
 | --- | --- | --- |
-| Everything except `verifier/` (proxy, policy engine, record store, report, console, scripts) | [Business Source License 1.1](LICENSE) | Free for the uses below. Other production use needs a commercial license |
+| Everything except `verifier/`, `guard/` and `rulepacks/` (proxy, policy engine, record store, report, console, scripts) | [Business Source License 1.1](LICENSE) | Free for the uses below. Other production use needs a commercial license |
 | `verifier/` (the independent chain verifier) | [Apache License 2.0](verifier/LICENSE) | Free, including commercial use and redistribution |
+| `guard/` (the agent guard, which runs inside the customer's agent and holds its key) and `rulepacks/` | [Apache License 2.0](guard/LICENSE) | Free, including commercial use and redistribution |
 
 On **2029-09-25** this version of Sijil converts to the Apache License 2.0 in full.
 
