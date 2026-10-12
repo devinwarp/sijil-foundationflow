@@ -15,7 +15,7 @@ COPY scripts/migrate_v2.py scripts/migrate_v2.py
 RUN mkdir /data /config && chgrp 0 /data && chmod g=u /data
 ENV DATABASE_PATH=/data/sijill.db POLICY_PATH=/config/policy.yaml \
     NODE_KEY_PATH=/data/node.key NODE_PUBKEY_PATH=/data/node.pub SIJILL_HALT_PATH=/data/sijill.halt \
-    SIJILL_DIGEST_CACHE=/data/sijill_digests.json SIJILL_MODELS_DIR=/models
+    SIJILL_JWKS_DIR=/data/jwks SIJILL_DIGEST_CACHE=/data/sijill_digests.json SIJILL_MODELS_DIR=/models
 # Operators mount model weights read-only at /models (-v <dir>:/models:ro)
 USER 1001
 EXPOSE 8000

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import yaml
 
+from . import oidc
 from .record import MODES, sha256_hex
 
 RULE_TYPES = ("region_allowlist", "model_allowlist", "keyword_flag")
@@ -22,6 +23,59 @@ GOV_HITS = ("principal-missing", "principal-invalid", "principal-expired", "prin
             "http-task-ambiguous", "approval-timeout")
 RESERVED_IDS = (UPSTREAM_ERROR_HIT, HALT_HIT, RESUME_HIT, *GOV_HITS)
 RESERVED_PREFIXES = ("budget:",)
+ATTESTATION_MODES = ("weights", "api")    # spec §3.1
+REGISTER_POLICIES = ("open", "closed", "principal_oidc")   # spec §5.6; principal_oidc needs principals:
+
+
+@dataclass(frozen=True)
+class PrincipalsConfig:
+    """policy.yaml `principals:` (spec §17.2.2). Absent block: no principal tokens are read (M1 behaviour)."""
+    require: bool = True
+    header: str = "X-Sijil-Principal-Token"
+    accept_authorization: bool = False
+    min_assurance: str = "substantial"
+    issuers: tuple[dict, ...] = ()
+
+
+def load_principals(doc) -> PrincipalsConfig | None:
+    if doc is None:
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("issuers"), list) or not doc["issuers"]:
+        raise ValueError("principals.issuers must be a non-empty list")
+    cfg = PrincipalsConfig(require=doc.get("require", True), header=doc.get("header", "X-Sijil-Principal-Token"),
+                           accept_authorization=doc.get("accept_authorization", False),
+                           min_assurance=doc.get("min_assurance", "substantial"),
+                           issuers=tuple(oidc.principal_issuer(d, "principals.issuers") for d in doc["issuers"]))
+    if (type(cfg.require) is not bool or type(cfg.accept_authorization) is not bool
+            or cfg.min_assurance not in oidc.LEVELS or not isinstance(cfg.header, str)):
+        raise ValueError("principals: require/accept_authorization are booleans, min_assurance low|substantial|high")
+    ids = [i["id"] for i in cfg.issuers]
+    if len(ids) != len(set(ids)) or len({i["issuer"] for i in cfg.issuers}) != len(ids):
+        raise ValueError("principals.issuers: duplicate id or issuer")
+    return cfg
+
+
+@dataclass(frozen=True)
+class AgentsConfig:
+    """policy.yaml `agents:` (spec §5.8.5). Absent block: registrations need the admin token (secure default)."""
+    register_policy: str = "closed"
+    session_ttl_s: int = 28800
+    oidc_issuers: tuple[dict, ...] = ()       # workload token issuers (spec §5.8.5)
+
+
+def load_agents(doc) -> AgentsConfig:
+    if doc is None:
+        return AgentsConfig()
+    if not isinstance(doc, dict) or doc.get("register_policy", "closed") not in REGISTER_POLICIES:
+        raise ValueError(f"agents.register_policy must be one of {REGISTER_POLICIES}")
+    ttl = doc.get("session_ttl_s", 28800)
+    if type(ttl) is not int or not 60 <= ttl <= 86400:
+        raise ValueError("agents.session_ttl_s must be an integer from 60 to 86400")
+    issuers = doc.get("oidc_issuers") or []
+    if not isinstance(issuers, list):
+        raise ValueError("agents.oidc_issuers must be a list")
+    return AgentsConfig(register_policy=doc.get("register_policy", "closed"), session_ttl_s=ttl,
+                        oidc_issuers=tuple(oidc.issuer_cfg(d, "agents.oidc_issuers") for d in issuers))
 
 # Each rule type must carry one list-of-strings key; keyword terms must be non-empty.
 REQUIRED_KEYS = {
@@ -40,6 +94,9 @@ class Policy:
     node_region: str
     rules: tuple[dict, ...]
     hash: str
+    attestation: str = "weights"
+    agents: AgentsConfig = AgentsConfig()
+    principals: PrincipalsConfig | None = None
 
     def modes(self) -> dict[str, str]:
         return {r["id"]: r["mode"] for r in self.rules}
@@ -67,6 +124,13 @@ def load(path: str | Path) -> Policy:
     ids = [r["id"] for r in rules]
     if len(ids) != len(set(ids)):
         raise ValueError(f"duplicate rule ids in {path}")
+    attestation = doc.get("attestation", "weights")
+    if attestation not in ATTESTATION_MODES:
+        raise ValueError(f"attestation must be one of {ATTESTATION_MODES} in {path}")
+    agents_cfg = load_agents(doc.get("agents"))
+    principals = load_principals(doc.get("principals"))
+    if agents_cfg.register_policy == "principal_oidc" and principals is None:
+        raise ValueError(f"agents.register_policy principal_oidc needs a principals: block in {path}")
     return Policy(
         policy_id=str(doc["policy_id"]),
         version_label=str(doc.get("version_label", "")),
@@ -75,6 +139,9 @@ def load(path: str | Path) -> Policy:
         node_region=str(doc["node"]["region"]),
         rules=rules,
         hash=sha256_hex(raw),
+        attestation=attestation,
+        agents=agents_cfg,
+        principals=principals,
     )
 
 
@@ -98,10 +165,11 @@ def _fires(rule: dict, region: str, model_digest: str, text: str) -> bool:
     return any(term.lower() in text for term in rule["terms"])
 
 
-def evaluate(policy: Policy, region: str, model_digest: str, messages) -> tuple[str, str, list[str]]:
-    """Returns (decision, mode, rule_hits)."""
+def evaluate(policy: Policy, region: str, model_digest: str, messages,
+             skip: tuple[str, ...] = ()) -> tuple[str, str, list[str]]:
+    """Returns (decision, mode, rule_hits). Rules whose type is in `skip` are not evaluated."""
     text = message_text(messages).lower()
-    fired = [r for r in policy.rules if _fires(r, region, model_digest, text)]
+    fired = [r for r in policy.rules if r["type"] not in skip and _fires(r, region, model_digest, text)]
     hits = [r["id"] for r in fired]
     if any(r["mode"] == "enforce" for r in fired):
         return "block", "enforce", hits

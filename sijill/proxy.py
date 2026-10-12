@@ -8,6 +8,7 @@ Admin endpoints require `Authorization: Bearer $SIJILL_ADMIN_TOKEN`; with no tok
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import os
@@ -25,7 +26,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from . import keys, policy, record
+from . import agents, chat, keys, oidc, policy, record, rulepack
 from .digest import DigestResolver
 from .store import Store
 
@@ -42,19 +43,23 @@ DASHBOARD = ROOT / "dashboard" / "index.html"
 class Settings:
     db_path: str = "sijill.db"
     policy_path: str = "policy.yaml"
+    rulepack_path: str = ""            # "" = no rule pack; records keep rulepack_hash "" (M1 behaviour)
     key_path: str = "node.key"
     pubkey_path: str = "node.pub"
     upstream: str = "http://localhost:1234/v1"
     upstream_token: str = ""
+    upstream_provider: str = ""        # <provider> in api:<provider>:<model> (spec §3.1: from the route)
     default_model: str = "llama-3.2-3b-instruct"
     upstream_timeout: float = 120.0
     admin_token: str = ""
+    agent_token: str = ""              # X-Sijil-Token for /api/agent/*; "" disables those endpoints
     pkcs11_module: str = ""
     pkcs11_token: str = ""
     pkcs11_key: str = ""
     pkcs11_pin: str = ""
     halt_path: str = "sijill.halt"
     digest_cache: str = ".sijill_digests.json"
+    jwks_dir: str = "jwks"             # JWKS snapshots by hash (spec §17.2.6); not evidence
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -62,27 +67,31 @@ class Settings:
         return cls(
             db_path=e("DATABASE_PATH", cls.db_path),
             policy_path=e("POLICY_PATH", cls.policy_path),
+            rulepack_path=e("SIJILL_RULEPACK_PATH", ""),
             key_path=e("NODE_KEY_PATH", cls.key_path),
             pubkey_path=e("NODE_PUBKEY_PATH", cls.pubkey_path),
             upstream=e("LMSTUDIO_BASE_URL", cls.upstream),
             upstream_token=e("LM_API_TOKEN", ""),
+            upstream_provider=e("SIJILL_UPSTREAM_PROVIDER", ""),
             default_model=e("SIJILL_MODEL", cls.default_model),
             upstream_timeout=float(e("UPSTREAM_TIMEOUT", cls.upstream_timeout)),
             admin_token=e("SIJILL_ADMIN_TOKEN", ""),
+            agent_token=e("SIJILL_TOKEN", ""),
             pkcs11_module=e("SIJILL_PKCS11_MODULE", ""),
             pkcs11_token=e("SIJILL_PKCS11_TOKEN", ""),
             pkcs11_key=e("SIJILL_PKCS11_KEY", ""),
             pkcs11_pin=e("SIJILL_PKCS11_PIN", ""),
             halt_path=e("SIJILL_HALT_PATH", cls.halt_path),
             digest_cache=e("SIJILL_DIGEST_CACHE", cls.digest_cache),
+            jwks_dir=e("SIJILL_JWKS_DIR", cls.jwks_dir),
         )
 
 
 class Node:
-    """Runtime state: the chain head, the policy in force and the node's current region."""
+    """Runtime state: the chain head, the policy and rule pack in force and the node's current region."""
 
     def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None,
-                 resolver: DigestResolver | None = None):
+                 resolver: DigestResolver | None = None, idp_transport: httpx.AsyncBaseTransport | None = None):
         self.settings = settings
         self.store = Store(settings.db_path)
         if settings.pkcs11_module:
@@ -103,17 +112,58 @@ class Node:
         else:
             self.key = keys.load_or_generate(settings.key_path, settings.pubkey_path)
         self.policy = policy.load(settings.policy_path)
+        self.check_attestation(self.policy)
         last = self.store.last()
         self.region = last["node_region"] if last else self.policy.node_region
+        # The rule pack hash in force on the chain; it moves only when a rulepack_change is sealed.
+        self.rulepack_hash = last["rulepack_hash"] if last else ""
+        self.rulepack = rulepack.load(settings.rulepack_path) if settings.rulepack_path else None
+        if self.rulepack is None and self.rulepack_hash:
+            self.store.close()
+            raise RuntimeError(f"chain in {settings.db_path} is under rule pack {self.rulepack_hash[:12]}; set "
+                               f"SIJILL_RULEPACK_PATH (a record without rulepack_hash fails check E)")
         # The writer trusts its own memory of the head, not the database: a record
         # deleted or edited at the tail while running still shows up as a break.
         self.head = self.store.head()
+        self.agents = agents.Registry(self.store)
         self.lock = asyncio.Lock()
         self.halted = Path(settings.halt_path).exists()
         self.resolver = resolver or DigestResolver(cache_path=settings.digest_cache)
         headers = {"Authorization": f"Bearer {settings.upstream_token}"} if settings.upstream_token else {}
         self.client = httpx.AsyncClient(base_url=settings.upstream, headers=headers,
                                         timeout=settings.upstream_timeout, transport=transport)
+        self.idp = httpx.AsyncClient(timeout=10.0, transport=idp_transport)   # discovery and JWKS only
+        self.jwks = self.keys_for(self.policy)
+
+    def keys_for(self, pol: policy.Policy) -> dict:
+        """JWKS caches for every issuer the policy names; a pinned file that fails its sha256 raises."""
+        humans = pol.principals.issuers if pol.principals else ()
+        return oidc.build_jwks([*pol.agents.oidc_issuers, *humans], self.settings.jwks_dir, self.idp)
+
+    async def human(self, request: Request, task: dict | None) -> dict | None:
+        """The validated human principal of a call (spec §17.2), bound to its task (§17.2.8). None when no
+        principals: block is configured, or a token is optional and absent. Raises oidc.OidcError."""
+        pcfg = self.policy.principals
+        if pcfg is None:
+            return None
+        token = oidc.token_of(pcfg, request.headers)
+        bound = task is not None and task["principal"].startswith("human:")
+        if token is None and not pcfg.require and not bound:
+            return None
+        h = await oidc.human(pcfg, self.jwks, token, agents.clock())
+        if task is not None and h["principal"] != task["principal"]:
+            raise oidc.OidcError("task_principal", 409, h["principal"])
+        if h["display"]:
+            self.store.index_principal(h["principal"], h["display"])
+        return h
+
+    def check_attestation(self, pol: policy.Policy) -> None:
+        """attestation: api needs the provider of the upstream route; it is never taken from the request."""
+        if pol.attestation == "api" and not chat.PROVIDER.fullmatch(self.settings.upstream_provider):
+            raise ValueError("attestation: api needs SIJILL_UPSTREAM_PROVIDER ([a-z0-9-]+), the upstream's provider")
+
+    def api_digest(self, model: str) -> str:
+        return f"api:{self.settings.upstream_provider}:{model}"
 
     def body(self, pol: policy.Policy, type_: str, **fields) -> dict:
         base = dict(type=type_, model_id="", model_digest="", node_id=pol.node_id, node_region=self.region,
@@ -122,13 +172,38 @@ class Node:
                     **{f: "" for f in record.EXT_FIELDS})   # v2 columns; set by the rows that use them
         return {**base, **fields}
 
-    async def seal(self, body: dict) -> dict:
+    async def seal(self, body) -> dict:
+        """`body` may be a callable that builds it under the lock, for bodies whose checks read state that a
+        concurrent seal could change (agent registry, task_end counts)."""
         async with self.lock:
+            if callable(body):
+                body = body()
+            if body["type"] != "rulepack_change":
+                # Stamped under the lock so no record lands between a rulepack_change and its hash (check E).
+                if body["rulepack_hash"] not in ("", self.rulepack_hash):
+                    raise rulepack.Mismatch(self.rulepack_hash)
+                body = {**body, "rulepack_hash": self.rulepack_hash}
             seq, prev = self.head
             rec = record.seal({**body, "ts": record.now_ts()}, seq + 1, prev, self.key)
             self.store.append(rec)
             self.head = (rec["seq"], rec["record_hash"])
+            if rec["type"] == "rulepack_change":
+                self.rulepack_hash = rec["rulepack_hash"]
             return rec
+
+    async def adopt_rulepack(self, new: rulepack.RulePack, trigger: str,
+                             old: rulepack.RulePack | None) -> dict | None:
+        """Put `new` in force; seal a rulepack_change iff its hash differs from the chain's.
+        rules_changed: every rule on first adoption; [] at a restart, where the old pack is unknown."""
+        self.rulepack = new
+        before = self.rulepack_hash
+        if new.hash == before:
+            return None
+        changed = rulepack.changed(old, new) if old or not before else []
+        ext = {"rulepack_id": new.rulepack_id, "version": new.version, "path": new.path, "before": before,
+               "after": new.hash, "rules_changed": changed, "trigger": trigger}
+        return await self.seal(self.body(self.policy, "rulepack_change", rule_hits=policy.rule_hits_json(changed),
+                                         rulepack_hash=new.hash, ext=record.canonical_json(ext).decode()))
 
     async def adopt_policy(self, new: policy.Policy, old_hash: str,
                            old: policy.Policy | None) -> dict | None:
@@ -145,6 +220,7 @@ class Node:
 
     async def aclose(self) -> None:
         await self.client.aclose()
+        await self.idp.aclose()
         self.store.close()
         close = getattr(self.key, "close", None)  # HSM signer only; file keys have none
         if close:
@@ -152,16 +228,20 @@ class Node:
 
 
 def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTransport | None = None,
-               resolver: DigestResolver | None = None) -> FastAPI:
+               resolver: DigestResolver | None = None,
+               idp_transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.node = Node(settings, transport, resolver)
+        app.state.node = Node(settings, transport, resolver, idp_transport)
         n = app.state.node
+        if n.rulepack:   # before any policy_change, so that record already carries the new hash
+            await n.adopt_rulepack(n.rulepack, "startup", old=None)
         last = n.store.last()
         if last and last["policy_hash"] != n.policy.hash:
             await n.adopt_policy(n.policy, old_hash=last["policy_hash"], old=None)
+        await agents.close_expired(n)
         yield
         await app.state.node.aclose()
 
@@ -177,6 +257,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         if not hmac.compare_digest(supplied, f"Bearer {settings.admin_token}".encode()):
             raise HTTPException(401, "admin token required")
 
+    app.include_router(agents.router(require_admin))
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
         t0 = perf_counter()
@@ -188,32 +270,107 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
             raise HTTPException(400, "`messages` must be a list")
 
+        # An agent's call is bound to its session and, when one is open, its task (spec §2.3, §17.2.8).
+        sess = agents.session_of(n, request)
+        if sess is None and request.headers.get("x-sijil-task-seq"):
+            raise HTTPException(401, "X-Sijil-Task-Seq needs X-Sijil-Agent-Session")
+        task = agents.task_for(n, sess, request.headers.get("x-sijil-task-seq")) if sess else None
+        who = agents.identity(sess, task)
+        session_id = json.loads(task["ext"])["session_id"] if task else ""
+
         model_id = str(payload.get("model") or settings.default_model)
-        digest = await asyncio.to_thread(n.resolver.resolve, model_id)
         pol, region = n.policy, n.region
-        decision, mode, hits = policy.evaluate(pol, region, digest, payload["messages"])
-        if n.halted:
-            decision, mode, hits = "block", "enforce", [policy.HALT_HIT]
-        body = n.body(pol, "inference", model_id=model_id, model_digest=digest, mode=mode, decision=decision,
-                      rule_hits=policy.rule_hits_json(hits), input_hash=record.input_hash(payload["messages"]))
+        api = pol.attestation == "api"
+        if api:
+            if not chat.MODEL.fullmatch(model_id):
+                raise HTTPException(400, "`model` must be 1-256 characters without whitespace")
+            digest = n.api_digest(model_id)   # until the provider names the model that answered
+        else:
+            digest = await asyncio.to_thread(n.resolver.resolve, model_id)
+        request_hash = record.sha256_hex(record.canonical_json(payload))
+        input_hash = record.input_hash(payload["messages"])
+        extra = {}
+
+        def ext(**answer) -> str:
+            x = chat.ext(pol.attestation, request_hash=request_hash, **{"session_id": session_id, **extra, **answer})
+            return record.canonical_json(x).decode() if x else ""
 
         def headers(rec: dict, upstream_ms: float) -> dict:
             overhead = (perf_counter() - t0) * 1000 - upstream_ms
             return {"X-Sijill-Seq": str(rec["seq"]), "X-Sijill-Decision": rec["decision"],
                     "X-Sijill-Record-Hash": rec["record_hash"], "X-Sijill-Overhead-Ms": f"{overhead:.3f}"}
 
-        if decision == "block":
-            rec = await n.seal(body)
-            return JSONResponse(status_code=403, headers=headers(rec, 0.0), content={
-                "error": {"message": f"Blocked by Sijill policy: {', '.join(hits)}",
-                          "type": "policy_block", "code": "sijill_block"},
-                "sijill": {"seq": rec["seq"], "decision": "block", "rule_hits": hits,
+        try:
+            human = await n.human(request, task)
+        except oidc.OidcError as e:
+            # Sealed like the halt, outside any task so check I holds (spec §17.2.7); nothing is forwarded.
+            refused = oidc.hit(e.code)
+            rec = await n.seal(n.body(pol, "inference", model_id=model_id, model_digest=digest, mode="enforce",
+                                      decision="block", rule_hits=policy.rule_hits_json([refused]),
+                                      input_hash=input_hash, ext=ext(principal_error=e.code, session_id=""),
+                                      agent_id=who["agent_id"], principal=e.principal))
+            return JSONResponse(status_code=e.status, headers=headers(rec, 0.0), content={
+                "error": {"message": f"Sijil principal refused: {e.code}", "type": "principal_refused",
+                          "code": refused},
+                "sijill": {"seq": rec["seq"], "decision": "block", "rule_hits": [refused],
                            "record_hash": rec["record_hash"]}})
+        if human is not None:
+            if task is None:
+                who["principal"] = human["principal"]
+                extra["principal_claims"] = human["claims"]
+            elif n.store.token_in_force(task["seq"]) != human["claims"]["token_hash"]:
+                extra["principal_claims"] = human["claims"]    # a refreshed token in the task (§17.2.8)
+
+        # In api mode the allowlist is checked against the model that answered (spec §3.1), after the call.
+        skip = ("model_allowlist",) if api else ()
+        decision, mode, hits = policy.evaluate(pol, region, digest, payload["messages"], skip=skip)
+        if n.halted:
+            decision, mode, hits = "block", "enforce", [policy.HALT_HIT]
+        body = n.body(pol, "inference", model_id=model_id, model_digest=digest, mode=mode, decision=decision,
+                      rule_hits=policy.rule_hits_json(hits), input_hash=input_hash, ext=ext(), **who)
+
+        def settled(b: dict):
+            """Seal-time body: a task that ended while the call was in flight is not written into, so the
+            inference is sealed outside it (task_seq and ext.session_id empty), keeping the session identity."""
+            def build() -> dict:
+                if b["task_seq"] and n.store.task_ended(b["task_seq"]):
+                    x = json.loads(b["ext"]) if b["ext"] else {}
+                    if "session_id" in x:
+                        x["session_id"] = ""
+                    # The token was validated in this request: seal the no-task human shape (§17.2.5).
+                    if human is not None:
+                        x["principal_claims"] = human["claims"]
+                    else:
+                        x.pop("principal_claims", None)
+                    return {**b, "task_seq": "", "agent_id": sess["agent_id"],
+                            "principal": human["principal"] if human is not None else sess["principal"],
+                            "ext": record.canonical_json(x).decode() if x else ""}
+                return b
+            return build
+
+        def answered(model) -> tuple[dict, list[str]] | None:
+            """api mode: digest and post-call evaluation for the model the provider says answered."""
+            if not (isinstance(model, str) and chat.MODEL.fullmatch(model)):
+                return None
+            d = n.api_digest(model)
+            post_decision, post_mode, post_hits = policy.evaluate(pol, region, d, payload["messages"])
+            return {"model_digest": d, "decision": post_decision, "mode": post_mode,
+                    "rule_hits": policy.rule_hits_json(post_hits)}, post_hits
+
+        def blocked(rec: dict, block_hits: list[str], upstream_ms: float = 0.0):
+            return JSONResponse(status_code=403, headers=headers(rec, upstream_ms), content={
+                "error": {"message": f"Blocked by Sijill policy: {', '.join(block_hits)}",
+                          "type": "policy_block", "code": "sijill_block"},
+                "sijill": {"seq": rec["seq"], "decision": "block", "rule_hits": block_hits,
+                           "record_hash": rec["record_hash"]}})
+
+        if decision == "block":
+            return blocked(await n.seal(settled(body)), hits)
 
         async def upstream_failed(status: int, content: dict, upstream_ms: float):
             """Seal the call marked with the reserved upstream-error hit and respond."""
-            rec = await n.seal({**body, "rule_hits": policy.rule_hits_json(
-                hits + [policy.UPSTREAM_ERROR_HIT])})
+            rec = await n.seal(settled({**body, "rule_hits": policy.rule_hits_json(
+                hits + [policy.UPSTREAM_ERROR_HIT])}))
             return JSONResponse(status_code=status, headers=headers(rec, upstream_ms), content=content)
 
         t1 = perf_counter()
@@ -235,7 +392,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 return await upstream_failed(resp.status_code, content, (perf_counter() - t1) * 1000)
 
             async def relay():
-                parts, done, errored, rec = [], False, False, None
+                parts, calls, relayed = [], chat.StreamCalls(), hashlib.sha256()
+                done, errored, refused, post, finish, rec = False, False, False, None, "", None
                 try:
                     async for line in resp.aiter_lines():
                         if n.halted:  # operator halt lands mid-stream: stop relaying now
@@ -250,25 +408,49 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                                 event = None
                             if isinstance(event, dict) and "error" in event:
                                 errored = True  # in-stream failure (vLLM), even if [DONE] follows
+                            if api and post is None and isinstance(event, dict) and event.get("model"):
+                                # An empty or absent model (Azure's leading prompt-filter chunk) does not latch.
+                                post = answered(event["model"])
+                                if post is None:
+                                    errored = True
+                                    break
+                                if post[0]["decision"] == "block":   # nothing of the answer is relayed
+                                    refused = True
+                                    break
                             try:
-                                delta = event["choices"][0].get("delta") or {}
+                                choice = event["choices"][0]
+                                delta = choice.get("delta") or {}
+                                finish = choice.get("finish_reason") or finish
                             except (KeyError, IndexError, TypeError, AttributeError):
                                 delta = {}
-                            if isinstance(delta.get("content"), str):
-                                parts.append(delta["content"])
+                            if api and post is None and isinstance(delta, dict) and (
+                                    delta.get("content") or delta.get("tool_calls")):
+                                errored = True   # answer content before the answering model is named
+                                break
+                            if isinstance(delta, dict):
+                                if isinstance(delta.get("content"), str):
+                                    parts.append(delta["content"])
+                                calls.add(delta)
+                        relayed.update((line + "\n").encode())
                         yield (line + "\n").encode()
                 finally:
                     # Read the halt flag here, with no await before the seal: a halt that has flipped
                     # it has its `halted` record sealed or queued ahead of ours on the lock.
                     halted = n.halted
-                    if done and not errored and not halted:
-                        sealed = {**body, "output_hash": record.output_hash("".join(parts))}
+                    uses = calls.tool_uses()
+                    ok = done and not errored and not halted and not (api and post is None)
+                    if ok:
+                        sealed = {**body, "output_hash": record.output_hash("".join(parts)), **(post[0] if post else {}),
+                                  "ext": ext(response_hash=relayed.hexdigest(), stop_reason=str(finish),
+                                             tool_uses=uses)}
                     elif halted:
                         # The halt is checked before each line is relayed, so `parts` is exactly the content
                         # already delivered. Hash it like a completed stream; nothing delivered keeps "".
                         sealed = {**body, "decision": "block", "mode": "enforce", "rule_hits": policy.rule_hits_json(
                             hits + [policy.HALT_HIT, policy.UPSTREAM_ERROR_HIT]),
                             "output_hash": record.output_hash("".join(parts)) if parts else ""}
+                    elif refused:
+                        sealed = {**body, **post[0]}
                     else:
                         sealed = {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT])}
                     # Shielded: a client hang-up cancels this task (anyio, level-triggered), but the call
@@ -276,7 +458,9 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     # runs even if the seal raises, so a signer outage does not leak the connection.
                     with anyio.CancelScope(shield=True):
                         try:
-                            rec = await n.seal(sealed)
+                            rec = await n.seal(settled(sealed))
+                            if ok and rec["decision"] != "block":
+                                n.store.index_tool_uses(rec["seq"], uses)
                         finally:
                             await resp.aclose()
                 yield (f": sijill seq={rec['seq']} decision={rec['decision']} "
@@ -305,19 +489,32 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         # `content` absent or null is a valid OpenAI shape (tool calls): hash "".
         try:
             data = resp.json()
-            message = data["choices"][0]["message"]
+            choice = data["choices"][0]
+            message = choice["message"]
             if not isinstance(message, dict):
                 raise TypeError("malformed choice")
             text = message.get("content")
             text = "" if text is None else text
             if not isinstance(text, str):
                 raise TypeError("message content is not a string or null")
-        except (ValueError, KeyError, IndexError, TypeError):
+            post = answered(data.get("model")) if api else None
+            if api and post is None:
+                raise TypeError("api attestation needs the response's model")
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
             return await upstream_failed(
                 502, {"error": {"message": "model runtime returned a malformed response",
                                 "type": UPSTREAM_ERROR_TYPE}}, upstream_ms)
 
-        rec = await n.seal({**body, "output_hash": record.output_hash(text)})
+        uses = chat.tool_uses(message)
+        sealed = {**body, "output_hash": record.output_hash(text), **(post[0] if post else {}),
+                  "ext": ext(response_hash=record.sha256_hex(resp.content),
+                             provider_request_id=resp.headers.get("x-request-id", ""),
+                             stop_reason=str(choice.get("finish_reason") or ""), tool_uses=uses)}
+        if post and post[0]["decision"] == "block":
+            # The provider answered, but not with an approved model: the answer is withheld.
+            return blocked(await n.seal(settled({**sealed, "output_hash": ""})), post[1], upstream_ms)
+        rec = await n.seal(settled(sealed))
+        n.store.index_tool_uses(rec["seq"], uses)
         return JSONResponse(content=data, headers=headers(rec, upstream_ms))
 
     @app.get("/api/records")
@@ -352,12 +549,28 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         n = node(request)
         try:
             new = policy.load(settings.policy_path)
+            n.check_attestation(new)
+            jwks = n.keys_for(new)
         except Exception as e:
             raise HTTPException(400, f"policy not loaded: {e}")
         old = n.policy
+        n.jwks = jwks
         rec = await n.adopt_policy(new, old_hash=old.hash, old=old)
         changed = policy.mode_changes(old, new)
         return {"changed": changed, "seq": rec and rec["seq"], "policy_hash": new.hash}
+
+    @app.post("/api/admin/rulepack/reload", dependencies=[Depends(require_admin)])
+    async def reload_rulepack(request: Request):
+        n = node(request)
+        if not settings.rulepack_path:
+            raise HTTPException(400, "no rule pack configured: set SIJILL_RULEPACK_PATH")
+        try:
+            new = rulepack.load(settings.rulepack_path)
+        except Exception as e:
+            raise HTTPException(400, f"rule pack not loaded: {e}")
+        old = n.rulepack
+        rec = await n.adopt_rulepack(new, "reload", old)
+        return {"changed": rulepack.changed(old, new), "seq": rec and rec["seq"], "rulepack_hash": new.hash}
 
     @app.post("/api/admin/node/region", dependencies=[Depends(require_admin)])
     async def set_region(request: Request):
