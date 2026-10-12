@@ -5,6 +5,7 @@ from pathlib import Path
 
 from agentkit import AGENT, OPEN_POLICY, TOKEN, agent_node
 from conftest import ROOT, stub_model
+from guard import config, identity, task
 from guard.ledger import Ledger
 
 
@@ -39,3 +40,14 @@ task:
 
 def ledger_of(client) -> Ledger:
     return Ledger("http://testserver", TOKEN, http=client)
+
+
+def guard_session(tmp_path, client, extra: str = ""):
+    """Register the agent, open its session and a task, as `sijil-guard task start` does: (cfg, State)."""
+    cfg = config.load(str(guard_yaml(tmp_path, f"rulepack: {tmp_path}/starter.yaml\nrepo: {tmp_path}/repo\n" + extra)))
+    ledger = ledger_of(client)
+    key = identity.create_key(cfg.key_path, cfg.repo)
+    identity.register(ledger, cfg.agent_id, key, cfg.registered_by)
+    state = task.from_session(identity.open_session(ledger, cfg, key), cfg.agent_id)
+    task.start(ledger, state, cfg.intent, cfg.harness, "conv-1")
+    return cfg, state
