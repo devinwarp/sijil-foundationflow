@@ -12,7 +12,8 @@ import yaml
 
 PRINCIPAL = re.compile(r"oidc:[a-z0-9.-]+:\S+|email:[0-9a-f]{64}|local:[0-9a-f]{64}|human:[a-z0-9-]{1,32}:[0-9a-f]{64}")
 SECTIONS = {"version", "sijil", "identity", "task", "state_path", "repo", "rulepack", "egress", "context_window",
-            "correlation", "results", "servers", "allowed_command_dirs", "lockfile"}
+            "correlation", "results", "servers", "allowed_command_dirs", "lockfile", "http_tools"}
+HARNESSES = ("foundry", "http-agent", "other")                      # X-Sijil-Harness values (spec §17.3.3)
 SERVER_NAME = re.compile(r"[a-z0-9_-]{1,32}")                      # source_label mcp:<name> (spec §17.1)
 LABELS = ("telemetry", "web", "memory", "repo")                    # `user` cannot be assigned (spec §5.2)
 COMMAND_DIRS = ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "~/.nvm/versions/*/bin", "node_modules/.bin")
@@ -82,6 +83,68 @@ def _server(d: dict, repo: str, dirs) -> Server:
 
 
 @dataclass(frozen=True)
+class HttpServer:
+    name: str                     # source_label http:<name>; tools are http:<name>:<operationId>
+    upstream: str
+    spec: str                     # OpenAPI 3.0/3.1, JSON or YAML
+    label: str
+    forward_headers: tuple        # lower-case names passed upstream; values are never sealed
+    allow: tuple
+    deny: tuple
+    max_body_bytes: int
+    command_arg: str
+
+    def allowed(self, operation: str) -> bool:
+        if any(fnmatch.fnmatchcase(operation, g) for g in self.allow):
+            return True
+        return not self.deny or not any(fnmatch.fnmatchcase(operation, g) for g in self.deny)
+
+
+@dataclass(frozen=True)
+class HttpTools:
+    listen: str
+    tls_cert: str
+    tls_key: str
+    auth: str                     # bearer_env | mtls | none (loopback only)
+    token: str                    # bearer_env: the expected X-Sijil-Tools-Token
+    client_ca: str                # mtls: the CA client certificates must chain to
+    servers: tuple
+
+
+def _http_tools(d, path: str) -> HttpTools | None:
+    """spec §17.3.2. Off loopback both TLS and inbound auth are required; entra inbound auth is row 42."""
+    if not d:
+        return None
+    listen, tls, auth = d.get("listen", "127.0.0.1:8090"), d.get("tls") or {}, d.get("inbound_auth") or {}
+    mode = auth.get("mode", "none")
+    loopback = listen.rsplit(":", 1)[0] in ("127.0.0.1", "localhost", "::1", "[::1]")
+    if mode not in ("bearer_env", "mtls", "none"):
+        raise ValueError(f"{path}: http_tools.inbound_auth.mode must be bearer_env or mtls (entra is not built)")
+    if not loopback and (not tls.get("cert") or not tls.get("key") or mode == "none"):
+        raise ValueError(f"{path}: http_tools off loopback needs tls.cert, tls.key and inbound_auth")
+    if mode == "mtls" and not (tls.get("cert") and auth.get("client_ca")):
+        raise ValueError(f"{path}: inbound_auth mtls needs tls and inbound_auth.client_ca")
+    token = os.environ.get(auth.get("token_env", "SIJIL_TOOLS_TOKEN"), "") if mode == "bearer_env" else ""
+    if mode == "bearer_env" and not token:
+        raise ValueError(f"{path}: inbound_auth bearer_env: {auth.get('token_env', 'SIJIL_TOOLS_TOKEN')} is not set")
+    servers = []
+    for s in d.get("servers") or ():
+        name, label = s.get("name", ""), s.get("label", "")
+        if not SERVER_NAME.fullmatch(name) or (label and label not in LABELS) or not s.get("upstream") \
+                or not s.get("spec"):
+            raise ValueError(f"{path}: http_tools server {name!r} needs a [a-z0-9_-] name, upstream and spec")
+        ops = s.get("operations") or {}
+        servers.append(HttpServer(name=name, upstream=s["upstream"].rstrip("/"), spec=_expand(s["spec"]),
+                                  label=label or f"http:{name}",
+                                  forward_headers=tuple(h.lower() for h in s.get("forward_headers") or ()),
+                                  allow=tuple(ops.get("allow") or ()), deny=tuple(ops.get("deny") or ()),
+                                  max_body_bytes=int(s.get("max_body_bytes", 1048576)),
+                                  command_arg=s.get("command_arg", "")))
+    return HttpTools(listen=listen, tls_cert=_expand(tls.get("cert", "")), tls_key=_expand(tls.get("key", "")),
+                     auth=mode, token=token, client_ca=_expand(auth.get("client_ca", "")), servers=tuple(servers))
+
+
+@dataclass(frozen=True)
 class Config:
     path: str
     url: str
@@ -105,6 +168,7 @@ class Config:
     invisible_unicode: str        # strip | block | record (spec §7.3)
     servers: tuple
     lockfile: str                 # pinned tool definitions (spec §7.4); "" = none, only invisible Unicode is checked
+    http_tools: HttpTools | None
 
 
 def _expand(p: str) -> str:
@@ -152,7 +216,8 @@ def load(path: str) -> Config:
                   require_parent=corr.get("require_parent", True),
                   max_result_bytes=res.get("max_result_bytes", 262144),
                   invisible_unicode=res.get("invisible_unicode", "strip"),
-                  servers=_servers(doc, path), lockfile=_expand(doc.get("lockfile", "")))
+                  servers=_servers(doc, path), lockfile=_expand(doc.get("lockfile", "")),
+                  http_tools=_http_tools(doc.get("http_tools"), path))
 
 
 def _servers(doc: dict, path: str) -> tuple:
