@@ -27,6 +27,7 @@ PUBKEY = HEX64 = re.compile(r"[0-9a-f]{64}")
 DECIMAL = re.compile(r"[1-9][0-9]{0,17}")      # fits SQLite INTEGER
 OUTCOMES = ("completed", "aborted", "blocked", "error", "timeout")
 SEALABLE = ("tool_call", "tool_result", "egress", "integrity_baseline", "integrity_drift")   # row 5; approval: 18g
+GUARD_HITS = ("http-operation-unknown",)    # the one reserved id the guard seals itself, on a blocked call (§17.3.4)
 PARENT_TYPE = {"tool_call": "inference", "tool_result": "tool_call", "egress": "tool_call",
                "integrity_drift": "integrity_baseline"}
 COUNTS = ("inference", "tool_calls", "blocked", "confirmed", "denied", "flagged", "egress")
@@ -210,9 +211,18 @@ def check_parent(store, body: dict, ext: dict) -> None:
         raise HTTPException(400, "parent in a different task")
     if t == "tool_call":
         uses = json.loads(parent["ext"]).get("tool_uses", []) if parent["ext"] else []
-        if not any(u.get("args_hash") == body["input_hash"] and ext.get("tool_use_id", u.get("id")) == u.get("id")
-                   for u in uses if isinstance(u, dict)):
+        fits = [u for u in uses if isinstance(u, dict) and u.get("args_hash") == body["input_hash"]
+                and ext.get("tool_use_id", u.get("id")) == u.get("id")]
+        if not fits:
             raise HTTPException(400, "tool_call args not requested by parent")
+        # one requested tool_use authorizes one tool_call: each earlier child consumed an entry (by its id, else
+        # by its args_hash); under the seal lock, so two concurrent calls cannot both take the last one
+        used = [(json.loads(c["ext"]).get("tool_use_id", "") if c["ext"] else "", c["input_hash"])
+                for c in store.children("tool_call", p)]
+        free = [u for u in fits if u.get("id") not in {i for i, _ in used if i}]
+        free = free[:max(0, len(free) - sum(1 for i, h in used if not i and h == body["input_hash"]))]
+        if not free:
+            raise HTTPException(409, "parent already consumed")
     if t == "tool_result" and store.has_child("tool_result", p):
         raise HTTPException(409, f"duplicate tool_result for parent {p}")
     if t == "integrity_drift" and body["input_hash"] != parent["input_hash"]:
@@ -398,7 +408,9 @@ def router(require_admin) -> APIRouter:
             raise HTTPException(400, "rule_hits must be a list of strings and ext an object")
         if not isinstance(b.get("rulepack_hash"), str):
             raise HTTPException(400, "rulepack_hash must be a string")
-        if any(h in policy.RESERVED_IDS or h.startswith(policy.RESERVED_PREFIXES) for h in hits):
+        guard_ok = t == "tool_call" and b.get("decision") == "block" and b.get("mode") == "enforce"
+        if any((h in policy.RESERVED_IDS or h.startswith(policy.RESERVED_PREFIXES)) and not (guard_ok and h in GUARD_HITS)
+               for h in hits):
             raise HTTPException(400, "rule_hits may not carry reserved ids; the node adds those itself")
         task = task_for(n, sess, b.get("task_seq"))
         if task is None and t in record.TASK_REQUIRED:
@@ -432,7 +444,8 @@ def router(require_admin) -> APIRouter:
             raise HTTPException(409, "rulepack mismatch")
         except ValueError as e:
             raise HTTPException(400, str(e))
-        return {"seq": rec["seq"], "record_hash": rec["record_hash"], "ts": rec["ts"], "decision": rec["decision"]}
+        return {"seq": rec["seq"], "record_hash": rec["record_hash"], "ts": rec["ts"], "decision": rec["decision"],
+                "task_seq": rec["task_seq"]}
 
     @r.get("/api/agent/parent")
     async def parent(request: Request, tool_use_id: str = "", name: str = "", args_hash: str = "",
@@ -463,7 +476,17 @@ def router(require_admin) -> APIRouter:
             since = max((r["seq"] for r in rows if r["type"] == "inference"
                          and not (json.loads(r["ext"]).get("tool_uses") if r["ext"] else None)), default=0)
         results = [r for r in rows if r["type"] == "tool_result" and r["seq"] > since]
-        return {"labels": sorted({r["source_label"] for r in results}), "seqs": [r["seq"] for r in results]}
+        hints = {h for r in results for h in (json.loads(r["ext"]).get("exec_hints", []) if r["ext"] else [])}
+        return {"labels": sorted({r["source_label"] for r in results}), "seqs": [r["seq"] for r in results],
+                "exec_hints": sorted(hints)}      # for the rules' context_exec_hints (spec §8.1)
+
+    @r.get("/api/agent/baseline")
+    async def baseline(request: Request, lockfile_hash: str, sess: dict = Depends(require_session)):
+        """The calling agent's own baseline that a guard's integrity_drift points at (spec §2.4.5, check C)."""
+        seq = node(request).store.baseline(lockfile_hash, sess["agent_id"])
+        if seq is None:
+            raise HTTPException(404, "no integrity_baseline for that lockfile_hash")
+        return {"seq": seq}
 
     @r.post("/api/agent/task/start")
     async def task_start(request: Request, sess: dict = Depends(require_session)):
