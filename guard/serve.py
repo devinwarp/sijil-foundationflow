@@ -105,16 +105,17 @@ class Guard:
         self.sessions: set = set()
         self.upstream = None
         self.init: dict = {}
-        self.lock_bytes, self.lock_doc, self.lock_stamp = None, None, None
+        self.drift_lock, self.state_lock = threading.Lock(), threading.Lock()
+        self.lock_state = (None, None, None)          # (doc, bytes, stamp), swapped as one
         self.lock()
         self._base = None
         self.removed: dict[str, list[str]] = {}      # tool -> the integrity rules that took it away
         self.changed: list[dict] = []                # drift found by the last applied check
         self.seen: list[dict] = []                   # the tools that check read
+        self.snap = (None, None)                     # the lockfile (doc, bytes) the last applied check used
         self.unchecked, self.checked_at = True, 0.0  # no applied check yet, or the last one failed
-        self.gen = self.applied = 0
-        self.sealed_drift: set[str] = set()
-        self.drift_lock, self.state_lock = threading.Lock(), threading.Lock()
+        self.gen = self.applied = self.floor = 0     # a check clears `unchecked` only if it began after `floor`
+        self.sealed_drift: set[tuple] = set()
 
     async def start(self) -> None:
         s = self.server
@@ -137,26 +138,38 @@ class Guard:
             self._base = Pipeline(self.ledger, "", self.cfg)
         return self._base
 
-    def lock(self) -> None:
-        """Re-read the lockfile when its mtime or size changed (`tools pin` ran, or someone edited it). A lockfile
-        that was there and is gone, or does not parse, is an error: drift cannot be measured."""
+    @property
+    def lock_doc(self):
+        return self.lock_state[0]
+
+    @property
+    def lock_bytes(self):
+        return self.lock_state[1]
+
+    def lock(self) -> tuple:
+        """The lockfile as (doc, bytes), re-read when its mtime or size changed (`tools pin` ran, or someone
+        edited it) and swapped in as one. A lockfile that was there and is gone, does not parse, or has a
+        malformed entry is an error: drift cannot be measured."""
         path = self.cfg.lockfile
         if not path:
-            return
+            return (None, None)
         try:
             st = os.stat(path)
         except FileNotFoundError:
-            if self.lock_stamp is not None:
+            if self.lock_state[2] is not None:
                 raise mcp.RpcError(mcp.SIJIL, f"Sijil: lockfile {path} is gone; tools cannot be checked")
-            return
+            return self.lock_state[:2]
         stamp = (st.st_mtime_ns, st.st_size)
-        if stamp != self.lock_stamp:
+        if stamp != self.lock_state[2]:
             try:
                 data = Path(path).read_bytes()
-                self.lock_doc = json.loads(data)
+                doc = json.loads(data)
+                integrity.validate(doc)
             except (OSError, ValueError) as e:
-                raise mcp.RpcError(mcp.SIJIL, f"Sijil: lockfile {path} is unreadable: {e}")
-            self.lock_bytes, self.lock_stamp = data, stamp
+                raise mcp.RpcError(mcp.SIJIL, f"Sijil: lockfile {path} is unreadable or malformed: {e}")
+            with self.state_lock:
+                self.lock_state = (doc, data, stamp)
+        return self.lock_state[:2]
 
     async def tools(self) -> list[dict]:
         """The tools the harness would get (allow/deny applied), all pages: the set that is pinned, checked and
@@ -191,13 +204,13 @@ class Guard:
         self.gen += 1
         gen = self.gen
         try:
-            self.lock()
+            snap = self.lock()
             tools = await self.tools()
-            changed = integrity.changes(self.lock_doc, self.server.name, tools)
+            changed = integrity.changes(snap[0], self.server.name, tools)
             p = session.pipeline if session else self.base
             removed = integrity.removed(p.pack, p.pins, changed, gone=True)
-            if session and changed and self.lock_doc is not None:
-                await asyncio.to_thread(self.seal_drift, session, changed, tools)
+            if session and changed and snap[0] is not None:
+                await asyncio.to_thread(self.seal_drift, session, changed, tools, snap)
         except Exception:
             with self.state_lock:
                 if gen > self.applied:
@@ -205,8 +218,11 @@ class Guard:
             raise
         with self.state_lock:
             if gen > self.applied:
-                self.applied, self.unchecked, self.checked_at = gen, False, time.monotonic()
-                self.removed, self.changed, self.seen = removed, changed, tools
+                self.applied, self.checked_at = gen, time.monotonic()
+                self.unchecked = self.unchecked and gen <= self.floor      # a list_changed since: not yet checked
+                self.removed, self.changed, self.seen, self.snap = removed, changed, tools, snap
+                if not changed:
+                    self.sealed_drift.clear()      # back at the baseline: a later drift to any state is new
         return tools
 
     async def fresh(self, session: "GuardSession") -> None:
@@ -214,11 +230,13 @@ class Guard:
         if self.unchecked or time.monotonic() - self.checked_at >= self.cfg.recheck_seconds:
             await self.check_tools(session)
 
-    def seal_drift(self, session: "GuardSession", changed: list[dict], tools: list[dict]) -> None:
+    def seal_drift(self, session: "GuardSession", changed: list[dict], tools: list[dict], snap: tuple) -> None:
+        """Seal under the lockfile snapshot (doc, bytes) the check used, never a fresher read."""
+        doc, data = snap
         with self.drift_lock:
-            before = sha256_hex(self.lock_bytes)
-            after = sha256_hex(integrity.render(integrity.with_server(self.lock_doc, self.server.name, tools)))
-            if after in self.sealed_drift:
+            before = sha256_hex(data)
+            after = sha256_hex(integrity.render(integrity.with_server(doc, self.server.name, tools)))
+            if (before, after) in self.sealed_drift:
                 return
             try:
                 base = self.ledger.call("GET", "/api/agent/baseline", session.agent_session, session.task_seq,
@@ -243,18 +261,20 @@ class Guard:
                         "rule_hits": v.hits, "input_hash": before, "output_hash": after,
                         "rulepack_hash": p.pack.hash, "ext": ext}
             p.seal(session.task_seq, build)
-            self.sealed_drift.add(after)
+            self.sealed_drift.add((before, after))
 
     async def upstream_note(self, method: str, params: dict) -> None:
         if method == "notifications/tools/list_changed":
             # a rug-pull mid-session is caught before the next call: checked under a live session whose task is
             # open (the first that works); with none, or when the check fails, calls are refused until one succeeds
-            self.unchecked = True
+            with self.state_lock:      # a check already under way may have read the list before the change
+                self.gen += 1
+                self.floor, self.unchecked = self.gen, True
             for s in [s for s in self.sessions if s.pipeline and not s.closed]:
                 try:
                     await self.check_tools(s)
                     break
-                except (Unreachable, Refused, mcp.RpcError) as e:
+                except Exception as e:      # any failure is a failed check: closed, logged, notification forwarded
                     print(f"sijil-guard: tool check after list_changed failed: {e}", file=sys.stderr)
             for s in list(self.sessions):
                 try:
@@ -330,9 +350,9 @@ class GuardSession(mcp.Session):
             raise mcp.RpcError(mcp.SIJIL, f"Sijil: no agent session or task: {e}")
         self.agent_session = state.agent_session
         self.pipeline = Pipeline(self.guard.ledger, state.agent_session, self.guard.cfg)
-        if g.changed and g.lock_doc is not None:
+        if g.changed and g.snap[0] is not None:
             try:
-                await asyncio.to_thread(g.seal_drift, self, g.changed, g.seen)
+                await asyncio.to_thread(g.seal_drift, self, g.changed, g.seen, g.snap)
             except (Unreachable, Refused) as e:
                 await self.close()
                 raise _ledger_error(e)

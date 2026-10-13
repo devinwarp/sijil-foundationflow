@@ -452,3 +452,87 @@ def test_integrity_recheck_seconds_is_validated(tmp_path):
         with pytest.raises(ValueError, match="recheck_seconds"):
             config.load(str(guard_yaml(tmp_path, f"integrity: {{recheck_seconds: {bad}}}\n")))
     assert config.load(str(guard_yaml(tmp_path, "integrity: {recheck_seconds: 5}\n"))).recheck_seconds == 5.0
+
+
+def test_a_check_begun_before_list_changed_cannot_clear_the_flag(env, monkeypatch):
+    client, s, cfg = env
+    fake = Fake("get_issue")
+    fake_upstream(monkeypatch, fake)
+    asyncio.run(serve.pin(cfg, "open", ledger_of(client)))
+
+    async def go():
+        g, a, h = await session(cfg, client, "open")
+        await asyncio.to_thread(ask, client, cfg, "look at the sentry error")
+        gate = asyncio.Event()
+        fake.script = [([fake.tools["get_issue"]], gate)]       # reads the list as it was, finishes late
+        slow = asyncio.create_task(g.check_tools(a))
+        await asyncio.sleep(0.05)
+        g.sessions.clear()                                      # no live session: no follow-up check
+        fake.tools["get_issue"]["description"] = RUG
+        await g.upstream_note("notifications/tools/list_changed", {})
+        gate.set()
+        await slow
+        still = g.unchecked
+        with pytest.raises(mcp.RpcError) as e:                  # the default window must not let this through
+            await call(a, "get_issue", LOOK)
+        await g.aclose()
+        return still, e.value
+    still, err = asyncio.run(go())
+    assert still is True and err.data["sijil"]["rule_hits"] == ["mcp-tool-description-changed"]
+    assert fake.called == []
+
+
+def test_a_drift_is_sealed_under_the_lockfile_the_check_used(env, monkeypatch):
+    client, s, cfg = env
+    fake = Fake("get_issue")
+    fake_upstream(monkeypatch, fake)
+    asyncio.run(serve.pin(cfg, "open", ledger_of(client)))
+
+    async def go():
+        g, a, h = await session(cfg, client, "open")
+        snap = g.lock()
+        drifted = [{**fake.tools["get_issue"], "description": RUG}]
+        changed = integrity.changes(snap[0], "open", drifted)
+        integrity.pin(cfg.lockfile, "open", [fake_tool("other")])          # `tools pin` lands before the seal
+        await asyncio.to_thread(g.seal_drift, a, changed, drifted, snap)
+        await g.aclose()
+        return snap
+    snap = asyncio.run(go())
+    assert rows(s.db_path, "type = 'integrity_drift'")[0]["input_hash"] == integrity.sha256_hex(snap[1])
+
+
+def test_a_malformed_lockfile_fails_the_check_closed_and_the_note_is_still_forwarded(env, monkeypatch, capsys):
+    client, s, cfg = env
+    fake = Fake("get_issue")
+    fake_upstream(monkeypatch, fake)
+    asyncio.run(serve.pin(cfg, "open", ledger_of(client)))
+
+    async def go():
+        g, a, h = await session(cfg, client, "open")
+        doc = json.loads(open(cfg.lockfile).read())
+        doc["entries"]["mcp:open/get_issue"] = {}
+        open(cfg.lockfile, "w").write(json.dumps(doc))
+        await g.upstream_note("notifications/tools/list_changed", {})
+        out = (g.unchecked, h.notes)
+        with pytest.raises(mcp.RpcError, match="malformed"):
+            await g.check_tools(a)
+        await g.aclose()
+        return out
+    assert asyncio.run(go()) == (True, ["notifications/tools/list_changed"])
+    assert "malformed" in capsys.readouterr().err
+
+
+def test_revert_then_redrift_is_sealed_again(env, monkeypatch):
+    client, s, cfg = env
+    fake = Fake("get_issue")
+    fake_upstream(monkeypatch, fake)
+    asyncio.run(serve.pin(cfg, "open", ledger_of(client)))
+
+    async def go():
+        g, a, h = await session(cfg, client, "open")
+        for description in (RUG, "does get_issue", RUG, RUG):
+            fake.tools["get_issue"]["description"] = description
+            await g.check_tools(a)
+        await g.aclose()
+    asyncio.run(go())
+    assert len(rows(s.db_path, "type = 'integrity_drift'")) == 2        # the repeat without a revert seals nothing

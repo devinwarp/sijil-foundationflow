@@ -58,6 +58,15 @@ def render(doc: dict) -> bytes:
     return (json.dumps(doc, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
 
 
+def validate(doc) -> None:
+    """ValueError unless doc is a lockfile this guard can compare against: an object whose entries map names to
+    objects with a string sha256."""
+    entries = doc.get("entries", {}) if isinstance(doc, dict) else None
+    if not isinstance(entries, dict) or not all(isinstance(v, dict) and isinstance(v.get("sha256"), str)
+                                                for v in entries.values()):
+        raise ValueError("entries must map names to objects with a sha256")
+
+
 def read(path: str) -> dict | None:
     try:
         return json.loads(Path(path).read_bytes())
