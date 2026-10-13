@@ -565,7 +565,10 @@ HOSTILE = [{"type": ["x"], "text": "a"}, {"type": {}}, "str", 5, {"type": "text"
 REQUESTS.update({"hostile": ("items", {"c": HOSTILE}), "nolist": ("items", {"c": {"type": "text", "text": "x"}}),
                  "emptyimg": ("items", {"c": [{"type": "text", "text": "a"}, {"type": "image", "data": ""}]}),
                  "nultext": ("items", {"c": [{"type": "text", "text": "a" + "\0" * 8}]}),
-                 "flood": ("items", {"c": [IMG600] * 3})})
+                 "flood": ("items", {"c": [IMG600] * 3}),
+                 "fatstruct": ("items", {"c": [IMG600], "s": {"v": "y" * 500}}),
+                 "thinstruct": ("items", {"c": [IMG600], "s": {"v": "ok"}}),
+                 "cutz": ("items", {"c": [IMG600, {"type": "text", "text": "z" * 500}]})})
 
 
 def session_of(cfg):
@@ -618,14 +621,14 @@ def test_fuzzed_result_shapes_never_crash_and_stay_within_the_budget(env):
         return c
     for _ in range(3000):
         raw = rng.choice([[item() for _ in range(rng.randint(0, 6))], item(), rng.choice(atoms)])
-        content = a._items(raw)
+        content, _ = a._items(raw)
         for c in content:
             fields = c.get("resource", c) if c["type"] == "resource" else c
             assert c["type"] in serve.ITEMS or c["type"] == "resource"
             assert all(isinstance(v, str) for v in fields.values())
         text = "".join(d[k] for _, _, d, k, b in a._parts(content) if not b)
         a._raw(content, text)
-        assert relayed(cfg, a._rewrite(content)) <= cfg.max_result_bytes
+        assert relayed(cfg, a._rewrite(content)[0]) <= cfg.max_result_bytes
 
 
 def test_malformed_items_become_notes_and_the_result_is_sealed(env):
@@ -646,8 +649,8 @@ def test_hash_framing_separates_text_from_payloads(env):
     hashes sha256(utf8(text)) (§2.4.2); bytes count text and payload bytes without framing."""
     client, s, cfg = env
     a = session_of(cfg)
-    img = a._items([{"type": "text", "text": "a"}, {"type": "image", "data": ""}])
-    assert a._raw(img, "a")[0] != b"a" + bytes(8) and a._raw(a._items([{"type": "text", "text": "a"}]), "a") == (None, None)
+    img, _ = a._items([{"type": "text", "text": "a"}, {"type": "image", "data": ""}])
+    assert a._raw(img, "a")[0] != b"a" + bytes(8) and a._raw(a._items([{"type": "text", "text": "a"}])[0], "a") == (None, None)
     run_calls(cfg, client, ["emptyimg", "nultext"])
     ri, rt = rows(s.db_path, "type = 'tool_result'")
     u64 = lambda v: v.to_bytes(8, "big")
@@ -662,11 +665,34 @@ def test_binary_payloads_share_one_result_budget(env):
     client, s, cfg = env
     cfg = cfg.__class__(**{**cfg.__dict__, "max_result_bytes": 1024})
     a = session_of(cfg)
-    over = a._items([{"type": "text", "text": "x" * 1024}, IMG600])
-    assert over[1] == {"type": "text", "text": "sijil-guard: image over the result budget"}
+    over, replaced = a._items([{"type": "text", "text": "x" * 1024}, IMG600])
+    assert over[1] == {"type": "text", "text": "sijil-guard: image over the result budget"} and replaced
     (got,) = run_calls(cfg, client, ["flood"])
     note = {"type": "text", "text": "sijil-guard: image over the result budget"}
     assert got["content"] == [IMG600, note, note] and relayed(cfg, got["content"]) <= 1024
     rec = json.loads(rows(s.db_path, "type = 'tool_result'")[0]["ext"])
-    assert rec["bytes"] == len("image/png") + 600 + 2 * len(note["text"])
+    assert rec["bytes"] == len("image/png") + 600 + 2 * len(note["text"]) and rec["truncated"] is True
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_structured_content_shares_the_one_result_budget(env):
+    """Concern 2: structuredContent gets only what the content left of the budget; dropped, it is recorded."""
+    client, s, cfg = env
+    cfg = cfg.__class__(**{**cfg.__dict__, "max_result_bytes": 1024})
+    big, small = run_calls(cfg, client, ["fatstruct", "thinstruct"])
+    assert "structuredContent" not in big and small["structuredContent"] == {"v": "ok"}
+    assert relayed(cfg, big["content"]) + len(json.dumps(small["structuredContent"])) <= 1024
+    rb, rs = (json.loads(r["ext"]) for r in rows(s.db_path, "type = 'tool_result'"))
+    assert rb["truncated"] is True and "truncated" not in rs
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_truncated_is_recorded_when_payloads_use_the_budget(env):
+    """Concern 3: a text cut only because an image used the budget is recorded as truncated."""
+    client, s, cfg = env
+    cfg = cfg.__class__(**{**cfg.__dict__, "max_result_bytes": 1024})
+    got, whole = run_calls(cfg, client, ["cutz", "emptyimg"])
+    assert got["content"][1]["text"] == "z" * (1024 - 600 - len("image/png"))
+    rc, rw = (json.loads(r["ext"]) for r in rows(s.db_path, "type = 'tool_result'"))
+    assert rc["truncated"] is True and "truncated" not in rw
     assert verify(s.db_path, s.pubkey_path)[0] == 0

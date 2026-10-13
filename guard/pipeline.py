@@ -164,15 +164,16 @@ class Pipeline:
 
     def result(self, call: Call, sealed: Sealed, text: str, status: str, content_types: list[str],
                source_label: str, raw: bytes | None = None, http_status: int | None = None,
-               truncate: bool = True, size: int | None = None) -> Result:
+               truncate: bool = True, size: int | None = None, cut: bool = False) -> Result:
         """Seal the tool_result. output_hash and bytes commit to what arrived, before any stripping (§2.4.2).
-        `raw` replaces the text as the hash input and `size` its byte count, when the caller frames more."""
+        `raw` replaces the text as the hash input and `size` its byte count, when the caller frames more; `cut`
+        says the caller cut or replaced part of the result for the budget, so it is recorded as truncated."""
         with _refusals():
             return self._result(call, sealed, text, status, content_types, source_label, raw, http_status, truncate,
-                                size)
+                                size, cut)
 
     def _result(self, call, sealed, text, status, content_types, source_label, raw, http_status, truncate,
-                size) -> Result:
+                size, cut) -> Result:
         data = raw if raw is not None else text.encode("utf-8", "surrogatepass")
         scan = unicode.scan(text)
         mode_u = self.cfg.invisible_unicode if scan["found"] else "none"
@@ -188,7 +189,7 @@ class Pipeline:
               **({"codepoints": scan["codepoints"]} if scan["found"] else {})}
         ext = {"tool": call.tool, "server": call.server, "status": status, "bytes": len(data) if size is None else size,
                "content_types": sorted(set(content_types)), "invisible_unicode": iu,
-               **({"exec_hints": hints} if hints else {}), **({"truncated": True} if truncated else {}),
+               **({"exec_hints": hints} if hints else {}), **({"truncated": True} if truncated or cut else {}),
                **({"http_status": http_status} if http_status is not None else {})}
         body = {}
 

@@ -220,16 +220,20 @@ class GuardSession(mcp.Session):
             result = await self.guard.upstream.request("tools/call", {**params, "arguments": args})
         except mcp.RpcError as e:      # the call reached the wrapped server: its failure is still a result
             result, failed = {"content": [{"type": "text", "text": e.message}], "isError": True}, e
-        content = self._items(result.get("content"))
+        content, replaced = self._items(result.get("content"))
         text = "".join(d[k] for _, _, d, k, binary in self._parts(content) if not binary)
         structured = result.get("structuredContent")
         if structured is not None:      # part of the result: sealed, scanned and bounded like the text
             text += json.dumps(structured, ensure_ascii=False, sort_keys=True)
         is_error = result.get("isError") is True
         raw, size = self._raw(content, text)
+        types = [c["type"] for c in content]
+        # what the harness gets, cleaned before the seal so the record says whether the budget cut anything
+        content, left, cut = self._rewrite(content)
+        clean, dropped = self._clean(structured, left) if structured is not None else (None, False)
         try:
             r = await asyncio.to_thread(self.pipeline.result, call, sealed, text, "error" if is_error else "ok",
-                                        [c["type"] for c in content], s.label, raw, size=size)
+                                        types, s.label, raw, size=size, cut=replaced or cut or dropped)
         except (Unreachable, Refused, Refusal) as e:      # fail closed: the result is withheld unsealed
             raise _ledger_error(e)
         if r.blocked:
@@ -238,35 +242,34 @@ class GuardSession(mcp.Session):
                                {"sijil": {"seq": r.seq, "rule_hits": r.hits}})
         if failed:      # message only, as sealed (stripped, truncated); the server's `data` is not relayed
             raise mcp.RpcError(_code(failed.code), r.text)
-        content = self._rewrite(content)
         out = {"content": content}      # only these keys reach the harness; upstream _meta and the rest are dropped
-        if structured is not None and (clean := self._clean(structured)) is not None:
+        if clean is not None:
             out["structuredContent"] = clean
         if is_error:
             out["isError"] = True
         return {**out, "_meta": {"sijil": {"seq": r.seq, "parent_seq": sealed.seq}}}
 
-    def _clean(self, value):
-        """structuredContent after the same treatment as the text: stripped, or dropped when over the budget."""
-        cfg = self.guard.cfg
+    def _clean(self, value, budget: int) -> tuple:
+        """structuredContent after the same treatment as the text: stripped, or dropped when over what is left of
+        the result budget after the content. (value or None, dropped for the budget)."""
         raw = json.dumps(value, ensure_ascii=False)
-        if cfg.invisible_unicode == "strip":
+        if self.guard.cfg.invisible_unicode == "strip":
             raw = unicode.strip(raw)
-        if len(raw.encode("utf-8", "surrogatepass")) > cfg.max_result_bytes:
-            return None
+        if len(raw.encode("utf-8", "surrogatepass")) > budget:
+            return None, True
         try:
-            return json.loads(raw)
+            return json.loads(raw), False
         except ValueError:
-            return None
+            return None, False
 
-    def _items(self, raw) -> list:
+    def _items(self, raw) -> tuple[list, bool]:
         """Each content item rebuilt from the allowlist for its type; _meta, annotations and unknown keys are
         dropped. Every upstream value is shape-checked: a `content` that is not a list, an item that is not an
         object, a type that is not a known string, an allowlisted field that is not a string, a text item without
         text, an image or audio item without data, or a payload that is not base64 becomes a text item saying so. One result budget covers the strings and the decoded payloads in
         item order; a binary item past it becomes a text item saying that. A payload is relayed re-encoded, so
-        the harness gets exactly the bytes that are hashed."""
-        limit, used, out = self.guard.cfg.max_result_bytes, 0, []
+        the harness gets exactly the bytes that are hashed. (items, whether the budget replaced any)."""
+        limit, used, out, replaced = self.guard.cfg.max_result_bytes, 0, [], False
         for c in raw if isinstance(raw, list) else [] if raw is None else [None]:
             c = c if isinstance(c, dict) else {}
             kind = c.get("type") if isinstance(c.get("type"), str) else None
@@ -284,13 +287,13 @@ class GuardSession(mcp.Session):
                 size = _size(item)
             elif blobs and used + size > limit:
                 item = _note(f"{kind} over the result budget")
-                size = _size(item)
+                size, replaced = _size(item), True
             else:
                 fields.update({k: base64.b64encode(b).decode("ascii") for k, b in blobs.items()})
                 item = {"type": kind, "resource": fields} if kind == "resource" else {"type": kind, **fields}
             used += size
             out.append(item)
-        return out
+        return out, replaced
 
     def _raw(self, content: list, text: str) -> tuple[bytes | None, int | None]:
         """The pipeline's hash input and byte count. A text-only result is left to the pipeline: output_hash is
@@ -326,18 +329,19 @@ class GuardSession(mcp.Session):
             found += [(n, c, holder, k, True) for k in binary if k in holder]
         return found
 
-    def _rewrite(self, content: list) -> list:
+    def _rewrite(self, content: list) -> tuple[list, int, bool]:
         """Strip and truncate every sealed string, in order, as the pipeline did the whole text. Decoded
-        payloads draw on the same budget; _items already kept them within it."""
-        cfg, budget = self.guard.cfg, self.guard.cfg.max_result_bytes
+        payloads draw on the same budget; _items already kept them within it. (content, budget left, cut)."""
+        cfg, budget, cut = self.guard.cfg, self.guard.cfg.max_result_bytes, False
         for _, _, d, k, binary in self._parts(content):
             if binary:
                 budget -= len(base64.b64decode(d[k]))
                 continue
             t = unicode.strip(d[k]) if cfg.invisible_unicode == "strip" else d[k]
             b = t.encode("utf-8", "surrogatepass")
+            cut = cut or len(b) > budget
             d[k], budget = b[:max(budget, 0)].decode("utf-8", "ignore"), budget - len(b)
-        return content
+        return content, budget, cut
 
     async def close(self) -> None:
         if self.closed:
