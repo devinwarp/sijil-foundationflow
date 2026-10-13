@@ -1,0 +1,333 @@
+"""The Azure AI Foundry Responses relay (spec §17.4): the model door for Foundry prompt agents. BSL.
+
+`POST /v1/responses` is forwarded to the Foundry project under the ledger's own Entra token, never the user's.
+Each Foundry conversation is one task of the relay agent (registered `auth: relay` at startup, §17.4.5) and each
+round trip one `inference`. With `require_approval: always` Foundry asks before it calls an MCP tool: the relay is
+that approval gate (rule pack, budgets, named approval) and answers Foundry itself with `mcp_approval_response`;
+the portal never sees the round trip. Server-side tool calls that Foundry reports without asking are sealed after
+the fact (§17.4.4): recorded, never enforced.
+"""
+
+import json
+import os
+import re
+from collections import Counter
+from urllib.parse import urlsplit
+
+import httpx
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
+
+from guard import rules as guard_rules, unicode    # Apache-2.0: the rule engine the guard runs
+from guard.cmdparse import Roots
+from guard.pipeline import exec_hints
+
+from . import agents, approvals, budgets, chat, oidc, policy, record
+
+API = "foundry_responses"
+ROUNDS = 8                                   # approval round trips per user turn
+ROOTS = Roots("/", "/", "/")                 # a relay has no workspace: path rules see absolute paths only
+
+
+def cj(obj) -> str:
+    return record.canonical_json(obj).decode()
+
+
+def server_label(item: dict) -> str:
+    """Foundry's server_label as a source-label name: [a-z0-9_-]{1,32} (§17.1)."""
+    name = re.sub(r"[^a-z0-9_-]", "-", str(item.get("server_label", "")).lower())[:32]
+    return name or "foundry"
+
+
+def tool_of(item: dict) -> tuple[str, str, str, str, dict]:
+    """(tool, server, qualified, source_label, arguments) of a server-side tool item."""
+    if item.get("type") in ("mcp_call", "mcp_approval_request"):
+        label, name = server_label(item), str(item.get("name", ""))
+        try:
+            args = json.loads(item.get("arguments") or "{}")
+        except ValueError:
+            args = {"_raw": item.get("arguments")}
+        return name, label, f"mcp:{label}:{name}", f"mcp:{label}", args if isinstance(args, dict) else {"body": args}
+    kind = str(item.get("type"))
+    action = item.get("action") if isinstance(item.get("action"), dict) else {}
+    return kind, "foundry", f"foundry:{kind}", "web" if kind == "web_search_call" else "mcp:foundry", action
+
+
+def output_text(data: dict) -> str:
+    return "".join(c.get("text", "") for item in data.get("output", []) if item.get("type") == "message"
+                   for c in item.get("content") or [] if c.get("type") == "output_text" and isinstance(c.get("text"), str))
+
+
+def guard_pack(n):
+    """The rule pack in force, as the guard's engine reads it (same file, same hash)."""
+    if n.rulepack is None:
+        return None
+    if getattr(n, "_guard_pack", None) is None or n._guard_pack.hash != n.rulepack.hash:
+        n._guard_pack = guard_rules.load(n.rulepack.path)
+    return n._guard_pack
+
+
+def verdict(n, task: dict, tool: str, args: dict, before_seq: int) -> guard_rules.Verdict:
+    pack = guard_pack(n)
+    if pack is None:
+        return guard_rules.Verdict([], "allow")
+    labels = sorted({r["source_label"] for r in n.store.in_task(task["seq"])
+                     if r["type"] == "tool_result" and r["seq"] < before_seq})
+    facts, _ = guard_rules.call_facts(tool, tool.rsplit(":", 1)[-1], args, ROOTS, "foundry", context_labels=labels)
+    return guard_rules.evaluate(pack, facts, guard_rules.Pins())
+
+
+async def register(n) -> None:
+    """Startup: the Foundry agent is registered once, auth relay (§17.4.5)."""
+    cfg = n.policy.foundry
+    if cfg is None or cfg.agent_id in n.agents.agents:
+        return
+    x = {"auth": "relay", "registered_by": cfg.registered_by, "principal_auth": "key", "id_form": "spiffe",
+         "relay_binding": {"platform": "foundry", "endpoint_host": urlsplit(cfg.endpoint).hostname,
+                           "agent_name": cfg.agent_name}}
+    await agents.seal_agent(n, "agent_register", cfg.agent_id, cfg.registered_by, "", x,
+                            check=lambda: n.agents.unregistered(cfg.agent_id))
+
+
+async def seal_in(n, task: dict, body) -> dict:
+    """Seal a record of the conversation's task; a task that ended meanwhile is not written into."""
+    def build() -> dict:
+        if n.store.task_ended(task["seq"]):
+            raise HTTPException(409, "the conversation's task ended")
+        return body() if callable(body) else body
+    return await n.seal(build)
+
+
+def in_task(n, task: dict, type_: str, **fields) -> dict:
+    return n.body(n.policy, type_, agent_id=task["agent_id"], principal=task["principal"], task_seq=str(task["seq"]),
+                  **fields)
+
+
+async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict):
+    """One Responses round trip, sealed as one inference (§17.4.3). Returns (record, response) or a refusal."""
+    pol, token = n.policy, os.environ.get(cfg.token_env, "")
+    if not token:
+        raise HTTPException(503, f"the relay's Entra token is not set ({cfg.token_env})")
+    given = req.get("input")
+    messages = [{"content": given}] if isinstance(given, str) else [i for i in given or [] if isinstance(i, dict)]
+    decision, mode, hits = policy.evaluate(pol, n.region, "", messages, skip=("model_allowlist",))
+    if n.halted:
+        decision, mode, hits = "block", "enforce", [policy.HALT_HIT]
+    else:
+        exceeded = budgets.evaluate(n.rulepack, n.store, task, "inference")[1]
+        if exceeded:
+            decision, mode, hits = "block", "enforce", hits + exceeded
+    # a refreshed token in the conversation is sealed once, as on the model door (§17.2.8)
+    claims = {} if n.store.token_in_force(task["seq"]) == human["claims"]["token_hash"] else \
+        {"principal_claims": human["claims"]}
+    base = in_task(n, task, "inference", model_id=cfg.agent_name, mode=mode, decision=decision,
+                   rule_hits=policy.rule_hits_json(hits), input_hash=record.sha256_hex(record.canonical_json(given)),
+                   ext=cj({"api": API, "session_id": conv_hash, **claims}))
+
+    def settled(b: dict):
+        return lambda: b if policy.HALT_HIT in json.loads(b["rule_hits"]) else budgets.inference(n, task, b)
+
+    def refused(rec: dict, status: int, kind: str) -> JSONResponse:
+        return JSONResponse(status_code=status, headers={"X-Sijill-Seq": str(rec["seq"])}, content={
+            "error": {"type": kind, "message": "Refused by Sijil"},
+            "sijill": {"seq": rec["seq"], "decision": rec["decision"], "rule_hits": json.loads(rec["rule_hits"])}})
+    if decision == "block":
+        return refused(await seal_in(n, task, settled(base)), 403, "policy_block"), None
+    # forwarded, so priced like any forwarded request: no usage reported means missing_usage_cost_micro
+    failed = {**base, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]),
+              "ext": cj({**json.loads(base["ext"]), **budgets.cost(n.rulepack, f"api:azure-foundry:{cfg.agent_name}", None)})}
+    try:
+        resp = await n.foundry.post("/responses", json=req, headers={"Authorization": f"Bearer {token}"})
+        status, data = resp.status_code, resp.json() if resp.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        status, data = 502, None
+    if not isinstance(data, dict) or not isinstance(data.get("output"), list):
+        return refused(await seal_in(n, task, settled(failed)), 502 if status == 200 else status, "upstream_error"), None
+    model = data["model"] if isinstance(data.get("model"), str) and chat.MODEL.fullmatch(data["model"]) \
+        else cfg.agent_name
+    digest = f"api:azure-foundry:{model}"
+    post = policy.evaluate(pol, n.region, digest, messages)
+    items = [i for i in data["output"] if isinstance(i, dict)]
+    uses = []
+    for i in items:
+        kind = str(i.get("type"))
+        if kind == "function_call":              # executed by the portal; its call_id is what it sends back
+            uses.append(chat.tool_use(i.get("call_id"), i.get("name"), i.get("arguments", "")))
+        elif kind == "mcp_approval_request" or (kind.endswith("_call") and kind != "mcp_call") or \
+                (kind == "mcp_call" and not i.get("approval_request_id")):
+            # a gated request, or a call Foundry ran without asking: the parent of its tool_call (Ruling)
+            tool, _, qualified, _, args = tool_of(i)
+            uses.append({"id": str(i.get("id", "")), "name": qualified.split(":", 1)[1] if kind.startswith("mcp")
+                         else tool, "args_hash": record.sha256_hex(record.canonical_json(args))})
+    u = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    usage = {k: u[k] for k in ("input_tokens", "output_tokens")} if all(type(u.get(k)) is int for k in
+                                                                        ("input_tokens", "output_tokens")) else None
+    x = {"api": API, "attestation": "api", "request_hash": record.sha256_hex(record.canonical_json(req)),
+         "system_hash": "", "response_hash": record.sha256_hex(resp.content), "provider_request_id": str(data.get("id", "")),
+         "stop_reason": str(data.get("status", "")), "tool_uses": uses, "session_id": conv_hash,
+         "foundry": {"endpoint_host": urlsplit(cfg.endpoint).hostname, "agent_name": cfg.agent_name,
+                     "agent_version": str((data.get("agent") or {}).get("version", "")) if isinstance(data.get("agent"), dict) else "",
+                     "response_id": str(data.get("id", "")), "previous_response_id": str(req.get("previous_response_id") or ""),
+                     "conversation_hash": conv_hash, "items": dict(Counter(str(i.get("type")) for i in items))},
+         **budgets.cost(n.rulepack, digest, usage)}
+    sealed = {**base, "model_id": model, "model_digest": digest, "decision": post[0], "mode": post[1],
+              "rule_hits": policy.rule_hits_json(post[2]), "output_hash": record.output_hash(output_text(data)),
+              "ext": cj(x)}
+    if post[0] == "block":         # Foundry answered, but not with an approved model: the answer is withheld
+        return refused(await seal_in(n, task, settled({**sealed, "output_hash": ""})), 403, "policy_block"), None
+    rec = await seal_in(n, task, settled(sealed))
+    if rec["decision"] == "block":
+        return refused(rec, 403, "policy_block"), None
+    n.store.index_tool_uses(rec["seq"], uses)
+    return rec, data
+
+
+async def gate(n, task: dict, inference: dict, item: dict, conv_hash: str) -> tuple[int, bool]:
+    """An mcp_approval_request: the model's tool request, evaluated as a tool_call before Foundry runs it
+    (§17.4.2). Returns (tool_call seq, approve)."""
+    tool, server, qualified, _, args = tool_of(item)
+    args_hash = record.sha256_hex(record.canonical_json(args))
+    v = verdict(n, task, qualified, args, inference["seq"])
+    _, over, on_exceed = budgets.evaluate(n.rulepack, n.store, task, "tool_call", qualified)
+    action = max([v.action, *([on_exceed] if over else [])], key=guard_rules.ACTIONS.index)
+    confirmation, decided = None, {}
+    if action == "confirm":
+        try:
+            p = await approvals.request_approval(n, None, task, {
+                "parent_seq": str(inference["seq"]), "correlation": "tool_use_id", "tool": tool, "server": server,
+                "qualified": qualified, "input_hash": args_hash, "arg_keys": sorted(args),
+                "rule_hits": [r.id for r in v.fired if r.action == "confirm"] + over})
+        except HTTPException:
+            confirmation = "unavailable"
+        else:
+            await p.event.wait()                   # the ledger's own timer seals the timeout
+            confirmation = "granted" if p.outcome == "granted" else "denied"
+            decided = {"approval_seq": p.decision_seq}
+    decision, mode = guard_rules.outcome(action, confirmation)
+    hits = [*v.hits, *over]
+    ext = {"harness": "foundry", "session_id": conv_hash, "tool": tool, "server": server, "qualified": qualified,
+           "tool_use_id": str(item.get("id")), "correlation": "tool_use_id", "observed_by": "foundry_relay",
+           "foundry_item_id": str(item.get("id")), "summary": {"arg_keys": sorted(args)},
+           **({"confirmation": confirmation} if confirmation else {}), **decided}
+    body = in_task(n, task, "tool_call", parent_seq=str(inference["seq"]), mode=mode, decision=decision,
+                   rule_hits=policy.rule_hits_json(hits), input_hash=args_hash, ext=cj(ext))
+    def build() -> dict:
+        if n.halted:                              # the operator halt stops the relay too; a blocked call consumes no grant
+            halted = {k: v for k, v in ext.items() if k not in ("approval_seq", "budget")}
+            return {**body, "mode": "enforce", "decision": "block", "rule_hits": policy.rule_hits_json(
+                [*(h for h in hits if not h.startswith("budget:")), policy.HALT_HIT]),
+                "ext": cj({**halted, **({"confirmation": "denied"} if "approval_seq" in ext else {})})}
+        if "approval_seq" in ext:                 # what the verifier's V2 and V3 would refuse
+            agents.check_approval(n.store, body, ext)
+        return budgets.stamp(n, task, body, ext, hits, confirmation == "granted")
+    rec = await seal_in(n, task, build)
+    return rec["seq"], rec["decision"] != "block"
+
+
+async def after_the_fact(n, task: dict, inference: dict, item: dict, conv_hash: str) -> None:
+    """A server-side tool call Foundry ran without asking: sealed as reported, at most flag (§17.4.4)."""
+    tool, server, qualified, label, args = tool_of(item)
+    v = verdict(n, task, qualified, args, inference["seq"])
+    ext = {"harness": "foundry", "session_id": conv_hash, "tool": tool, "server": server, "qualified": qualified,
+           "tool_use_id": str(item.get("id")), "correlation": "tool_use_id", "observed_by": "foundry_relay",
+           "foundry_item_id": str(item.get("id")), "after_the_fact": True, "summary": {"arg_keys": sorted(args)}}
+    rec = await seal_in(n, task, in_task(n, task, "tool_call", parent_seq=str(inference["seq"]),
+                                         decision="flag" if v.hits else "allow", rule_hits=policy.rule_hits_json(v.hits),
+                                         input_hash=record.sha256_hex(record.canonical_json(args)), ext=cj(ext)))
+    await result(n, task, rec["seq"], item, qualified, tool, server, label)
+
+
+async def result(n, task: dict, call_seq: int, item: dict, qualified: str, tool: str, server: str, label: str) -> None:
+    """The output Foundry reports for a tool call. The model inside Foundry has already read it, so it is recorded
+    and flagged, never withheld."""
+    out = item.get("output")
+    text = out if isinstance(out, str) else "" if out is None else json.dumps(out, sort_keys=True)
+    scan, hints = unicode.scan(text), exec_hints(text)
+    pack = guard_pack(n)
+    v = guard_rules.evaluate(pack, guard_rules.Facts("tool_result", tool=qualified, harness="foundry", source_label=label,
+                                                     invisible_unicode=scan["found"], exec_hints=hints),
+                             guard_rules.Pins()) if pack else guard_rules.Verdict([], "allow")
+    ext = {"tool": tool, "server": server, "status": "error" if item.get("error") else "ok",
+           "bytes": len(text.encode("utf-8", "surrogatepass")), "content_types": ["text"],
+           "invisible_unicode": {"found": scan["found"], "count": scan["count"], "action": "none",
+                                 **({"codepoints": scan["codepoints"]} if scan["found"] else {})},
+           **({"exec_hints": hints} if hints else {})}
+    await seal_in(n, task, in_task(n, task, "tool_result", parent_seq=str(call_seq), source_label=label,
+                                   decision="flag" if v.hits else "allow", rule_hits=policy.rule_hits_json(v.hits),
+                                   output_hash=record.sha256_hex(text.encode("utf-8", "surrogatepass")), ext=cj(ext)))
+
+
+def router() -> APIRouter:
+    r = APIRouter()
+
+    @r.post("/v1/responses")
+    async def responses(request: Request):
+        n = request.app.state.node
+        cfg = n.policy.foundry
+        if cfg is None:
+            raise HTTPException(404, "the Foundry relay is not configured (policy.yaml foundry:)")
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = None
+        conv = payload.get("conversation") if isinstance(payload, dict) else None
+        conv = conv.get("id") if isinstance(conv, dict) else conv
+        if not isinstance(conv, str) or not conv or "input" not in payload:
+            raise HTTPException(400, "the body needs input and conversation: one task per Foundry conversation")
+        conv_hash = record.sha256_hex(conv.encode())
+        sid = "fr_" + conv_hash[:32]                 # the relay's agent session for this conversation (not evidence)
+        sess = n.store.session(sid)
+        if sess is not None and sess["expires_at"] <= oidc.ts_at(agents.clock()):
+            raise HTTPException(409, "this conversation's relay session expired: start a new conversation")
+        task = (n.store.open_tasks(sid) or [None])[0] if sess else None
+        try:
+            human = await n.human(request, task, n.settings.upstream_timeout)
+            if human is None:
+                raise oidc.OidcError("missing")
+        except oidc.OidcError as e:              # sealed outside any task, like the model door (§17.2.7)
+            hit = oidc.hit(e.code)
+            rec = await n.seal(n.body(n.policy, "inference", model_id=cfg.agent_name, mode="enforce", decision="block",
+                                      rule_hits=policy.rule_hits_json([hit]), agent_id=cfg.agent_id, principal=e.principal,
+                                      input_hash=record.sha256_hex(record.canonical_json(payload["input"])),
+                                      ext=cj({"principal_error": e.code})))
+            return JSONResponse(status_code=e.status, headers={"X-Sijill-Seq": str(rec["seq"])}, content={
+                "error": {"type": "principal_refused", "code": hit}, "sijill": {"seq": rec["seq"], "rule_hits": [hit]}})
+        if sess is None:
+            n.store.add_session({"agent_session": sid, "agent_id": cfg.agent_id, "principal": human["principal"],
+                                 "agent_auth": "relay", "principal_auth": "oidc", "remote_addr": "foundry-relay",
+                                 "expires_at": oidc.ts_at(agents.clock() + n.policy.agents.session_ttl_s), "jti": ""})
+        if task is None:
+            x = {"intent_hash": conv_hash, "harness": "foundry", "session_id": conv_hash, "repo": "", "commit": "",
+                 "lockfile_hash": "", "delegated_from": "", "agent_auth": "relay", "principal_auth": "oidc",
+                 "agent_session": sid, "principal_claims": human["claims"]}
+
+            def start() -> dict:
+                n.agents.active(cfg.agent_id)
+                return n.body(n.policy, "task_start", agent_id=cfg.agent_id, principal=human["principal"],
+                              input_hash=conv_hash, ext=cj(x))
+            task = await n.seal(start)
+        req, gated, data, rec = dict(payload), {}, None, None
+        for _ in range(ROUNDS):
+            rec, data = await round_trip(n, cfg, task, req, conv_hash, human)
+            if data is None:
+                return rec
+            answers = []
+            for item in (i for i in data["output"] if isinstance(i, dict)):
+                kind = str(item.get("type"))
+                if kind == "mcp_call" and item.get("approval_request_id") in gated:
+                    tool, server, qualified, label, _ = tool_of(item)
+                    await result(n, task, gated.pop(item["approval_request_id"]), item, qualified, tool, server, label)
+                elif kind == "mcp_approval_request":
+                    seq, approve = await gate(n, task, rec, item, conv_hash)
+                    gated[item.get("id")] = seq
+                    answers.append({"type": "mcp_approval_response", "approve": approve,
+                                    "approval_request_id": item.get("id")})
+                elif kind not in ("message", "reasoning", "function_call") and kind.endswith("_call"):
+                    await after_the_fact(n, task, rec, item, conv_hash)
+            if not answers:
+                break
+            req = {**{k: v for k, v in payload.items() if k not in ("input", "conversation")},
+                   "previous_response_id": data.get("id"), "input": answers}
+        return JSONResponse(content=data, headers={"X-Sijill-Seq": str(rec["seq"])})
+
+    return r
