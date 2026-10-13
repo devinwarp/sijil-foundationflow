@@ -26,7 +26,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from . import agents, approvals, chat, keys, oidc, policy, record, rulepack
+from . import agents, approvals, budgets, chat, keys, oidc, policy, record, rulepack
 from .digest import DigestResolver
 from .store import Store
 
@@ -271,6 +271,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
     app.include_router(agents.router(require_admin))
     app.include_router(approvals.router())
+    app.include_router(budgets.router())
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
@@ -340,6 +341,10 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         decision, mode, hits = policy.evaluate(pol, region, digest, payload["messages"], skip=skip)
         if n.halted:
             decision, mode, hits = "block", "enforce", [policy.HALT_HIT]
+        elif task is not None:   # model spend is post-paid: admitted while the task is under budget (§17.6.2)
+            exceeded = budgets.evaluate(n.rulepack, n.store, task, "inference")[1]
+            if exceeded:
+                decision, mode, hits = "block", "enforce", hits + exceeded
         body = n.body(pol, "inference", model_id=model_id, model_digest=digest, mode=mode, decision=decision,
                       rule_hits=policy.rule_hits_json(hits), input_hash=input_hash, ext=ext(), **who)
 
@@ -359,8 +364,16 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     return {**b, "task_seq": "", "agent_id": sess["agent_id"],
                             "principal": human["principal"] if human is not None else sess["principal"],
                             "ext": record.canonical_json(x).decode() if x else ""}
+                if b["task_seq"] and policy.HALT_HIT not in json.loads(b["rule_hits"]):
+                    return budgets.inference(n, task, b)      # counted under the lock (check W)
                 return b
             return build
+
+        def usage(u) -> dict | None:
+            """Chat completions usage as {input_tokens, output_tokens} (§17.6.2)."""
+            if isinstance(u, dict) and all(type(u.get(k)) is int for k in ("prompt_tokens", "completion_tokens")):
+                return {"input_tokens": u["prompt_tokens"], "output_tokens": u["completion_tokens"]}
+            return None
 
         def answered(model) -> tuple[dict, list[str]] | None:
             """api mode: digest and post-call evaluation for the model the provider says answered."""
@@ -389,7 +402,10 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
         t1 = perf_counter()
         if payload.get("stream"):
-            req = n.client.build_request("POST", "/chat/completions", json={**payload, "model": model_id})
+            forward = {**payload, "model": model_id}
+            if n.rulepack and n.rulepack.pricing:     # the cost needs the usage the last chunk carries
+                forward["stream_options"] = {**(payload.get("stream_options") or {}), "include_usage": True}
+            req = n.client.build_request("POST", "/chat/completions", json=forward)
             try:
                 resp = await n.client.send(req, stream=True)
             except httpx.HTTPError as e:
@@ -407,7 +423,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
             async def relay():
                 parts, calls, relayed = [], chat.StreamCalls(), hashlib.sha256()
-                done, errored, refused, post, finish, rec = False, False, False, None, "", None
+                done, errored, refused, post, finish, rec, spent = False, False, False, None, "", None, None
                 try:
                     async for line in resp.aiter_lines():
                         if n.halted:  # operator halt lands mid-stream: stop relaying now
@@ -422,6 +438,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                                 event = None
                             if isinstance(event, dict) and "error" in event:
                                 errored = True  # in-stream failure (vLLM), even if [DONE] follows
+                            if isinstance(event, dict) and event.get("usage"):
+                                spent = usage(event["usage"])
                             if api and post is None and isinstance(event, dict) and event.get("model"):
                                 # An empty or absent model (Azure's leading prompt-filter chunk) does not latch.
                                 post = answered(event["model"])
@@ -454,9 +472,10 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     uses = calls.tool_uses()
                     ok = done and not errored and not halted and not (api and post is None)
                     if ok:
+                        answered_by = post[0]["model_digest"] if post else digest
                         sealed = {**body, "output_hash": record.output_hash("".join(parts)), **(post[0] if post else {}),
                                   "ext": ext(response_hash=relayed.hexdigest(), stop_reason=str(finish),
-                                             tool_uses=uses)}
+                                             tool_uses=uses, **budgets.cost(n.rulepack, answered_by, spent))}
                     elif halted:
                         # The halt is checked before each line is relayed, so `parts` is exactly the content
                         # already delivered. Hash it like a completed stream; nothing delivered keeps "".
@@ -520,14 +539,18 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                                 "type": UPSTREAM_ERROR_TYPE}}, upstream_ms)
 
         uses = chat.tool_uses(message)
+        answered_by = post[0]["model_digest"] if post else digest
         sealed = {**body, "output_hash": record.output_hash(text), **(post[0] if post else {}),
                   "ext": ext(response_hash=record.sha256_hex(resp.content),
                              provider_request_id=resp.headers.get("x-request-id", ""),
-                             stop_reason=str(choice.get("finish_reason") or ""), tool_uses=uses)}
+                             stop_reason=str(choice.get("finish_reason") or ""), tool_uses=uses,
+                             **budgets.cost(n.rulepack, answered_by, usage(data.get("usage"))))}
         if post and post[0]["decision"] == "block":
             # The provider answered, but not with an approved model: the answer is withheld.
             return blocked(await n.seal(settled({**sealed, "output_hash": ""})), post[1], upstream_ms)
         rec = await n.seal(settled(sealed))
+        if rec["decision"] == "block":   # a concurrent call of the task spent the budget first: withheld
+            return blocked(rec, json.loads(rec["rule_hits"]), upstream_ms)
         n.store.index_tool_uses(rec["seq"], uses)
         return JSONResponse(content=data, headers=headers(rec, upstream_ms))
 
