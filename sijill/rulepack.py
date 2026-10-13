@@ -75,6 +75,11 @@ class RulePack:
     def actions(self) -> dict[str, str]:
         return {r["id"]: r["action"] for r in self.rules}
 
+    def confirm_hits(self, hits: list[str]) -> list[str]:
+        """The hits a named approver answers: confirm rules of this pack, and excesses of its confirm budgets."""
+        actions, budgets = self.actions(), {b.id for b in self.budgets if b.on_exceed == "confirm"}
+        return [h for h in hits if actions.get(h) == "confirm" or (h.startswith("budget:") and h.split(":")[1] in budgets)]
+
     def route(self, hits: list[str]) -> Route | None:
         """The first hitl route with a glob matching any of the hits (spec §17.5.1)."""
         routes = self.hitl.routes if self.hitl else ()

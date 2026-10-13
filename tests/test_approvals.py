@@ -238,6 +238,9 @@ def test_a_grant_must_cite_a_grant_for_this_task_and_call(tmp_path):
         hdr = {"X-Sijil-Agent-Session": sess["agent_session"]}
         r = client.post("/api/agent/seal", json=body, headers=hdr)          # a grant with no citation
         assert r.status_code == 409 and "must cite its approval_seq" in r.text
+        bare = {**body, "ext": {k: v for k, v in ext.items() if k != "confirmation"}}
+        r = client.post("/api/agent/seal", json=bare, headers=hdr)          # the confirm hit, no confirmation at all
+        assert r.status_code == 409 and "must cite its approval_seq" in r.text
         assert seal_call(client, sess, parent, call_id, 10 ** 6).status_code == 400    # not a decision at all
         assert seal_call(client, sess, parent, call_id, seq - 1).status_code == 400    # the request, not the decision
         assert seal_call(client, sess, parent, call_id, seq).status_code == 200

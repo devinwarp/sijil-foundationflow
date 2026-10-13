@@ -464,10 +464,11 @@ def router(require_admin) -> APIRouter:
             check_parent(n.store, body, x)
             if t == "tool_call" and "approval_seq" in x:
                 check_approval(n.store, body, x)
-            elif t == "tool_call" and "confirmation" in x and x["confirmation"] not in ("denied", "unavailable") \
-                    and n.rulepack is not None and n.rulepack.hitl is not None \
-                    and n.rulepack.hitl.channel == "entra" and n.rulepack.route(hits) is not None:
-                raise HTTPException(409, "a grant under the entra channel must cite its approval_seq")
+            elif t == "tool_call" and body["decision"] != "block" and n.rulepack is not None \
+                    and n.rulepack.hitl is not None and n.rulepack.hitl.channel == "entra" \
+                    and (x.get("confirmation") == "granted" or n.rulepack.confirm_hits(hits)):
+                # keyed on the hits, not on `confirmation`, which a caller may leave out
+                raise HTTPException(409, "a confirm hit under the entra channel must cite its approval_seq")
             if task is not None and t in ("tool_call", "egress") and not halted:
                 return budgets.stamp(n, task, body, x, hits, x.get("confirmation") == "granted")
             return body

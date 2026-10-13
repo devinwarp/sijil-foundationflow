@@ -159,8 +159,7 @@ async def request_approval(n, sess: dict | None, task: dict, b: dict) -> Pending
     hits = b.get("rule_hits")
     if not isinstance(hits, list) or not hits or not all(isinstance(h, str) for h in hits):
         raise HTTPException(400, "rule_hits must be a non-empty list of rule ids")
-    budgets, actions = {bud.id for bud in pack.budgets if bud.on_exceed == "confirm"}, pack.actions()
-    if not all(actions.get(h) == "confirm" or (h.startswith("budget:") and h.split(":")[1] in budgets) for h in hits):
+    if pack.confirm_hits(hits) != hits:
         raise HTTPException(400, "rule_hits must be confirm rules of the pack in force or confirm budgets")
     route = pack.route(hits)
     if route is None:

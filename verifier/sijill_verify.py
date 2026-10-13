@@ -597,8 +597,17 @@ def approval_checks(st, rec, x, parent, task):
         if d["used"]:
             raise Fail("approval_reused", "approval reused")
         d["used"] = True
+    elif (t == "tool_call" and st.pack and rec["rulepack_hash"] == st.pack["hash"] and st.pack["entra"]   # V2
+          and rec["decision"] != "block" and x.get("after_the_fact") is not True
+          and (x.get("confirmation") == "granted" or any(confirm_hit(st.pack, h) for h in rule_hits(rec)))):
+        raise Fail("approval_mismatch", "tool_call approval mismatch")      # a confirm hit let through uncited
     elif t == "task_end" and task is not None and task["pending"]:                    # V4
         raise Fail("approval_undecided", "approval undecided at task_end")
+
+
+def confirm_hit(pack, h):
+    """A hit a named approver answers: a confirm rule of the pack, or an excess of one of its confirm budgets."""
+    return h in pack["confirm"] or (h.startswith("budget:") and h.split(":")[1] in pack["confirm_budgets"])
 
 
 def approval_decision(st, rec, x):
@@ -709,7 +718,8 @@ def cost(pack, digest, x):
 
 
 def load_pack(path):
-    """--rulepack: the budgets and pricing of a rule pack file, keyed by the SHA-256 of its bytes (W2). PyYAML is
+    """--rulepack: the budgets, pricing and confirm hits of a rule pack file, keyed by the SHA-256 of its bytes
+    (W2, and V2's uncited confirm hit under an entra channel). PyYAML is
     read only here (Ruling: the pack is YAML; the verifier's other checks need nothing beyond `cryptography`)."""
     import yaml
     with open(path, "rb") as f:
@@ -721,9 +731,14 @@ def load_pack(path):
     if not isinstance(doc, dict):
         raise ValueError("not a mapping")
     listed = lambda key: [e for e in doc.get(key) or [] if isinstance(e, dict)] if isinstance(doc.get(key), list) else []
+    hitl = doc.get("hitl") if isinstance(doc.get("hitl"), dict) else {}
     return {"hash": sha256(raw).hexdigest(), "pricing": listed("pricing"),
             "budgets": {b["id"]: b["limits"] if isinstance(b.get("limits"), dict) else {}
-                        for b in listed("budgets") if isinstance(b.get("id"), str)}}
+                        for b in listed("budgets") if isinstance(b.get("id"), str)},
+            "entra": hitl.get("channel") == "entra",
+            "confirm": {r["id"] for r in listed("rules") if isinstance(r.get("id"), str) and r.get("action") == "confirm"},
+            "confirm_budgets": {b["id"] for b in listed("budgets")
+                                if isinstance(b.get("id"), str) and b.get("on_exceed") == "confirm"}}
 
 
 def register_agent(st, rec, x):

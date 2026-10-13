@@ -522,3 +522,23 @@ def test_53e_a_cost_on_a_model_the_pack_does_not_price(tmp_path):
     x = json.loads(c[71]["ext"])
     c[71]["ext"] = record_json({k: v for k, v in x.items() if k not in ("price_rule", "cost_micro")})
     assert run(c, tmp_path, "--rulepack", pack)[0] == 0
+
+
+ENTRA_PACK = GOV_PACK.replace("rules: []", """rules:
+  - {id: case-closure-needs-approval, on: tool_call, match: {tool: ["http:case-api:closeCase"]}, action: confirm}
+hitl:
+  channel: entra""")
+
+
+def test_a_confirm_hit_let_through_without_a_citation_fails_under_the_rulepack(tmp_path):
+    p = tmp_path / "entra-pack.yaml"
+    p.write_text(ENTRA_PACK.replace("LIMIT", "1"))
+    rp = hashlib.sha256(p.read_bytes()).hexdigest()
+    assert run(v2chain.gov(rp), tmp_path, "--rulepack", str(p))[0] == 0
+    for drop in (("approval_seq", "confirmation"), ("approval_seq",)):    # the probe: no confirmation at all
+        c = v2chain.gov(rp)
+        x = json.loads(c[77]["ext"])
+        c[77]["ext"] = record_json({k: v for k, v in x.items() if k not in drop})
+        c.ext(79, confirmed=int("confirmation" not in drop))
+        assert run(c, tmp_path)[0] == 0                                    # without the pack, rule actions are unseen
+        assert run(c, tmp_path, "--rulepack", str(p)) == (1, "FAIL seq=77 tool_call approval mismatch")
