@@ -476,6 +476,14 @@ def router(require_admin) -> APIRouter:
         return {"labels": sorted({r["source_label"] for r in results}), "seqs": [r["seq"] for r in results],
                 "exec_hints": sorted(hints)}      # for the rules' context_exec_hints (spec §8.1)
 
+    @r.get("/api/agent/baseline")
+    async def baseline(request: Request, lockfile_hash: str, sess: dict = Depends(require_session)):
+        """The baseline a guard's integrity_drift points at (spec §2.4.5, check C)."""
+        seq = node(request).store.baseline(lockfile_hash)
+        if seq is None:
+            raise HTTPException(404, "no integrity_baseline for that lockfile_hash")
+        return {"seq": seq}
+
     @r.post("/api/agent/task/start")
     async def task_start(request: Request, sess: dict = Depends(require_session)):
         b = await body_of(request)

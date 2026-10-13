@@ -5,6 +5,7 @@
   task start --intent TEXT [--delegate] [--session-id ID]   print the task_seq
   task end --outcome OUTCOME
   serve --server NAME [--http HOST:PORT]   the MCP guard for one wrapped server (stdio unless --http)
+  tools pin --server NAME           pin the server's tool definitions in the lockfile; seal the baseline
 """
 
 import argparse
@@ -60,6 +61,9 @@ def main(argv: list[str] | None = None, ledger: Ledger | None = None) -> int:
         elif cmd == "task end":
             r = update(cfg, ledger, lambda st: task.end(ledger, st, a.outcome))
             print(f"task_end seq={r['seq']} tool_calls={r['tool_calls']} blocked={r['blocked']}")
+        elif cmd == "tools pin":
+            seq, n = asyncio.run(serve.pin(cfg, a.server, ledger))
+            print(f"pinned {n} tools of {a.server} in {cfg.lockfile}; integrity_baseline seq={seq}")
         elif cmd == "serve":
             asyncio.run(serve.run(cfg, a.server, ledger, a.http))
         else:

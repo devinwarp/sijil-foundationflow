@@ -12,7 +12,7 @@ import yaml
 
 PRINCIPAL = re.compile(r"oidc:[a-z0-9.-]+:\S+|email:[0-9a-f]{64}|local:[0-9a-f]{64}|human:[a-z0-9-]{1,32}:[0-9a-f]{64}")
 SECTIONS = {"version", "sijil", "identity", "task", "state_path", "repo", "rulepack", "egress", "context_window",
-            "correlation", "results", "servers", "allowed_command_dirs", "mcp"}
+            "correlation", "results", "servers", "allowed_command_dirs", "mcp", "lockfile"}
 KEYS = {"sijil": {"url", "token_env", "on_unreachable"},
         "identity": {"agent_id", "auth", "key_path", "registered_by", "display_name", "oidc_token_env"},
         "task": {"intent", "harness", "principal_header"},
@@ -139,6 +139,7 @@ class Config:
     tools_token: str              # X-Sijil-Tools-Token the HTTP door requires (mcp.tools_token_env); "" is none
     tls_cert: str                 # serve --http off loopback needs both, and the token
     tls_key: str
+    lockfile: str                 # pinned tool definitions (spec §7.4); "" = none, only invisible Unicode is checked
 
 
 def _path(p: str, name: str, base: Path) -> str:
@@ -197,6 +198,8 @@ def load(path: str) -> Config:
     if doc.get("servers") and not doc.get("repo") and repo in (os.path.realpath(os.path.expanduser("~")), "/"):
         raise ValueError(f"{path}: repo is unset and the working directory is {repo}: set repo, or the Kiro "
                          "check would trust every command under it")
+    if not isinstance(doc.get("lockfile", ""), str):
+        raise ValueError(f"{path}: lockfile must be a path")
     tools_env = mcp.get("tools_token_env")
     if tools_env and not os.environ.get(tools_env):
         raise ValueError(f"{path}: mcp.tools_token_env names {tools_env}, which is unset or empty")
@@ -217,4 +220,5 @@ def load(path: str) -> Config:
                   allowed_origins=tuple(str(o) for o in mcp.get("allowed_origins") or ()),
                   tools_token=os.environ.get(tools_env, "") if tools_env else "",
                   tls_cert=_path(mcp.get("tls_cert", ""), "mcp.tls_cert", base),
-                  tls_key=_path(mcp.get("tls_key", ""), "mcp.tls_key", base))
+                  tls_key=_path(mcp.get("tls_key", ""), "mcp.tls_key", base),
+                  lockfile=_path(doc.get("lockfile", ""), "lockfile", base))
