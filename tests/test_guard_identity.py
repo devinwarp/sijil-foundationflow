@@ -327,3 +327,14 @@ def test_load_key_reports_an_empty_file(tmp_path):
     key_file.touch(mode=0o600)
     with pytest.raises(ValueError, match="empty or corrupt"):
         identity.load_key(str(key_file))
+
+
+@pytest.mark.parametrize("answer", [httpx.Response(500), httpx.Response(200, content=b"<html>"),
+                                    httpx.Response(200, json={"nope": 1}), httpx.Response(200, json=[1]),
+                                    httpx.Response(200, json={"value": 7})])
+def test_github_oidc_failures_are_a_clean_refusal(monkeypatch, answer):
+    """Final review Minor 10: every door maps ValueError to a refusal; a raw httpx or KeyError was a 500."""
+    monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://actions.test/token")
+    monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-bearer")
+    with pytest.raises(ValueError, match="GitHub Actions OIDC token request failed"):
+        identity.github_token("n", httpx.Client(transport=httpx.MockTransport(lambda r: answer)))

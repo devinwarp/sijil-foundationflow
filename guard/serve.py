@@ -111,7 +111,7 @@ class Guard:
             if os.path.realpath(s.command) != s.real:      # retargeted since the config was checked
                 raise ValueError(f"server {s.name}: {s.command} no longer resolves to {s.real}")
             self.upstream = mcp.StdioUpstream(s.command, list(s.args), s.env, self.upstream_note)
-        else:
+        else:      # this connection is not sealed as egress: the guard's own egress is out of scope until row 9
             self.upstream = mcp.HttpUpstream(s.url, s.headers, self.upstream_note)
         await self.upstream.start()
         self.init = await self.upstream.request("initialize", {

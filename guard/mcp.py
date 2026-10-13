@@ -29,6 +29,9 @@ from fastapi.responses import JSONResponse
 PROTOCOL = "2025-06-18"
 METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL, SIJIL = -32601, -32602, -32603, -32000
 INVALID_REQUEST = -32600
+# the guard's environment a wrapped server inherits; its configured `env` is added. Nothing else passes: the
+# guard holds the ledger token, the OIDC and tools tokens and the human's SIJIL_PRINCIPAL_TOKEN in its env.
+PASS_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "TZ")
 MAX_LINE = 2 ** 24            # most bytes taken from the wrapped server in one line, body or stream
 MAX_REQUEST = 2 ** 22         # most bytes taken from the harness in one HTTP request body
 MAX_TASKS = 64                # notification handlers in flight per transport; more are dropped and logged
@@ -156,7 +159,7 @@ class StdioUpstream:
     async def start(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
             self.command, *self.args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            env={**os.environ, **self.env}, limit=MAX_LINE)
+            env={**{k: os.environ[k] for k in PASS_ENV if k in os.environ}, **self.env}, limit=MAX_LINE)
         self.reader = asyncio.create_task(self._read())
 
     async def _read(self) -> None:

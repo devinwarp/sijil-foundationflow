@@ -529,3 +529,21 @@ def test_concurrent_initializes_cannot_exceed_the_session_cap(monkeypatch):
             again = await c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize"})
         return codes, kept, again.status_code
     assert asyncio.run(go()) == ([200] * 3 + [503] * 7, 3, 200)
+
+
+def test_a_wrapped_server_gets_a_minimal_env_and_never_the_guards_secrets(monkeypatch):
+    """Final review Minor 5: the ledger, OIDC, tools and principal tokens stay in the guard."""
+    secrets = ("SIJIL_TOKEN", "SIJIL_OIDC_TOKEN", "SIJIL_TOOLS_TOKEN", "SIJIL_PRINCIPAL_TOKEN", "GUARD_TEST_TOKEN")
+    for name in secrets:
+        monkeypatch.setenv(name, "secret")
+
+    async def go():
+        up = mcp.StdioUpstream(MOCK[0], MOCK[1:], {"CONFIGURED": "1"})
+        await up.start()
+        try:
+            got = await up.request("tools/call", {"name": "environ", "arguments": {}})
+        finally:
+            await up.close()
+        return set(json.loads(got["content"][0]["text"]))
+    names = asyncio.run(go())
+    assert "CONFIGURED" in names and not names & set(secrets) and "PATH" in names

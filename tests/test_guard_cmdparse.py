@@ -260,7 +260,8 @@ def test_known_value_options_are_not_taken_for_commands(roots):
 def test_nul_byte_never_raises_and_separates(roots):
     for command in ("cat \x00", "\x00", "cat a\x00b", "npx\x00evil", "bash -c '\x00npx x'", "> \x00"):
         parse(command, roots).summary()
-    assert seen("cat a\x00npx x", roots) == ["cat", "npx"] or "cat" in seen("cat a\x00npx x", roots)
+    assert seen("cat a\x00npx x", roots) == ["cat"]          # NUL separates words: npx is an argument of cat
+    assert seen("npx\x00evil", roots) == ["npx"]
     assert normalise("a\x00b", roots)
 
 

@@ -818,3 +818,26 @@ def test_a_delegated_sub_task_is_seen_by_a_running_guard(env):
     assert now != first and json.loads(sub["ext"])["delegated_from"] == str(first)
     assert rec["task_seq"] == str(now) == str(sub["seq"])
     assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_one_tool_use_parents_one_call_without_a_tool_use_id(env):
+    """Task 5 mechanism 2 (deferred): matched by name and args_hash, a second identical call in the same
+    inference has no parent left and is refused unsealed under require_parent."""
+    client, s, cfg = env
+
+    async def go():
+        g = guard(cfg, client, "sentry")
+        await g.start()
+        a = await g.new_session(Harness(), {})
+        await a.handle("initialize", INIT)
+        await asyncio.to_thread(ask, client, cfg, "look at the sentry error")
+        first = await call(a, "get_issue", {"issueId": "SENTRY-4821"})
+        with pytest.raises(mcp.RpcError) as e:
+            await call(a, "get_issue", {"issueId": "SENTRY-4821"})
+        await g.aclose()
+        return first, e.value
+    first, err = asyncio.run(go())
+    assert first["content"][0]["text"] == mcp_mock.SENTRY_TEXT
+    assert err.code == mcp.SIJIL and "no parent inference" in err.message and err.data["sijil"]["seq"] is None
+    assert len(rows(s.db_path, "type = 'tool_call'")) == 1
+    assert verify(s.db_path, s.pubkey_path)[0] == 0

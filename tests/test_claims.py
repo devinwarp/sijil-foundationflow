@@ -36,4 +36,4 @@ def test_guard_sources_carry_no_invisible_unicode():
     files = [*(ROOT / "guard").glob("*.py"), *(ROOT / "rulepacks").glob("*.yaml"), *(ROOT / "tests").glob("*guard*.py"),
              *(ROOT / "tests").glob("mcp_*.py")]
     for path in files:
-        assert unicode.scan(path.read_text())["count"] == 0, path.name
+        assert unicode.scan(path.read_text(encoding="utf-8"))["count"] == 0, path.name

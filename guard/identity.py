@@ -93,10 +93,16 @@ def github_token(node_id: str, http: httpx.Client | None = None) -> str | None:
     url, bearer = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL"), os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
     if not url or not bearer:
         return None
-    r = (http or httpx.Client(timeout=10.0)).get(url, params={"audience": f"sijil:{node_id}"},
-                                                  headers={"Authorization": f"bearer {bearer}"})
-    r.raise_for_status()
-    return r.json()["value"]
+    try:
+        r = (http or httpx.Client(timeout=10.0)).get(url, params={"audience": f"sijil:{node_id}"},
+                                                      headers={"Authorization": f"bearer {bearer}"})
+        r.raise_for_status()
+        token = r.json()["value"]
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:      # every door maps ValueError to a refusal
+        raise ValueError(f"GitHub Actions OIDC token request failed ({type(e).__name__})") from None
+    if not isinstance(token, str):
+        raise ValueError("GitHub Actions OIDC token request failed (no token in the answer)")
+    return token
 
 
 def open_session(ledger: Ledger, cfg, key: Ed25519PrivateKey | None = None, http: httpx.Client | None = None) -> dict:

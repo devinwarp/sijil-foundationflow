@@ -6,7 +6,7 @@ MOCK_DESCRIPTIONS (JSON {tool: description}) overrides descriptions, to stage a 
 Over stdio it also has misbehaving tools, hidden from tools/list (the guard refuses a tool the server does not
 list, so these serve the transport tests only): `crash` exits at once, `sleep` answers after
 `seconds` (without blocking other requests), `garbage` emits junk lines before its answer, `oversize` emits one
-line of `size` bytes and never answers.
+line of `size` bytes and never answers; `environ` names the variables it was given.
 """
 
 import json
@@ -74,6 +74,8 @@ def call(name: str, args: dict, ask=None, notify=None) -> dict:
             {"type": "image", "data": "aGk=", "mimeType": "image/png", "_meta": {"x": 1}},
             {"type": "image", "data": "not base64 !!", "mimeType": "image/png"},
             {"type": "video", "data": "x"}]}
+    if name == "environ":         # hidden: the names in the server's environment
+        return text(json.dumps(sorted(os.environ)))
     if name == "fail":
         return text("boom", error=True)
     if name == "changed":

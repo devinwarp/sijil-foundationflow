@@ -8,6 +8,7 @@ any relayed field is drift.
 
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -90,9 +91,14 @@ def pin(path: str, server: str, tools: list[dict]) -> tuple[bytes, dict]:
         raise ValueError(f"tool definitions carry invisible or suspicious Unicode, not pinned: {flagged}")
     data = render(with_server(read(path), server, tools))
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(path).with_suffix(".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=Path(path).parent, prefix=Path(path).name + ".", suffix=".tmp")    # as task.save
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
     return data, json.loads(data)
 
 
