@@ -218,3 +218,83 @@ def test_named_approval_needs_its_issuer_in_the_policy(tmp_path):
         (tmp_path / "pack.yaml").write_text(GOV)
         r = client.post("/api/admin/rulepack/reload")
         assert r.status_code == 400 and "principals.issuers" in r.json()["detail"]
+
+
+def test_policy_reload_dropping_the_needed_issuer_is_refused(tmp_path):
+    from agentkit import OPEN_POLICY
+    from jwtkit import Idp, rsa_jwk
+    from test_principals import POLICY
+    (tmp_path / "pack.yaml").write_text(GOV)
+    client, s = make_node(tmp_path, stub_model, POLICY, idp=Idp({"keys": [rsa_jwk()]}),
+                          rulepack_path=str(tmp_path / "pack.yaml"))
+    with client:
+        before = len(rows(s.db_path))
+        (tmp_path / "policy.yaml").write_text(OPEN_POLICY)
+        r = client.post("/api/admin/policy/reload")
+        assert r.status_code == 400 and "principals.issuers" in r.json()["detail"]
+        assert len(rows(s.db_path)) == before
+        (tmp_path / "policy.yaml").write_text(POLICY)
+        assert client.post("/api/admin/policy/reload").status_code == 200
+
+
+def load_text(tmp_path, text):
+    (tmp_path / "p.yaml").write_text(text)
+    return rulepack.load(str(tmp_path / "p.yaml"))
+
+
+BY = "tool_calls_by: {\"http:case-api:addCaseNote\": 5, \"mcp:*:send_*\": 2}"
+
+
+def test_a_confirm_budget_needs_a_route_for_the_hit_the_ledger_emits(tmp_path):
+    # the hit for a per-tool excess is budget:<id>:tool_calls_by:<glob>; the bare metric name never matches it
+    for rules, ok in ((["budget:case-agent:tool_calls_by"], False), (["budget:case-agent:tool_calls_by:*"], True),
+                      (["budget:*"], True)):
+        text = GOV.replace('rules: ["budget:*"]', f"rules: {json.dumps(rules)}")
+        text = text.replace("      tool_calls: 40\n", "")
+        if ok:
+            p = load_text(tmp_path, text.replace("      egress_hosts: 4\n      model_spend_micro: 3000000\n", ""))
+            assert p.route(["budget:case-agent:tool_calls_by:mcp:*:send_*"]).id == "budget-overrun"
+        else:
+            with pytest.raises(ValueError, match="needs a hitl route"):
+                load_text(tmp_path, text.replace("      egress_hosts: 4\n      model_spend_micro: 3000000\n", ""))
+
+
+@pytest.mark.parametrize("change, match", [
+    (("timeout_seconds: 900", "timeout_seconds: 604801"), "at most 604800"),
+    (("timeout_seconds: 300", "timeout_seconds: 0"), "at least 1"),
+    (("tool_calls: 40", f"tool_calls: {2 ** 53 + 1}"), "at most"),
+    (("model_spend_micro: 3000000", "model_spend_micro: 100000000000000000000"), "at most"),
+    (("input_per_mtok_micro: 7340000", f"input_per_mtok_micro: {2 ** 64}"), "at most"),
+    (("  entra: {issuer_id: entra-moi, audience: \"api://sijil-approvals\"}\n", "  entra: abc\n"), "hitl.entra must be a mapping"),
+    (("  notify: {teams_webhook_env: SIJIL_TEAMS_WEBHOOK}\n", "  notify: abc\n"), "hitl.notify must be a mapping"),
+    (("  timeout_seconds: 300\n", "  approvers: {role: x}\n  timeout_seconds: 300\n"), "v1 form"),
+    (("model: \"sha256:*\"", "model: \"\""), "non-empty model"),
+    (("  - {id: local, model: \"sha256:*\"", "  - {id: shadow, model: \"api:azure-openai:gpt-4.1-mini\""), "shadowed"),
+    (("input_per_mtok_micro: 7340000,", "currency: USD, input_per_mtok_micro: 7340000,"), "disagree on currency"),
+])
+def test_loader_bounds_and_strictness(tmp_path, change, match):
+    assert GOV.count(change[0]) == 1
+    with pytest.raises(ValueError, match=match):
+        load_text(tmp_path, GOV.replace(*change))
+
+
+def test_empty_limits_refused_and_oids_are_case_insensitive(tmp_path):
+    only_by = GOV.replace("      tool_calls: 40\n", "").replace(
+        "      tool_calls_by: {\"http:case-api:addCaseNote\": 5, \"mcp:*:send_*\": 2}\n      egress_hosts: 4\n"
+        "      model_spend_micro: 3000000\n", "      tool_calls_by: {}\n")
+    with pytest.raises(ValueError, match="no limits"):
+        load_text(tmp_path, only_by)
+    upper = GOV.replace("7a8b9c0d-2e3f-4a5b-9c6d-1e2f3a4b5c6d", "7A8B9C0D-2E3F-4A5B-9C6D-1E2F3A4B5C6D")
+    assert load_text(tmp_path, upper).hitl.routes[1].oids == ("7a8b9c0d-2e3f-4a5b-9c6d-1e2f3a4b5c6d",)
+
+
+@pytest.mark.parametrize("hitl", ["hitl: []\n", "hitl: false\n", "hitl: \"\"\n", "hitl: {channel: email}\n",
+                                  "hitl: {entra: abc}\n", "hitl: {approvers: {role: x}}\n",
+                                  "hitl: {channel: entra}\n", "hitl: {channel: entra, entra: abc}\n"])
+def test_guard_and_ledger_refuse_the_same_hitl(tmp_path, hitl):
+    from guard import rules
+    (tmp_path / "p.yaml").write_text(PACK + hitl)
+    with pytest.raises(ValueError):
+        rulepack.load(str(tmp_path / "p.yaml"))
+    with pytest.raises(ValueError):
+        rules.load(str(tmp_path / "p.yaml"))

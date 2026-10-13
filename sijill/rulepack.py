@@ -16,9 +16,11 @@ ON = ("tool_call", "tool_result", "egress", "integrity")
 ACTIONS = ("allow", "record", "confirm", "block")
 RULE_ID = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 BLOCK_ID = re.compile(r"[a-z0-9-]{1,32}")                 # hitl.routes[].id, budgets[].id
-GUID = re.compile(r"[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}")
+GUID = re.compile(r"[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}", re.I)
+MAX_TIMEOUT = 7 * 86400                                   # seconds; deadlines are ts + this
+MAX_COUNT = 2 ** 53                                       # budget limits and prices: exact in a JSON number
 LEVELS = ("low", "substantial", "high")
-HITL_KEYS = {"approvers", "timeout_seconds", "on_timeout", "mode", "channel", "entra", "separation_of_duties",
+HITL_KEYS = {"timeout_seconds", "on_timeout", "mode", "channel", "entra", "separation_of_duties",
              "routes", "notify"}
 BUDGET_MATCH = ("harness", "agent_id", "logical_agent_id", "principal_issuer")
 METRICS = ("tool_calls", "tool_calls_by", "egress_hosts", "model_spend_micro")
@@ -83,9 +85,17 @@ class RulePack:
         return next((p for p in self.pricing if fnmatch.fnmatchcase(model_digest, p["model"])), None)
 
 
-def _count(v, where: str) -> int:
-    if type(v) is not int or v < 0:
-        raise ValueError(f"{where} must be a non-negative integer")
+def _count(v, where: str, hi: int = MAX_COUNT) -> int:
+    if type(v) is not int or not 0 <= v <= hi:
+        raise ValueError(f"{where} must be a non-negative integer of at most {hi}")
+    return v
+
+
+def _block(v, where: str) -> dict:
+    if v is None:
+        return {}
+    if not isinstance(v, dict):
+        raise ValueError(f"{where} must be a mapping")
     return v
 
 
@@ -99,12 +109,17 @@ def _hitl(d, path: str) -> Hitl | None:
     """hitl: (spec §17.5.1). Named approval needs channel entra; mode monitor and allow-on-timeout are row 18's."""
     if d is None:
         return None
+    if isinstance(d, dict) and "approvers" in d:
+        raise ValueError(f"{path}: hitl.approvers is the v1 form; name approvers per route in hitl.routes[].approvers")
     if not isinstance(d, dict) or set(d) - HITL_KEYS:
         raise ValueError(f"{path}: hitl keys must be among {sorted(HITL_KEYS)}")
-    channel, timeout = d.get("channel", "self"), _count(d.get("timeout_seconds", 300), f"{path}: hitl.timeout_seconds")
+    channel, timeout = d.get("channel", "self"), _count(d.get("timeout_seconds", 300), f"{path}: hitl.timeout_seconds",
+                                                        MAX_TIMEOUT)
+    if timeout < 1:
+        raise ValueError(f"{path}: hitl.timeout_seconds must be at least 1")
     if channel not in ("self", "entra") or d.get("mode", "enforce") != "enforce" or d.get("on_timeout", "deny") != "deny":
         raise ValueError(f"{path}: hitl needs channel self|entra, mode enforce and on_timeout deny")
-    entra = d.get("entra") or {}
+    entra = _block(d.get("entra"), f"{path}: hitl.entra")
     if channel == "entra" and not (isinstance(entra.get("issuer_id"), str) and BLOCK_ID.fullmatch(entra["issuer_id"])
                                    and isinstance(entra.get("audience"), str) and entra["audience"]):
         raise ValueError(f"{path}: hitl channel entra needs entra.issuer_id and entra.audience")
@@ -117,16 +132,18 @@ def _hitl(d, path: str) -> Hitl | None:
                 or not isinstance(a, dict) or len(a) != 1 or set(a) - {"role", "oids"}:
             raise ValueError(f"{path}: hitl route needs an id and approvers {{role}} or {{oids}}: {r!r}")
         oids = _strings(a["oids"], f"{path}: hitl route {r['id']} oids") if "oids" in a else ()
+        oids = tuple(o.lower() for o in oids)
         if not all(GUID.fullmatch(o) for o in oids) or ("role" in a and not (isinstance(a["role"], str) and a["role"])):
             raise ValueError(f"{path}: hitl route {r['id']}: role is a name, oids are object id GUIDs")
         routes.append(Route(r["id"], _strings(r.get("rules"), f"{path}: hitl route {r['id']} rules"), a.get("role", ""),
                             oids, r.get("min_assurance", "substantial"),
-                            _count(r.get("timeout_seconds", timeout), f"{path}: hitl route {r['id']} timeout_seconds")))
+                            _count(r.get("timeout_seconds", timeout), f"{path}: hitl route {r['id']} timeout_seconds",
+                                   MAX_TIMEOUT)))
         if routes[-1].min_assurance not in LEVELS or routes[-1].timeout_seconds < 1:
             raise ValueError(f"{path}: hitl route {r['id']}: min_assurance in {LEVELS}, timeout_seconds at least 1")
     if routes and channel != "entra" or len({r.id for r in routes}) != len(routes):
         raise ValueError(f"{path}: hitl routes need channel entra and unique ids")
-    notify = d.get("notify") or {}
+    notify = _block(d.get("notify"), f"{path}: hitl.notify")
     if set(notify) - {"teams_webhook_env"} or not isinstance(notify.get("teams_webhook_env", ""), str):
         raise ValueError(f"{path}: hitl.notify takes teams_webhook_env only")
     return Hitl(channel, timeout, d.get("separation_of_duties", True), entra.get("issuer_id", ""),
@@ -151,12 +168,18 @@ def _budgets(items, hitl: Hitl | None, path: str) -> tuple[Budget, ...]:
         lim = {k: _count(v, f"{path}: budget {b['id']} {k}") for k, v in limits.items() if k != "tool_calls_by"}
         if by:
             lim["tool_calls_by"] = {g: _count(n, f"{path}: budget {b['id']} tool_calls_by") for g, n in by.items()}
+        if not lim:
+            raise ValueError(f"{path}: budget {b['id']} has no limits")
         on_exceed = b.get("on_exceed", "block")
         if on_exceed not in ("block", "confirm") or not isinstance(b.get("currency", ""), str):
             raise ValueError(f"{path}: budget {b['id']} on_exceed must be block or confirm")
         pack = RulePack("", "", "", (), "", hitl)
-        if on_exceed == "confirm" and any(pack.route([f"budget:{b['id']}:{m}"]) is None for m in lim):
-            raise ValueError(f"{path}: budget {b['id']} on_exceed confirm needs a hitl route for budget:{b['id']}:*")
+        # the ledger's hit names (spec §17.6.2): tool_calls_by hits carry the glob that was exceeded
+        hits = [f"budget:{b['id']}:{m}" for m in lim if m != "tool_calls_by"] + \
+            [f"budget:{b['id']}:tool_calls_by:{g}" for g in lim.get("tool_calls_by", {})]
+        if on_exceed == "confirm" and any(pack.route([h]) is None for h in hits):
+            raise ValueError(f"{path}: budget {b['id']} on_exceed confirm needs a hitl route matching every hit "
+                             f"({hits[0]} ...)")
         out.append(Budget(b["id"], match, lim, b.get("currency", ""), on_exceed))
     if len({b.id for b in out}) != len(out):
         raise ValueError(f"{path}: duplicate budget ids")
@@ -167,8 +190,13 @@ def _pricing(items, path: str) -> tuple[dict, ...]:
     out = []
     for p in items or []:
         if not isinstance(p, dict) or not isinstance(p.get("id"), str) or not p["id"] \
-                or not isinstance(p.get("model"), str) or set(p) != {"id", "model", *PRICE_INTS}:
-            raise ValueError(f"{path}: pricing entry needs exactly id, model and {PRICE_INTS}: {p!r}")
+                or not isinstance(p.get("model"), str) or not p["model"] \
+                or set(p) - {"currency"} != {"id", "model", *PRICE_INTS} or not isinstance(p.get("currency", ""), str):
+            raise ValueError(f"{path}: pricing entry needs id, a non-empty model, {PRICE_INTS} and optionally "
+                             f"currency: {p!r}")
+        # ponytail: textual shadow test (the earlier glob matches the later glob's text); misses partial overlaps
+        if any(fnmatch.fnmatchcase(p["model"], q["model"]) for q in out):
+            raise ValueError(f"{path}: pricing {p['id']} is shadowed by an earlier model glob (first match wins)")
         out.append({**p, **{k: _count(p[k], f"{path}: pricing {p['id']} {k}") for k in PRICE_INTS}})
     if len({p["id"] for p in out}) != len(out):
         raise ValueError(f"{path}: duplicate pricing ids")
@@ -196,9 +224,12 @@ def load(path: str) -> RulePack:
     if len(ids) != len(set(ids)):
         raise ValueError(f"{path}: duplicate rule ids")
     hitl = _hitl(doc.get("hitl"), path)
+    budgets, pricing = _budgets(doc.get("budgets"), hitl, path), _pricing(doc.get("pricing"), path)
+    cur = {b.currency for b in budgets if b.currency} | {p["currency"] for p in pricing if p.get("currency")}
+    if len(cur) > 1:    # a spend limit in one currency priced in another would compare unlike units
+        raise ValueError(f"{path}: budgets and pricing disagree on currency: {sorted(cur)}")
     return RulePack(rulepack_id=str(doc["rulepack_id"]), version=str(doc["version"]), path=str(path),
-                    rules=tuple(rules), hash=sha256_hex(raw), hitl=hitl,
-                    budgets=_budgets(doc.get("budgets"), hitl, path), pricing=_pricing(doc.get("pricing"), path))
+                    rules=tuple(rules), hash=sha256_hex(raw), hitl=hitl, budgets=budgets, pricing=pricing)
 
 
 def check_policy(pack: RulePack | None, pol) -> None:

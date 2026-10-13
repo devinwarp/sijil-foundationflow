@@ -127,6 +127,29 @@ def _compile(rule_id: str, on: str, match) -> dict:
     return out
 
 
+HITL_KEYS = {"timeout_seconds", "on_timeout", "mode", "channel", "entra", "separation_of_duties", "routes", "notify"}
+
+
+def _approval(h, path: str) -> str:
+    """hitl.channel, validated as the ledger does (sijill/rulepack.py `_hitl`, which owns routes and timeouts): a
+    pack the ledger refuses must not be read here as channel self. Reimplemented; the guard never imports sijill/."""
+    if h is None:
+        return "self"
+    if isinstance(h, dict) and "approvers" in h:
+        raise ValueError(f"{path}: hitl.approvers is the v1 form; name approvers per route in hitl.routes[].approvers")
+    if not isinstance(h, dict) or set(h) - HITL_KEYS:
+        raise ValueError(f"{path}: hitl keys must be among {sorted(HITL_KEYS)}")
+    channel, entra = h.get("channel", "self"), h.get("entra")
+    if channel not in ("self", "entra") or h.get("mode", "enforce") != "enforce" or h.get("on_timeout", "deny") != "deny":
+        raise ValueError(f"{path}: hitl needs channel self|entra, mode enforce and on_timeout deny")
+    if entra is not None and not isinstance(entra, dict):
+        raise ValueError(f"{path}: hitl.entra must be a mapping")
+    if channel == "entra" and not (isinstance(entra, dict) and isinstance(entra.get("issuer_id"), str)
+                                   and entra["issuer_id"] and isinstance(entra.get("audience"), str) and entra["audience"]):
+        raise ValueError(f"{path}: hitl channel entra needs entra.issuer_id and entra.audience")
+    return channel
+
+
 def load(path: str) -> RulePack:
     raw = Path(path).read_bytes()
     doc = yaml.safe_load(raw)
@@ -135,9 +158,7 @@ def load(path: str) -> RulePack:
     unknown = set(doc) - {"rulepack_id", "version", "description", "defaults", "rules", "hitl", "budgets", "pricing"}
     if unknown:    # dlp:, mode: and arg_max_length are row 18. hitl routes, budgets and pricing are the ledger's
         raise ValueError(f"{path}: top-level keys {sorted(unknown)} are not supported")
-    approval = (doc.get("hitl") or {}).get("channel", "self") if isinstance(doc.get("hitl") or {}, dict) else None
-    if approval not in ("self", "entra"):
-        raise ValueError(f"{path}: hitl.channel must be self or entra")
+    approval = _approval(doc.get("hitl"), path)
     if (doc.get("defaults") or {"action": "allow"}) != {"action": "allow"}:
         raise ValueError(f"{path}: defaults.action must be allow (a rule fires or the call proceeds)")
     rules, seen = [], set()
