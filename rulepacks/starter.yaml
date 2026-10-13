@@ -178,6 +178,46 @@ rules:
       command_regex: '(?i)(^|[;&|]\s*)(\S*/)?((npm|pnpm|yarn|bun|lerna|changeset)\b[^;&|]*?\spublish|twine\b[^;&|]*?\supload|cargo\b[^;&|]*?\spublish|gem\s+push|python3?\s+(-m\s+twine\s+upload|setup\.py\s+upload))(?=\s|$|[;&|])'
     action: block
 
+  # The next four are not in spec §8.2: the pilot plan carries them into M2d (idea from CUSTOS-CORE's
+  # action gate deny list; no code taken). They fill what the egress and credential rules above miss.
+  # Case-insensitive like the rules above; a flag whose case changes its meaning is matched with (?-i:).
+
+  - id: no-destructive-fs
+    description: Recursive delete of the filesystem root, home or workspace root, mkfs, dd onto a device, shred, find -delete from /
+    incident: pilot plan M2d (destructive agent actions)
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:*:run_command", "mcp:*:execute_command", "mcp:*:shell"]
+      command_regex: '(?i)(^|[;&|]\s*)rm\s+(-\S+\s+)*-[a-zA-Z]*[rR][a-zA-Z]*\s+(-\S+\s+)*["'']?(/|/\*|~|~/|~/\*|\$\{?HOME\}?/?\*?|\.|\./|\./\*|\*|\$\{?PWD\}?/?\*?)["'']?(\s|$|[;&|])|(^|[;&|]\s*)mkfs(\.\w+)?\b|(^|[;&|]\s*)dd\b[^;&|]*\bof=/dev/|(^|[;&|]\s*)shred\b|(^|[;&|]\s*)find\s+/\s[^;&|]*-delete\b'
+    action: block
+
+  - id: no-perm-escalation
+    description: chmod 777, a+w or setuid, chown root, a root shell (sudo -s, sudo -i), sudoers edits
+    incident: pilot plan M2d (privilege escalation)
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:*:run_command", "mcp:*:execute_command", "mcp:*:shell"]
+      command_regex: '(?i)(^|[;&|]\s*)chmod\s+(-\S+\s+)*(0?777|[ao]\+[rwxX]*w[rwxX]*|[ugoa]*\+[rwxX]*s[rwxX]*|[0-7]?[4267][0-7]{3})(\s|$)|(^|[;&|]\s*)chown\s+(-\S+\s+)*root\b|\bsudo\s+([^;&|\s]+\s+)*?(?-i:-[a-zA-Z]*[si])\b|\bvisudo\b|(>>?|\btee\b(\s+-a)?)\s*/etc/sudoers'
+    action: confirm
+
+  - id: no-reverse-shell
+    description: A shell or socket wired to a remote host (/dev/tcp, nc -e, socat exec, a fifo piped into nc)
+    incident: pilot plan M2d (reverse shells; the command parser sees no host in /dev/tcp/)
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:*:run_command", "mcp:*:execute_command", "mcp:*:shell"]
+      command_regex: '(?i)/dev/(tcp|udp)/|\b(nc|ncat|netcat)\s+([^;&|]*\s)?(?-i:-[a-zA-Z]*[ec])\b|\bsocat\b[^;&|]*\b(exec|system):|\bmkfifo\b.*\|\s*(nc|ncat|netcat)\b'
+    action: block
+
+  - id: no-oversight-tamper
+    description: Stopping the Sijil guard or ledger, touching the ledger database or ~/.sijil/, unsetting SIJIL_* variables
+    incident: pilot plan M2d (an agent switching off its own oversight)
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:*:run_command", "mcp:*:execute_command", "mcp:*:shell"]
+      command_regex: '(?i)\b(kill|pkill|killall)\b[^;&|]*sijil|\bsystemctl\s+(stop|disable|kill|mask)\b[^;&|]*sijil|(^|[;&|]\s*)(rm|truncate|shred|sqlite3)\b[^;&|]*(sijill?\.db|\.sijil/)|>\s*\S*sijill?\.db\b|\bunset\s+([^;&|]*\s)?SIJILL?_\w*|\benv\s+(-\S+\s+)*-u\s*SIJILL?_\w*'
+    action: block
+
   - id: tool-not-allowlisted
     description: Reserved id written by the guard when a tools.allow/deny filter rejects a call; not matchable from YAML
     incident: rug-pull / scope creep
