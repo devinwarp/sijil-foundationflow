@@ -552,20 +552,25 @@ def _find_execs(args: list[str]) -> list[str]:
 
 
 def _shell_command(args: list[str]) -> list[str]:
-    """The string `sh -c` runs: if any short-option cluster before the first operand has a c (-c, -lc, -cl, -ci),
-    it is the first operand. Option clusters, `-o name` / `+o name` pairs and `--` are skipped on the way."""
-    has_c, i = False, 0
+    """The strings `sh -c` may run. If any short-option cluster has a c (-c, -lc, -cl, -ci), EVERY operand is
+    returned, not just the first: an option table always misses something (`--foo bar -c`), and parsing an extra
+    operand as a command only over-sees. `-o name`, `+O name`, `--rcfile f` and `--init-file f` are skipped so
+    their values are not taken for operands; `--` ends the options."""
+    has_c, operands, i = False, [], 0
     while i < len(args):
         a, i = args[i], i + 1
         if a == "--":
+            operands += args[i:]
             break
         if not a.startswith(("-", "+")):
-            return [a] if has_c else []                  # the first operand: a command string, or a script file
-        if not a.startswith("--"):
+            operands.append(a)
+        elif a in ("--rcfile", "--init-file", "-o", "+o", "-O", "+O"):
+            i += 1                                        # the option's value
+        elif not a.startswith("--"):
             has_c |= a[0] == "-" and "c" in a
             if a[-1] in "oO" and i < len(args):
-                i += 1                                    # -o pipefail, +o errexit, -O extglob
-    return args[i:i + 1] if has_c else []
+                i += 1                                    # -eo pipefail
+    return operands if has_c else []
 
 
 def _nested_commands(argv0: str, args: list[str]) -> list[str]:

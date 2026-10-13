@@ -237,15 +237,24 @@ def test_fetcher_and_network_paths(command, reads, writes, roots):
 @pytest.mark.parametrize("command", [
     "bash -cl 'npx x'", "bash -ci 'npx x'", "bash -cx 'npx x'", "bash -c -l 'npx x'", "bash -c -- 'npx x'",
     "bash -lc 'npx x'", "bash -o pipefail -c 'npx x'", "bash -eo pipefail -c 'npx x'", "bash +o errexit -c 'npx x'",
-    "bash --login -c 'npx x'", "bash -l -c -x 'npx x'", "sudo bash -cl 'npx x'", "sh -c 'npx x' name arg",
+    "bash --login -c 'npx x'", "bash --rcfile f -c 'npx x'", "bash --init-file f -c 'npx x'",
+    "bash -O extglob -c 'npx x'", "bash +O extglob -c 'npx x'", "bash --foo bar -c 'npx x'",
+    "bash --foo bar -lc 'npx x'", "bash script.sh -c 'npx x'", "bash -l -c -x 'npx x'", "sudo bash -cl 'npx x'", "sh -c 'npx x' name arg",
 ])
 def test_shell_command_string_is_found_whatever_the_option_order(command, roots):
     assert "npx" in seen(command, roots)
 
 
 def test_shell_script_operand_is_not_a_command_string(roots):
-    assert seen("bash script.sh -c 'npx x'", roots) == ["bash"]
     assert seen("bash -l script.sh", roots) == ["bash"]
+    assert seen("bash --rcfile f script.sh", roots) == ["bash"]
+
+
+def test_known_value_options_are_not_taken_for_commands(roots):
+    assert seen("bash --rcfile f -c 'npx x'", roots) == ["bash", "npx"]
+    assert seen("bash --init-file f -c 'npx x'", roots) == ["bash", "npx"]
+    assert seen("bash -O extglob -c 'npx x'", roots) == ["bash", "npx"]
+    assert "bar" in seen("bash --foo bar -c 'npx x'", roots)          # unknown option: over-seen, payload kept
 
 
 def test_nul_byte_never_raises_and_separates(roots):
