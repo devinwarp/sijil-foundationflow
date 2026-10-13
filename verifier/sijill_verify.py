@@ -547,7 +547,7 @@ def pack_checks(st, rec, x):
     one carries neither."""
     if rec["type"] != "inference":
         return
-    if "cost_micro" in x and type(x["cost_micro"]) is not int:
+    if "cost_micro" in x and (type(x["cost_micro"]) is not int or x["cost_micro"] < 0):
         raise Fail("cost_mismatch", "cost mismatch")
     if st.pack and rec["rulepack_hash"] == st.pack["hash"]:
         st.rulepack_matched += 1
@@ -651,7 +651,7 @@ def budget_checks(st, rec, x, task):
             if (type(limit) is not int or type(used) is not int or not isinstance(metric, str)
                     or METRIC_TYPE.get(kind) != t or used != own_count(task, metric)):
                 raise Fail("budget_counter_mismatch", "budget counter mismatch")             # W
-            if metric == "egress_hosts" and isinstance(x.get("host"), str) and x["host"] in task["hosts"]:
+            if metric == "egress_hosts" and isinstance(x.get("host"), str) and x["host"].lower() in task["hosts"]:
                 admitted = True
             else:
                 admitted = used < limit if metric == "model_spend_micro" else used + 1 <= limit
@@ -664,13 +664,13 @@ def budget_checks(st, rec, x, task):
                 failed.add(hit)
             if st.pack and rec["rulepack_hash"] == st.pack["hash"] and pack_limit(st.pack, bid, metric) != limit:
                 raise Fail("budget_limit_not_in_pack", "budget limit not in rule pack")      # W2
-    if t in METRIC_TYPE.values() and any(h.startswith("budget:") and h not in failed for h in hits):
+    if t != "approval" and any(h.startswith("budget:") and h not in failed for h in hits):
         raise Fail("budget_spurious_hit", "budget hit without excess")    # an approval request names its hits
     st.budget_hits += bool(failed)
     if t == "tool_call" and rec["decision"] != "block":
         task["calls"].append(str(x.get("qualified", "")))
     elif t == "egress" and rec["decision"] != "block" and isinstance(x.get("host"), str):
-        task["hosts"].add(x["host"])
+        task["hosts"].add(x["host"].lower())
     elif t == "inference" and type(x.get("cost_micro")) is int:
         task["spend"] += x["cost_micro"]
 
@@ -703,7 +703,7 @@ def cost(pack, digest, x):
         return price.get("missing_usage_cost_micro")
     n = (u.get("input_tokens", 0), price.get("input_per_mtok_micro", 0),
          u.get("output_tokens", 0), price.get("output_per_mtok_micro", 0))
-    if any(type(v) is not int for v in n):
+    if any(type(v) is not int or v < 0 for v in n):
         return None
     return (n[0] * n[1] + n[2] * n[3]) // 1_000_000
 

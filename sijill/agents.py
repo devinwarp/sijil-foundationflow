@@ -442,6 +442,7 @@ def router(require_admin) -> APIRouter:
         if halted:                                    # the operator halt stops agents too
             fields.update(mode="enforce", decision="block")
             hits = [*(h for h in hits if not h.startswith("budget:")), policy.HALT_HIT]   # no budget evaluated
+            x = {k: v for k, v in x.items() if k != "budget"}                             # and none sealed
             if "approval_seq" in x:          # a blocked call consumes no grant (V2)
                 x = {**{k: v for k, v in x.items() if k != "approval_seq"}, "confirmation": "denied"}
         if not all(isinstance(v, str) for v in fields.values()):

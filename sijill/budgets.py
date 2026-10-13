@@ -33,7 +33,7 @@ def used(store, task_seq: int) -> tuple[list[str], set[str], int]:
         if r["type"] == "tool_call" and r["decision"] != "block":
             calls.append(x.get("qualified", ""))
         elif r["type"] == "egress" and r["decision"] != "block":
-            hosts.add(x.get("host"))
+            hosts.add(str(x.get("host")).lower())
         elif r["type"] == "inference" and type(x.get("cost_micro")) is int:
             spend += x["cost_micro"]
     return calls, hosts, spend
@@ -44,6 +44,7 @@ def evaluate(pack, store, task: dict, type_: str, qualified: str = "", host: str
     block when any failing budget says block, else confirm; "" when nothing fails). §17.6.2."""
     if pack is None or not pack.budgets or task is None:
         return {}, [], ""
+    host = str(host).lower()
     f, (calls, hosts, spend) = facts(task), used(store, task["seq"])
     obj, hits, block = {}, [], False
     for b in pack.budgets:
@@ -96,7 +97,8 @@ def cost(pack, model_digest: str, usage) -> dict:
     price = pack.price(model_digest) if pack else None
     if price is None:
         return {}
-    if not (isinstance(usage, dict) and all(type(usage.get(k)) is int for k in ("input_tokens", "output_tokens"))):
+    if not (isinstance(usage, dict)
+            and all(type(usage.get(k)) is int and usage[k] >= 0 for k in ("input_tokens", "output_tokens"))):
         return {"cost_micro": price["missing_usage_cost_micro"], "price_rule": price["id"]}
     return {"usage": usage, "price_rule": price["id"],
             "cost_micro": (usage["input_tokens"] * price["input_per_mtok_micro"]

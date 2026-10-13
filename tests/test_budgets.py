@@ -2,16 +2,19 @@
 before a tool call or an egress and enforces the answer; every evaluated record carries the budget object the
 verifier recounts (W-W2, with --rulepack)."""
 
+import asyncio
+import importlib.util
 import json
 import threading
 
 import httpx
 
 from agentkit import register, session
-from conftest import MODEL, StubResolver, rows, verify
+from conftest import ADMIN, MODEL, VERIFIER, StubResolver, make_node, rows, verify
 import govkit
 from govkit import CASE, CLOSE, NOTE, PACK, gov_node, officer, supervisor
 from guard.ledger import Ledger
+from test_chat_tool_uses import API, API_POLICY, answer, ask
 from test_approvals import h, open_task, seal_call, think
 from test_guard_approval import env, pending_approval  # noqa: F401  (env is a fixture)
 
@@ -214,3 +217,158 @@ def test_a_budget_confirmation_under_the_entra_channel_must_cite_its_grant(tmp_p
                           ext={**ext, "confirmation": confirmation})
             assert r.status_code == 409 and "must cite its approval_seq" in r.text, r.text
         assert [r["type"] for r in rows(s.db_path)].count("tool_call") == 0
+
+
+def usage_model(usage):
+    def model(request):
+        return httpx.Response(200, json={"id": "c", "model": MODEL, "usage": usage,
+                                         "choices": [{"index": 0, "finish_reason": "stop",
+                                                      "message": {"role": "assistant", "content": "ok"}}]})
+    return model
+
+
+def test_a_halted_call_drops_a_client_sent_budget_and_verifies(tmp_path):
+    client, s, _ = gov_node(tmp_path, pack=pack())
+    with client:
+        sess, task = open_task(client)
+        parent, call_id = think(client, sess, task)
+        assert client.post("/api/admin/halt", json={"halted": True}, headers=ADMIN).status_code == 200
+        forged = {"case-agent": {"tool_calls": {"limit": 40, "used": 999}}}
+        ext = {"harness": "http-agent", "session_id": "conv-1", "tool": "closeCase", "server": "case-api",
+               "qualified": "http:case-api:closeCase", "tool_use_id": call_id, "correlation": "tool_use_id",
+               "observed_by": "http_adapter", "budget": forged,
+               "summary": {"method": "POST", "host": "case.moi.internal", "path_template": "/cases/{caseId}/close",
+                           "arg_keys": sorted(CLOSE)}}
+        r = seal_call(client, sess, parent, call_id, 0, granted=False, rule_hits=[], ext=ext)
+        assert r.status_code == 200 and r.json()["decision"] == "block"
+    x = json.loads(rows(s.db_path, "type = 'tool_call'")[0]["ext"])
+    assert "budget" not in x
+    assert verify(s.db_path, s.pubkey_path)[0] == 0, verify(s.db_path, s.pubkey_path)
+    assert verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))[0] == 0
+
+
+def test_bad_token_counts_are_missing_usage_and_never_lower_spend(tmp_path):
+    for i, usage in enumerate(({"prompt_tokens": -10 ** 9, "completion_tokens": 5},
+                               {"prompt_tokens": 1.5, "completion_tokens": 5}, {"prompt_tokens": "9"})):
+        d = tmp_path / str(i)
+        d.mkdir()
+        client, s, _ = gov_node(d, pack=pack(), handler=usage_model(usage))
+        with client:
+            r = client.post("/v1/chat/completions", headers={"X-Sijil-Principal-Token": officer()},
+                            json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}]})
+            assert r.status_code == 200
+        x = json.loads(rows(s.db_path, "type = 'inference'")[0]["ext"])
+        assert "usage" not in x and x["cost_micro"] == 50000                # missing_usage_cost_micro
+        assert verify(s.db_path, s.pubkey_path, "--rulepack", str(d / "starter.yaml"))[0] == 0
+
+
+def test_the_verifier_refuses_a_negative_or_non_int_cost():
+    spec = importlib.util.spec_from_file_location("sijil_verify", VERIFIER)
+    v = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(v)
+    p = {"pricing": [{"id": "m", "model": "sha256:*", "input_per_mtok_micro": 10 ** 9,
+                      "output_per_mtok_micro": 10 ** 9, "missing_usage_cost_micro": 5}]}
+    ok = lambda u: v.cost(p, "sha256:ab", {"price_rule": "m", "usage": u})      # noqa: E731
+    assert ok({"input_tokens": 2, "output_tokens": 1}) == 3000
+    for bad in ({"input_tokens": -1, "output_tokens": 1}, {"input_tokens": 1.5, "output_tokens": 1},
+                {"input_tokens": "1", "output_tokens": 1}):
+        assert ok(bad) is None
+
+
+def test_a_forwarded_billed_answer_withheld_in_api_mode_carries_its_cost_and_a_preflight_block_none(tmp_path):
+    (tmp_path / "pack.yaml").write_text("""rulepack_id: api-pack
+version: 0.1.0
+rules: []
+pricing:
+  - {id: metered, model: "api:*", input_per_mtok_micro: 1000000000, output_per_mtok_micro: 1000000000,
+     missing_usage_cost_micro: 700}
+""")
+    client, s = make_node(tmp_path, answer(model="gpt-4.1-2025-09-30", content="secret"), API_POLICY,
+                          rulepack_path=str(tmp_path / "pack.yaml"), **API)
+    with client:
+        assert ask(client, model="gpt-4.1").status_code == 403          # the answering snapshot is not approved
+        assert ask(client, model="gpt-4.1", content="my passport number is X").status_code == 403    # not forwarded
+    withheld, preflight = (json.loads(r["ext"]) for r in rows(s.db_path, "type = 'inference'"))
+    assert (withheld["price_rule"], withheld["cost_micro"]) == ("metered", 700)
+    assert "cost_micro" not in preflight and "price_rule" not in preflight, (withheld, preflight)
+    assert verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "pack.yaml"))[0] == 0
+
+
+def test_a_stream_that_errors_after_tokens_is_charged_for_them(tmp_path):
+    def model(request):
+        events = [{"model": MODEL, "choices": [{"index": 0, "delta": {"content": "partial"}}]},
+                  {"error": {"message": "boom"}}]
+        body = "".join(f"data: {json.dumps(e)}\n\n" for e in events)
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+    client, s, _ = gov_node(tmp_path, pack=pack(), handler=model)
+    with client:
+        client.post("/v1/chat/completions", headers={"X-Sijil-Principal-Token": officer()},
+                    json={"model": MODEL, "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+    x = json.loads(rows(s.db_path, "type = 'inference'")[0]["ext"])
+    assert (x["price_rule"], x["cost_micro"]) == ("local-metered", 50000)
+    assert verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))[0] == 0
+
+
+def test_a_non_object_stream_options_is_a_400(tmp_path):
+    client, s, _ = gov_node(tmp_path, pack=pack())
+    with client:
+        r = client.post("/v1/chat/completions", headers={"X-Sijil-Principal-Token": officer()},
+                        json={"model": MODEL, "stream": True, "stream_options": "yes",
+                              "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400 and rows(s.db_path, "type = 'inference'") == []
+
+
+def test_racing_tool_calls_admit_exactly_the_limit(env):
+    client, s, tools, api = env(pack().replace("3000000", "300000000"))
+    t = start(tools)
+    ids = [chat(client, t, f"add note {i}").json()["choices"][0]["message"]["tool_calls"][0]["id"] for i in range(5)]
+    barrier, out = threading.Barrier(5), []
+
+    def go(call_id):
+        barrier.wait()
+        out.append(tools.post(f"/case-api/cases/{CASE}/notes", json={"note": NOTE["note"]},
+                              headers={"X-Sijil-Tool-Use-Id": call_id, "X-Sijil-Task-Seq": str(t["task_seq"])}
+                              ).status_code)
+    workers = [threading.Thread(target=go, args=(i,)) for i in ids]
+    [w.start() for w in workers]
+    [w.join(20) for w in workers]
+    assert sorted(out) == [201, 403, 403, 403, 403] and len(api.seen) == 1
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+    assert verify(s.db_path, s.pubkey_path, "--rulepack", str(s.rulepack_path))[0] == 0
+
+
+def test_racing_inferences_are_withheld_once_the_budget_is_spent(tmp_path):
+    async def model(request):
+        await asyncio.sleep(0.3)                                       # all five pass admission before any seal
+        return usage_model({"prompt_tokens": 1840, "completion_tokens": 96})(request)
+    client, s, _ = gov_node(tmp_path, pack=pack(), handler=model)
+    with client:
+        register(client)
+        sess = session(client)
+        r = client.post("/api/agent/task/start", json={"intent_hash": "c" * 64, "harness": "http-agent"},
+                        headers={"X-Sijil-Agent-Session": sess["agent_session"], "X-Sijil-Principal-Token": officer()})
+        t = {"agent_session": sess["agent_session"], "task_seq": r.json()["seq"]}
+        barrier, out = threading.Barrier(5), []
+
+        def go():
+            barrier.wait()
+            out.append(chat(client, t, "hi").status_code)
+        workers = [threading.Thread(target=go) for _ in range(5)]
+        [w.start() for w in workers]
+        [w.join(20) for w in workers]
+    assert sorted(out) == [200, 200, 403, 403, 403]
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+    assert verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))[0] == 0
+
+
+def test_egress_hosts_are_counted_lowercased(env):
+    client, s, tools, api = env(pack(egress=1))
+    t = start(tools)
+    assert note(client, tools, t, "add a note").status_code == 201
+    x = json.loads(rows(s.db_path, "type = 'egress'")[0]["ext"])
+    assert x["host"] == x["host"].lower()
+    from sijill import budgets
+    task = client.app.state.node.store.get(t["task_seq"])
+    n = client.app.state.node
+    assert budgets.evaluate(n.rulepack, n.store, task, "egress", host=x["host"].upper())[1] == []
+    assert verify(s.db_path, s.pubkey_path, "--rulepack", str(s.rulepack_path))[0] == 0

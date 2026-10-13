@@ -283,6 +283,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             raise HTTPException(400, "request body must be JSON")
         if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
             raise HTTPException(400, "`messages` must be a list")
+        if not isinstance(payload.get("stream_options") or {}, dict):
+            raise HTTPException(400, "`stream_options` must be an object")
 
         # An agent's call is bound to its session and, when one is open, its task (spec §2.3, §17.2.8).
         sess = agents.session_of(n, request)
@@ -371,7 +373,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
         def usage(u) -> dict | None:
             """Chat completions usage as {input_tokens, output_tokens} (§17.6.2)."""
-            if isinstance(u, dict) and all(type(u.get(k)) is int for k in ("prompt_tokens", "completion_tokens")):
+            if isinstance(u, dict) and all(type(u.get(k)) is int and u[k] >= 0 for k in ("prompt_tokens", "completion_tokens")):
                 return {"input_tokens": u["prompt_tokens"], "output_tokens": u["completion_tokens"]}
             return None
 
@@ -470,6 +472,13 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     # it has its `halted` record sealed or queued ahead of ours on the lock.
                     halted = n.halted
                     uses = calls.tool_uses()
+
+                    def delivered_cost() -> dict:
+                        """Tokens reached the client before the stream ended badly: what was delivered was billed."""
+                        if not parts:
+                            return {}
+                        by = post[0]["model_digest"] if post else digest
+                        return {"ext": ext(**budgets.cost(n.rulepack, by, spent))}
                     ok = done and not errored and not halted and not (api and post is None)
                     if ok:
                         answered_by = post[0]["model_digest"] if post else digest
@@ -481,11 +490,13 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                         # already delivered. Hash it like a completed stream; nothing delivered keeps "".
                         sealed = {**body, "decision": "block", "mode": "enforce", "rule_hits": policy.rule_hits_json(
                             hits + [policy.HALT_HIT, policy.UPSTREAM_ERROR_HIT]),
-                            "output_hash": record.output_hash("".join(parts)) if parts else ""}
+                            "output_hash": record.output_hash("".join(parts)) if parts else "",
+                            **delivered_cost()}
                     elif refused:
                         sealed = {**body, **post[0]}
                     else:
-                        sealed = {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT])}
+                        sealed = {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]),
+                                  **delivered_cost()}
                     # Shielded: a client hang-up cancels this task (anyio, level-triggered), but the call
                     # must still be sealed. Seal first; closing the upstream may itself yield. The close
                     # runs even if the seal raises, so a signer outage does not leak the connection.
