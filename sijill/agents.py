@@ -27,6 +27,7 @@ PUBKEY = HEX64 = re.compile(r"[0-9a-f]{64}")
 DECIMAL = re.compile(r"[1-9][0-9]{0,17}")      # fits SQLite INTEGER
 OUTCOMES = ("completed", "aborted", "blocked", "error", "timeout")
 SEALABLE = ("tool_call", "tool_result", "egress", "integrity_baseline", "integrity_drift")   # row 5; approval: 18g
+GUARD_HITS = ("http-operation-unknown",)    # the one reserved id the guard seals itself, on a blocked call (§17.3.4)
 PARENT_TYPE = {"tool_call": "inference", "tool_result": "tool_call", "egress": "tool_call",
                "integrity_drift": "integrity_baseline"}
 COUNTS = ("inference", "tool_calls", "blocked", "confirmed", "denied", "flagged", "egress")
@@ -407,7 +408,9 @@ def router(require_admin) -> APIRouter:
             raise HTTPException(400, "rule_hits must be a list of strings and ext an object")
         if not isinstance(b.get("rulepack_hash"), str):
             raise HTTPException(400, "rulepack_hash must be a string")
-        if any(h in policy.RESERVED_IDS or h.startswith(policy.RESERVED_PREFIXES) for h in hits):
+        guard_ok = t == "tool_call" and b.get("decision") == "block" and b.get("mode") == "enforce"
+        if any((h in policy.RESERVED_IDS or h.startswith(policy.RESERVED_PREFIXES)) and not (guard_ok and h in GUARD_HITS)
+               for h in hits):
             raise HTTPException(400, "rule_hits may not carry reserved ids; the node adds those itself")
         task = task_for(n, sess, b.get("task_seq"))
         if task is None and t in record.TASK_REQUIRED:

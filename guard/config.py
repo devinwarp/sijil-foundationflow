@@ -2,24 +2,32 @@
 setting the guard does not honour is never mistaken for one it does."""
 
 import fnmatch
+import ipaddress
 import os
 import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
 PRINCIPAL = re.compile(r"oidc:[a-z0-9.-]+:\S+|email:[0-9a-f]{64}|local:[0-9a-f]{64}|human:[a-z0-9-]{1,32}:[0-9a-f]{64}")
 SECTIONS = {"version", "sijil", "identity", "task", "state_path", "repo", "rulepack", "egress", "context_window",
-            "correlation", "results", "servers", "allowed_command_dirs", "mcp", "lockfile", "integrity"}
+            "correlation", "results", "servers", "allowed_command_dirs", "mcp", "lockfile", "integrity", "http_tools"}
+TOOLS_KEYS = {"allow", "deny"}
 KEYS = {"sijil": {"url", "token_env", "on_unreachable"},
         "identity": {"agent_id", "auth", "key_path", "registered_by", "display_name", "oidc_token_env"},
         "task": {"intent", "harness", "principal_header"},
         "egress": {"pins"}, "correlation": {"require_parent"}, "results": {"max_result_bytes", "invisible_unicode"}, "mcp": {"allowed_origins", "tools_token_env", "tls_cert", "tls_key"},
-        "integrity": {"recheck_seconds"}}
-TOOLS_KEYS = {"allow", "deny"}
+        "integrity": {"recheck_seconds"},
+        "http_tools": {"listen", "tls", "inbound_auth", "servers"}, "http_tools.tls": {"cert", "key"},
+        "http_tools.inbound_auth": {"mode", "token_env", "client_ca"}, "http_tools.operations": TOOLS_KEYS,
+        "http_tools.server": {"name", "upstream", "spec", "label", "forward_headers", "operations", "max_body_bytes",
+                              "command_arg"}}
 SERVER_KEYS = {"name", "transport", "command", "args", "env", "url", "headers", "label", "tools", "command_arg"}
+HARNESSES = ("foundry", "http-agent", "other")                      # X-Sijil-Harness values (spec §17.3.3)
+NOT_FORWARDED = {"host", "content-length", "transfer-encoding", "connection"}      # the adapter sets these itself
 SERVER_NAME = re.compile(r"[a-z0-9_-]{1,32}")                      # source_label mcp:<name> (spec §17.1)
 LABELS = ("telemetry", "web", "memory", "repo")                    # `user` cannot be assigned (spec §5.2)
 COMMAND_DIRS = ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "~/.nvm/versions/*/bin", "node_modules/.bin")
@@ -114,6 +122,119 @@ def _servers(doc: dict, path: str, repo: str) -> tuple:
 
 
 @dataclass(frozen=True)
+class HttpServer:
+    name: str                     # source_label http:<name>; tools are http:<name>:<operationId>
+    upstream: str
+    spec: str                     # OpenAPI 3.0/3.1, JSON or YAML
+    label: str
+    forward_headers: tuple        # lower-case names passed upstream; values are never sealed
+    allow: tuple
+    deny: tuple
+    max_body_bytes: int
+    command_arg: str
+
+    def allowed(self, operation: str) -> bool:
+        """Allow wins over deny; with no lists every operation is allowed (as for an MCP server)."""
+        if any(fnmatch.fnmatchcase(operation, g) for g in self.allow):
+            return True
+        return not self.deny or not any(fnmatch.fnmatchcase(operation, g) for g in self.deny)
+
+
+@dataclass(frozen=True)
+class HttpTools:
+    listen: str
+    tls_cert: str
+    tls_key: str
+    auth: str                     # bearer_env | mtls | none (loopback only)
+    token: str                    # bearer_env: the expected X-Sijil-Tools-Token
+    client_ca: str                # mtls: the CA client certificates must chain to
+    servers: tuple
+
+
+def loopback(host: str) -> bool:
+    """An allowlist: localhost, 127.0.0.0/8 and ::1. An empty host or 0.0.0.0 binds every interface."""
+    host = host.strip("[]")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _keys(d, name: str, path: str) -> dict:
+    """A mapping with only the keys KEYS[name] lists."""
+    if d is None:
+        return {}
+    if not isinstance(d, dict) or set(d) - KEYS[name]:
+        raise ValueError(f"{path}: {name} must be a mapping with only {sorted(KEYS[name])}")
+    return d
+
+
+def _strs(v, what: str, path: str) -> tuple:
+    if v is None:
+        return ()
+    if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+        raise ValueError(f"{path}: {what} must be a list of strings")
+    return tuple(v)
+
+
+def _http_server(s, path: str, base: Path) -> HttpServer:
+    s = _keys(s, "http_tools.server", path)
+    name, label, up, spec = s.get("name", ""), s.get("label", ""), s.get("upstream"), s.get("spec")
+    if not isinstance(name, str) or not SERVER_NAME.fullmatch(name) or not isinstance(label, str) \
+            or (label and label not in LABELS) or not isinstance(up, str) or not isinstance(spec, str) or not spec:
+        raise ValueError(f"{path}: http_tools server {name!r} needs a [a-z0-9_-] name, upstream and spec")
+    u = urlsplit(up)
+    if u.scheme not in ("http", "https") or not u.hostname or u.query or u.fragment or u.username:
+        raise ValueError(f"{path}: http_tools server {name}: upstream must be an http(s) URL without credentials")
+    ops = _keys(s.get("operations"), "http_tools.operations", path)
+    fwd = tuple(h.lower() for h in _strs(s.get("forward_headers"), f"server {name}: forward_headers", path))
+    if any(h.startswith("x-sijil-") or h in NOT_FORWARDED for h in fwd):
+        raise ValueError(f"{path}: http_tools server {name}: forward_headers may not name X-Sijil-* or "
+                         f"{sorted(NOT_FORWARDED)}")
+    cap = s.get("max_body_bytes", 1048576)
+    if type(cap) is not int or cap < 1:
+        raise ValueError(f"{path}: http_tools server {name}: max_body_bytes must be a positive integer")
+    return HttpServer(name=name, upstream=up.rstrip("/"), spec=_path(spec, f"http_tools server {name}: spec", base),
+                      label=label or f"http:{name}", forward_headers=fwd,
+                      allow=_strs(ops.get("allow"), "operations.allow", path),
+                      deny=_strs(ops.get("deny"), "operations.deny", path), max_body_bytes=cap,
+                      command_arg=str(s.get("command_arg", "")))
+
+
+def _http_tools(d, path: str, base: Path) -> HttpTools | None:
+    """spec §17.3.2. Off loopback both TLS and inbound auth are required; entra inbound auth is row 42."""
+    if not d:
+        return None
+    d = _keys(d, "http_tools", path)
+    tls, auth = _keys(d.get("tls"), "http_tools.tls", path), _keys(d.get("inbound_auth"), "http_tools.inbound_auth", path)
+    listen, mode = d.get("listen", "127.0.0.1:8090"), auth.get("mode", "none")
+    host, _, port = listen.rpartition(":") if isinstance(listen, str) else ("", "", "")
+    if not port.isdecimal() or not 0 < int(port) < 65536:
+        raise ValueError(f"{path}: http_tools.listen must be HOST:PORT")
+    if mode not in ("bearer_env", "mtls", "none"):
+        raise ValueError(f"{path}: http_tools.inbound_auth.mode must be bearer_env or mtls (entra is not built)")
+    cert, key = _path(tls.get("cert", ""), "http_tools.tls.cert", base), _path(tls.get("key", ""), "http_tools.tls.key", base)
+    if not loopback(host) and (not cert or not key or mode == "none"):
+        raise ValueError(f"{path}: http_tools off loopback needs tls.cert, tls.key and inbound_auth")
+    ca = _path(auth.get("client_ca", ""), "http_tools.inbound_auth.client_ca", base)
+    if mode == "mtls" and not (cert and key and ca):
+        raise ValueError(f"{path}: inbound_auth mtls needs tls and inbound_auth.client_ca")
+    env = auth.get("token_env", "SIJIL_TOOLS_TOKEN")
+    token = os.environ.get(env, "") if mode == "bearer_env" and isinstance(env, str) else ""
+    if mode == "bearer_env" and not token:
+        raise ValueError(f"{path}: inbound_auth bearer_env: {env} is not set")
+    items = d.get("servers") or []
+    if not isinstance(items, list):
+        raise ValueError(f"{path}: http_tools.servers must be a list")
+    servers = tuple(_http_server(s, path, base) for s in items)
+    if len({s.name for s in servers}) != len(servers):
+        raise ValueError(f"{path}: http_tools server names must be unique")
+    return HttpTools(listen=listen, tls_cert=cert, tls_key=key, auth=mode, token=token, client_ca=ca, servers=servers)
+
+
+@dataclass(frozen=True)
 class Config:
     path: str
     url: str
@@ -142,6 +263,7 @@ class Config:
     tls_key: str
     lockfile: str                 # pinned tool definitions (spec §7.4); "" = none, only invisible Unicode is checked
     recheck_seconds: float        # tools/call re-checks the wrapped server's tools when the last check is older
+    http_tools: HttpTools | None = None
 
 
 def _path(p: str, name: str, base: Path) -> str:
@@ -227,4 +349,5 @@ def load(path: str) -> Config:
                   tools_token=os.environ.get(tools_env, "") if tools_env else "",
                   tls_cert=_path(mcp.get("tls_cert", ""), "mcp.tls_cert", base),
                   tls_key=_path(mcp.get("tls_key", ""), "mcp.tls_key", base),
-                  lockfile=_path(doc.get("lockfile", ""), "lockfile", base), recheck_seconds=float(recheck))
+                  lockfile=_path(doc.get("lockfile", ""), "lockfile", base), recheck_seconds=float(recheck),
+                  http_tools=_http_tools(doc.get("http_tools"), path, base))

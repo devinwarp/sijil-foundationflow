@@ -6,6 +6,7 @@
   task end --outcome OUTCOME
   serve --server NAME [--http HOST:PORT]   the MCP guard for one wrapped server (stdio unless --http)
   tools pin --server NAME           pin the server's tool definitions in the lockfile; seal the baseline
+  http                              the HTTP tool adapter (http_tools:)
 """
 
 import argparse
@@ -13,7 +14,7 @@ import asyncio
 import os
 import sys
 
-from . import config, identity, serve, task
+from . import config, http, identity, serve, task
 from .ledger import Ledger, Refused, Unreachable
 
 
@@ -64,6 +65,8 @@ def main(argv: list[str] | None = None, ledger: Ledger | None = None) -> int:
         elif cmd == "tools pin":
             seq, n = asyncio.run(serve.pin(cfg, a.server, ledger))
             print(f"pinned {n} tools of {a.server} in {cfg.lockfile}; integrity_baseline seq={seq}")
+        elif cmd == "http":
+            http.run(cfg, ledger)
         elif cmd == "serve":
             asyncio.run(serve.run(cfg, a.server, ledger, a.http))
         else:
