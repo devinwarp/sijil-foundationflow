@@ -171,6 +171,15 @@ def session_of(n, request: Request) -> dict | None:
     return sess
 
 
+async def require_session(request: Request) -> dict:
+    n = request.app.state.node
+    await close_expired(n)
+    sess = session_of(n, request)
+    if sess is None:
+        raise HTTPException(401, "X-Sijil-Agent-Session required")
+    return sess
+
+
 def task_for(n, sess: dict, task_seq) -> dict | None:
     """The open task a call belongs to: the named one, which must be this session's, or else the session's
     only open task, or None when it has none. Several open tasks and no name: 409 (spec §17.3.3)."""
@@ -220,6 +229,23 @@ def check_parent(store, body: dict, ext: dict) -> None:
         raise HTTPException(400, "drift baseline mismatch")
 
 
+def check_approval(store, body: dict, x: dict) -> None:
+    """What the verifier's V2 and V3 would refuse: the cited decision answers this very call, once."""
+    d = store.get(x["approval_seq"]) if type(x["approval_seq"]) is int else None
+    dx = json.loads(d["ext"]) if d and d["type"] == "approval" else {}
+    if dx.get("phase") != "decision" or d["task_seq"] != body["task_seq"]:
+        raise HTTPException(400, "approval_seq must be the seq of an approval decision in this task")
+    req = store.get(int(d["parent_seq"]))
+    if json.loads(req["ext"])["qualified"] != x.get("qualified") or req["input_hash"] != body["input_hash"]:
+        raise HTTPException(409, "the approval is for another call")
+    granted = dx["outcome"] == "granted"
+    if (x.get("confirmation") == "granted") != granted or \
+            (body["decision"], body["mode"]) != (("flag", "record") if granted else ("block", "enforce")):
+        raise HTTPException(400, "confirmation, decision and mode must follow the approval's outcome (spec §2.5)")
+    if store.approval_used(x["approval_seq"]):
+        raise HTTPException(409, "approval already used")
+
+
 def task_counts(store, task_seq: int) -> dict:
     """task_end counts, as ints, with the verifier's L2 meanings; last_seq is the task_start when empty."""
     c, last = dict.fromkeys(COUNTS, 0), task_seq
@@ -242,6 +268,8 @@ async def end_task(n, start: dict, outcome: str) -> dict:
     def build() -> dict:   # under the seal lock: no record of the task can land between count and seal
         if n.store.task_ended(start["seq"]):
             raise HTTPException(409, "task already ended")
+        if n.approvals.pending_in(start["seq"]):     # V4: every request is decided before task_end
+            raise HTTPException(409, "approval pending in this task")
         x = {"outcome": outcome, **task_counts(n.store, start["seq"])}
         return n.body(n.policy, "task_end", agent_id=start["agent_id"], principal=start["principal"],
                       task_seq=str(start["seq"]), ext=cj(x))
@@ -274,14 +302,6 @@ def router(require_admin) -> APIRouter:
             raise HTTPException(503, "agent endpoints disabled: set SIJILL_TOKEN")
         if not hmac.compare_digest(request.headers.get("x-sijil-token", "").encode(), want.encode()):
             raise HTTPException(401, "X-Sijil-Token required")
-
-    async def require_session(request: Request) -> dict:
-        n = node(request)
-        await close_expired(n)
-        sess = session_of(n, request)
-        if sess is None:
-            raise HTTPException(401, "X-Sijil-Agent-Session required")
-        return sess
 
     async def registrar(request: Request) -> tuple[str | None, str]:
         """(registered_by or None to take the body's, principal_auth): open -> none; closed -> the admin
@@ -411,6 +431,8 @@ def router(require_admin) -> APIRouter:
         if n.halted and t in ("tool_call", "tool_result", "egress"):   # the operator halt stops agents too
             fields.update(mode="enforce", decision="block")
             hits = [*hits, policy.HALT_HIT]
+            if "approval_seq" in x:          # a blocked call consumes no grant (V2)
+                x = {**{k: v for k, v in x.items() if k != "approval_seq"}, "confirmation": "denied"}
         if not all(isinstance(v, str) for v in fields.values()):
             raise HTTPException(400, "parent_seq, source_label, mode, decision, input_hash and output_hash must be strings")
         try:
@@ -428,6 +450,8 @@ def router(require_admin) -> APIRouter:
             if task is not None and n.store.task_ended(task["seq"]):
                 raise HTTPException(409, "task already ended")
             check_parent(n.store, body, x)
+            if t == "tool_call" and "approval_seq" in x:
+                check_approval(n.store, body, x)
             return body
         try:
             rec = await n.seal(build)

@@ -26,7 +26,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from . import agents, chat, keys, oidc, policy, record, rulepack
+from . import agents, approvals, chat, keys, oidc, policy, record, rulepack
 from .digest import DigestResolver
 from .store import Store
 
@@ -60,6 +60,7 @@ class Settings:
     halt_path: str = "sijill.halt"
     digest_cache: str = ".sijill_digests.json"
     jwks_dir: str = "jwks"             # JWKS snapshots by hash (spec §17.2.6); not evidence
+    public_url: str = ""               # this ledger's URL as approvers reach it, for approval links (spec §17.5.2)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -84,6 +85,7 @@ class Settings:
             halt_path=e("SIJILL_HALT_PATH", cls.halt_path),
             digest_cache=e("SIJILL_DIGEST_CACHE", cls.digest_cache),
             jwks_dir=e("SIJILL_JWKS_DIR", cls.jwks_dir),
+            public_url=e("SIJILL_PUBLIC_URL", ""),
         )
 
 
@@ -131,13 +133,15 @@ class Node:
         # deleted or edited at the tail while running still shows up as a break.
         self.head = self.store.head()
         self.agents = agents.Registry(self.store)
+        self.approvals = approvals.Approvals(self.store)
         self.lock = asyncio.Lock()
         self.halted = Path(settings.halt_path).exists()
         self.resolver = resolver or DigestResolver(cache_path=settings.digest_cache)
         headers = {"Authorization": f"Bearer {settings.upstream_token}"} if settings.upstream_token else {}
         self.client = httpx.AsyncClient(base_url=settings.upstream, headers=headers,
                                         timeout=settings.upstream_timeout, transport=transport)
-        self.idp = httpx.AsyncClient(timeout=10.0, transport=idp_transport)   # discovery and JWKS only
+        # discovery, JWKS and approval notifications (spec §17.5.1 notify); nothing the model sees
+        self.idp = httpx.AsyncClient(timeout=10.0, transport=idp_transport)
         self.jwks = self.keys_for(self.policy)
 
     def keys_for(self, pol: policy.Policy) -> dict:
@@ -189,7 +193,8 @@ class Node:
                     raise rulepack.Mismatch(self.rulepack_hash)
                 body = {**body, "rulepack_hash": self.rulepack_hash}
             seq, prev = self.head
-            rec = record.seal({**body, "ts": record.now_ts()}, seq + 1, prev, self.key)
+            # A builder may set ts itself, under this lock, when a check depends on it (an approval deadline).
+            rec = record.seal({**body, "ts": body.get("ts") or record.now_ts()}, seq + 1, prev, self.key)
             self.store.append(rec)
             self.head = (rec["seq"], rec["record_hash"])
             if rec["type"] == "rulepack_change":
@@ -247,7 +252,9 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         if last and last["policy_hash"] != n.policy.hash:
             await n.adopt_policy(n.policy, old_hash=last["policy_hash"], old=None)
         await agents.close_expired(n)
+        await approvals.start(n)
         yield
+        approvals.stop(n)
         await app.state.node.aclose()
 
     app = FastAPI(title="Sijill", lifespan=lifespan)
@@ -263,6 +270,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             raise HTTPException(401, "admin token required")
 
     app.include_router(agents.router(require_admin))
+    app.include_router(approvals.router())
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):

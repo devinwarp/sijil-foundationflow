@@ -132,6 +132,11 @@ class Store:
                                 "ORDER BY seq DESC LIMIT 1", (lockfile_hash,)).fetchone()
         return row[0] if row else None
 
+    def approval_used(self, decision_seq: int) -> bool:
+        """A tool_call already cites this approval decision (check V3: a grant is single-use)."""
+        return self.conn.execute("SELECT 1 FROM records WHERE type = 'tool_call' AND ext != '' AND "
+                                 "json_extract(ext, '$.approval_seq') = ?", (decision_seq,)).fetchone() is not None
+
     def has_child(self, type_: str, parent_seq: str) -> bool:
         return self.conn.execute("SELECT 1 FROM records WHERE type = ? AND parent_seq = ?",
                                  (type_, parent_seq)).fetchone() is not None
