@@ -359,3 +359,9 @@ def test_a_notification_never_fails_and_needs_a_public_url(tmp_path, monkeypatch
         assert "notification failed" in capsys.readouterr().err
     assert verify(s.db_path, s.pubkey_path)[0] == 0
     assert verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))[0] == 0
+
+
+def test_the_approval_page_clears_the_token_from_the_address_bar():
+    page = approvals.PAGE.read_text()
+    read, clear = page.index('fragment.get("access_token")'), page.index('history.replaceState(null, "", location.pathname)')
+    assert read < clear                                     # read first, then gone from the address and history

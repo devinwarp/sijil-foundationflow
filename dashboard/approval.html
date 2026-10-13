@@ -36,6 +36,7 @@
   const id = location.pathname.split("/").pop();
   const fragment = new URLSearchParams(location.hash.slice(1));
   if (fragment.get("access_token")) document.getElementById("token").value = fragment.get("access_token");
+  if (location.hash) history.replaceState(null, "", location.pathname);   // the token leaves the address bar and history
   const show = (facts) => {
     const dl = document.getElementById("facts");
     dl.replaceChildren();
