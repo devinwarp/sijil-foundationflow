@@ -118,6 +118,7 @@ def test_valid_token_seals_a_pseudonymous_principal_and_its_claims(tmp_path):
     (officer(tid="ffffffff-0000-4000-8000-000000000000"), 401, "principal-invalid", "tenant"),
     (officer(ver="1.0"), 401, "principal-invalid", "issuer"),
     (officer(life=-5), 401, "principal-expired", "expired"),
+    (officer(life=60), 401, "principal-expired", "expired"),     # would expire before the answer is sealed (U1)
     (officer(aud="api://other"), 401, "principal-invalid", "audience"),
 ])
 def test_each_refusal_seals_its_reserved_hit(tmp_path, token, status, hit, code):

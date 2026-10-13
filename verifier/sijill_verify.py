@@ -5,11 +5,12 @@
 Sijill verifier: standalone CLI. Record schema v2.
 
 Reimplements canonicalisation and verification from the Build Spec (docs/README.md) and the
-agent integration spec (§2.2 hashing, §4 checks). Deliberately imports nothing from the `sijill/`
-package: the thing that checks the records is not the thing that wrote them.
+agent integration spec (§2.2 hashing, §4 checks, §17.7 government checks). Deliberately imports nothing
+from the `sijill/` package: the thing that checks the records is not the thing that wrote them.
 
     python verifier/sijill_verify.py --db sijill.db --pubkey node.pub [--json]
         [--allow-orphan-tool-calls] [--allow-unauthenticated-agents]
+        [--token-dir DIR] [--jwks-dir DIR] [--min-principal-assurance low|substantial|high]
 
 Prints exactly one result line, `PASS records=N first=<ts> last=<ts> attestation=... agent_auth=...`
 or `FAIL seq=N <reason>`; with --json, one JSON object instead. When stdout is a terminal the line
@@ -17,16 +18,18 @@ is preceded by a large banner for projector display (disable with --plain). Exit
 """
 
 import argparse
+import base64
 import json
 import os
 import re
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from hashlib import sha256
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
 
 FIELDS = (
     "seq", "type", "ts", "model_id", "model_digest", "node_id", "node_region",
@@ -56,6 +59,12 @@ ID_SYNTAX = {"spiffe": r"spiffe://[a-z0-9.-]+/\S+", "wimse": r"wimse://[a-z0-9.-
 CONTINUITY = ("logical_agent_id", "responsible_entity", "lifecycle_class", "runtime_identities", "derived_from")
 REGISTER_AUTH = {"key": ("key", "mtls"), "oidc": ("oidc",), "relay": ("relay",)}   # N: register auth -> agent_auth
 TASK_COUNTS = ("inference", "tool_calls", "blocked", "confirmed", "denied", "flagged", "egress")
+ASSURANCE = ("low", "substantial", "high")                         # §17.1 PRINCIPAL_ASSURANCE, in order
+HUMAN = re.compile(r"human:([a-z0-9-]{1,32}):([0-9a-f]{64})")
+CLAIMS_REQ = ("issuer_id", "profile", "validation", "iss", "aud", "tenant", "assurance", "assurance_rule",
+              "delegated", "token_hash")
+CLAIMS_JWT = ("kid", "alg", "jwks_hash", "nbf", "exp")
+PRINCIPAL_KINDS = {"human": "human", "oidc": "workload", "local": "local", "email": "local"}   # Ruling: email is local
 
 BANNER_FONT = {
     "P": ["█████ ", "██  ██", "█████ ", "██    ", "██    "],
@@ -135,8 +144,12 @@ class Seen:
 
 
 class State:
-    def __init__(self, allow_orphans=False, allow_unauthenticated=False):
+    def __init__(self, allow_orphans=False, allow_unauthenticated=False, token_dir=None, jwks_dir=None,
+                 min_assurance=None):
         self.allow_orphans, self.allow_unauthenticated = allow_orphans, allow_unauthenticated
+        self.token_dir, self.jwks_dir, self.min_assurance = token_dir, jwks_dir, min_assurance
+        self.principals = dict.fromkeys(("human", "workload", "local", "none"), 0)
+        self.principal_tokens = dict.fromkeys(("verified", "unverified", "unverifiable"), 0)
         self.seen = {}                  # seq -> Seen
         self.result_parents = set()     # B3: tool_call seqs that already have a tool_result
         self.rulepack, self.rulepack_seen = "", False
@@ -278,6 +291,8 @@ def identity_checks(st, rec, x, parent):
         raise Fail("agent_id_malformed", "agent_id malformed")
     if principal and not PRINCIPAL.fullmatch(principal):
         raise Fail("principal_malformed", "principal malformed")
+    if t in ("task_start", "inference"):
+        principal_checks(st, rec, x, task)
     if t == "task_start":
         start_task(st, rec, x)
     elif t == "agent_register":
@@ -343,8 +358,110 @@ def start_task(st, rec, x):
                   and getattr(st.seen.get(int(d)), "type", None) == "task_start"):
         raise Fail("delegated_from_missing", "delegated_from missing")
     st.agent_auth[auth] += 1
+    st.principals[PRINCIPAL_KINDS.get(rec["principal"].split(":", 1)[0], "none")] += 1
     st.tasks[seq] = {"agent_id": rec["agent_id"], "principal": rec["principal"], "ended": False,
-                     "counts": dict.fromkeys(TASK_COUNTS, 0), "last_seq": seq}
+                     "counts": dict.fromkeys(TASK_COUNTS, 0), "last_seq": seq, "claims": x.get("principal_claims")}
+
+
+def claims_ok(c):
+    """U: every §17.2.5 key, the jwt keys when validation is jwt, enums in range."""
+    return (isinstance(c, dict) and all(k in c for k in CLAIMS_REQ)
+            and c["profile"] in ("entra", "uaepass", "oidc") and c["validation"] in ("jwt", "userinfo")
+            and c["assurance"] in ASSURANCE and (c["validation"] != "jwt" or all(k in c for k in CLAIMS_JWT)))
+
+
+def principal_checks(st, rec, x, task):
+    """U-U3 (spec §17.7) on a task_start or an inference: claims shape and issuer, the token lifetime at ts,
+    the customer-kept token when --token-dir is given, and the assurance floor."""
+    principal, claims = rec["principal"], x.get("principal_claims")
+    human = HUMAN.fullmatch(principal)
+    refusal = "principal_error" in x                    # Ruling: a sealed refusal carries no claims (§17.2.7)
+    if claims is not None and not claims_ok(claims):
+        raise Fail("principal_claims_malformed", "principal claims malformed")
+    if human and claims is None and not refusal and (rec["type"] == "task_start" or task is None):
+        raise Fail("principal_claims_malformed", "principal claims malformed")
+    if claims is not None and human and claims["issuer_id"] != human.group(1):
+        raise Fail("principal_claims_malformed", "principal claims malformed")
+    if rec["type"] == "task_start" and claims is not None and x.get("principal_auth") != "oidc":
+        raise Fail("principal_claims_malformed", "principal claims malformed")
+    if task is not None and claims is not None:                                       # U1, issuer
+        if task["claims"] is None or claims["issuer_id"] != task["claims"]["issuer_id"]:
+            raise Fail("principal_claims_malformed", "principal claims malformed")
+        task["claims"] = claims
+    in_force = claims if claims is not None else (task or {}).get("claims")
+    if in_force is not None and in_force["validation"] == "jwt" and not refusal:      # U1, lifetime
+        if not in_force["nbf"] <= rec["ts"] < in_force["exp"]:
+            raise Fail("principal_token_not_valid", "principal token not valid at ts")
+    if claims is not None:
+        token_check(st, principal, claims)                                            # U2
+    if (rec["type"] == "task_start" and human and st.min_assurance and claims is not None      # U3
+            and ASSURANCE.index(claims["assurance"]) < ASSURANCE.index(st.min_assurance)):
+        raise Fail("principal_assurance_low", f"principal assurance below {st.min_assurance}")
+
+
+def b64d(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def ts_of(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def jws_valid(token, kid, alg, jwks):
+    """The compact JWS verifies under the JWKS key named kid, with alg EdDSA or RS256."""
+    head, body, sig = token.split(".")
+    key = next((k for k in jwks.get("keys", []) if isinstance(k, dict) and k.get("kid") == kid), None)
+    try:
+        if alg == "EdDSA" and key and key.get("kty") == "OKP":
+            ed25519.Ed25519PublicKey.from_public_bytes(b64d(key["x"])).verify(b64d(sig), f"{head}.{body}".encode())
+        elif alg == "RS256" and key and key.get("kty") == "RSA":
+            n, e = (int.from_bytes(b64d(key[k]), "big") for k in ("n", "e"))
+            rsa.RSAPublicNumbers(e, n).public_key().verify(b64d(sig), f"{head}.{body}".encode(),
+                                                            padding.PKCS1v15(), hashes.SHA256())
+        else:
+            return False
+    except (InvalidSignature, ValueError, KeyError, TypeError):
+        return False
+    return True
+
+
+def token_check(st, principal, c):
+    """U2: with --token-dir, the kept token is the sealed one, verifies under the kept JWKS, and its claims are
+    the sealed claims and the principal. A token not kept is unverified; userinfo tokens are unverifiable."""
+    if c["validation"] != "jwt":
+        st.principal_tokens["unverifiable"] += 1
+        return
+    path = os.path.join(st.token_dir or "", c["token_hash"] + ".jwt")
+    if not st.token_dir or not os.path.exists(path):
+        st.principal_tokens["unverified"] += 1
+        return
+    mismatch = Fail("principal_token_mismatch", "principal token mismatch")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        with open(os.path.join(st.jwks_dir or st.token_dir, c["jwks_hash"] + ".json"), "rb") as f:
+            jwks_raw = f.read()
+        token = raw.decode()
+        head, payload = (json.loads(b64d(p)) for p in token.split(".")[:2])
+        jwks = json.loads(jwks_raw)
+    except (OSError, ValueError, UnicodeDecodeError):
+        raise mismatch
+    if (sha256(raw).hexdigest() != c["token_hash"] or sha256(jwks_raw).hexdigest() != c["jwks_hash"]
+            or head.get("kid") != c["kid"] or head.get("alg") != c["alg"]
+            or not jws_valid(token, c["kid"], c["alg"], jwks)):
+        raise mismatch
+    aud = payload.get("aud")
+    subject = payload.get("oid" if c["profile"] == "entra" else "sub")     # Ruling: the default subject_claim
+    try:
+        times = ts_of(payload.get("nbf", payload.get("iat"))) == c["nbf"] and ts_of(payload["exp"]) == c["exp"]
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        times = False
+    human = HUMAN.fullmatch(principal)
+    if (payload.get("iss") != c["iss"] or not (aud == c["aud"] or (isinstance(aud, list) and c["aud"] in aud))
+            or (c["profile"] == "entra" and payload.get("tid") != c["tenant"]) or not times or not human
+            or sha256(canonical_json({"iss": payload.get("iss"), "sub": subject})).hexdigest() != human.group(2)):
+        raise mismatch
+    st.principal_tokens["verified"] += 1
 
 
 def register_agent(st, rec, x):
@@ -388,11 +505,13 @@ def read_rows(conn):
             for row in conn.execute(f"SELECT {', '.join(cols)} FROM records ORDER BY seq ASC"))
 
 
-def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated=False):
+def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated=False, token_dir=None,
+                jwks_dir=None, min_assurance=None):
     """Walk the chain in seq order, stop at the first failure. Returns the --json object."""
-    st = State(allow_orphans, allow_unauthenticated)
+    st = State(allow_orphans, allow_unauthenticated, token_dir, jwks_dir, min_assurance)
     res = {"ok": False, "line": "", "seq": None, "code": None, "records": 0, "attestation": st.attestation,
-           "agent_auth": st.agent_auth, "orphans": 0, "unauthenticated": 0, "agents": {}}
+           "agent_auth": st.agent_auth, "orphans": 0, "unauthenticated": 0, "agents": {},
+           "principals": st.principals, "principal_tokens": st.principal_tokens}
 
     def fail(seq, code, reason):
         res.update(seq=seq, code=code, line=f"FAIL seq={seq} {reason}" if seq is not None else f"FAIL {reason}",
@@ -442,7 +561,8 @@ def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated
         if conn is not None:
             conn.close()
     line = (f"PASS records={res['records']} first={first_ts or '-'} last={last_ts or '-'} "
-            f"attestation={counts(st.attestation)} agent_auth={counts(st.agent_auth)}")
+            f"attestation={counts(st.attestation)} agent_auth={counts(st.agent_auth)} "
+            f"principals={counts(st.principals)} principal_tokens={counts(st.principal_tokens)}")
     if allow_orphans and st.orphans:
         line += f" orphans={st.orphans}"
     if allow_unauthenticated and st.unauthenticated:
@@ -475,10 +595,15 @@ def main(argv=None):
                         help="accept tool_call records with correlation=none and no parent (counted)")
     parser.add_argument("--allow-unauthenticated-agents", action="store_true",
                         help="accept tasks with agent_auth=none (counted)")
+    parser.add_argument("--token-dir", help="customer-kept principal tokens, <token_hash>.jwt (check U2)")
+    parser.add_argument("--jwks-dir", help="JWKS snapshots, <jwks_hash>.json (check U2; default: --token-dir)")
+    parser.add_argument("--min-principal-assurance", choices=ASSURANCE,
+                        help="every task with a human principal has at least this assurance (check U3)")
     args = parser.parse_args(argv)
 
     res = verify_full(args.db, args.pubkey, allow_orphans=args.allow_orphan_tool_calls,
-                      allow_unauthenticated=args.allow_unauthenticated_agents)
+                      allow_unauthenticated=args.allow_unauthenticated_agents, token_dir=args.token_dir,
+                      jwks_dir=args.jwks_dir, min_assurance=args.min_principal_assurance)
     ok, line = res["ok"], res["line"]
     if args.json:
         print(json.dumps(res, sort_keys=True))

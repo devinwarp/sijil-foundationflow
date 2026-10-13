@@ -187,8 +187,9 @@ def decode(token):
     return header, claims, f"{head}.{body}".encode(), signature
 
 
-async def validate(token, issuers: dict, jwks: dict, now: float) -> Verified:
-    """§17.2.3 steps 1-4: alg, issuer by exact iss, kid and signature, aud, nbf/exp."""
+async def validate(token, issuers: dict, jwks: dict, now: float, margin: float = 0.0) -> Verified:
+    """§17.2.3 steps 1-4: alg, issuer by exact iss, kid and signature, aud, nbf/exp. A token that expires within
+    `margin` seconds counts as expired: the record it authorises is sealed up to that long after now (U1)."""
     header, claims, signing_input, signature = decode(token)
     if header.get("alg") not in ALGS:
         raise OidcError("alg")
@@ -219,7 +220,7 @@ async def validate(token, issuers: dict, jwks: dict, now: float) -> Verified:
     exp, nbf = claims.get("exp"), claims.get("nbf", claims.get("iat"))
     if not all(type(v) in (int, float) and abs(v) < 1e18 for v in (exp, nbf)):
         raise OidcError("malformed")
-    if now >= exp:
+    if now + margin >= exp:
         raise OidcError("expired")
     if now < nbf - SKEW_S:
         raise OidcError("not_yet_valid")
@@ -281,11 +282,11 @@ def token_of(pcfg, headers) -> str | None:
     return token
 
 
-async def human(pcfg, jwks: dict, token, now: float) -> dict:
+async def human(pcfg, jwks: dict, token, now: float, margin: float = 0.0) -> dict:
     """§17.2.3 steps 1-8 for validation: jwt. Returns {principal, claims, display}; raises OidcError."""
     if token is None:
         raise OidcError("missing")
-    v = await validate(token, {i["issuer"]: i for i in pcfg.issuers}, jwks, now)
+    v = await validate(token, {i["issuer"]: i for i in pcfg.issuers}, jwks, now, margin)
     c, i = v.claims, v.cfg
     if i["profile"] == "entra" and c.get("ver") != "2.0":
         raise OidcError("issuer")                      # v1.0 tokens carry another iss (§17.2.3 step 2)

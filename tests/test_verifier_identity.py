@@ -10,7 +10,8 @@ from conftest import verify, verify_json
 from v2chain import AGENT, AGENT_KEY, NEW_KEY, PRINCIPAL, SENTRY_ARGS
 
 DEMO_PASS = ("PASS records=15 first=2026-10-01T08:00:00.000Z last=2026-10-01T08:00:14.000Z "
-             "attestation=weights:0,api:2,api+tee:0,none:0 agent_auth=key:1,mtls:0,oidc:0,relay:0,none:0")
+             "attestation=weights:0,api:2,api+tee:0,none:0 agent_auth=key:1,mtls:0,oidc:0,relay:0,none:0 "
+             "principals=human:0,workload:0,local:1,none:0 principal_tokens=verified:0,unverified:0,unverifiable:0")
 OTHER = "spiffe://acme.example/agent/intruder"
 
 
@@ -123,7 +124,7 @@ def test_16_unauthenticated_agent(tmp_path):
     assert run(c, tmp_path) == (1, "FAIL seq=4 unauthenticated agent")
     code, line = run(c, tmp_path, "--allow-unauthenticated-agents")
     assert code == 0
-    assert line.endswith(" agent_auth=key:0,mtls:0,oidc:0,relay:0,none:1 unauthenticated=1")
+    assert " agent_auth=key:0,mtls:0,oidc:0,relay:0,none:1 " in line and line.endswith(" unauthenticated=1")
 
 
 @pytest.mark.parametrize("agent_auth", ["magic", ""])
@@ -200,12 +201,13 @@ def test_agent_id_and_principal_malformed(tmp_path):
     assert run(c, tmp_path) == (1, "FAIL seq=3 principal malformed")
 
 
-def test_human_principal_accepted(tmp_path):
+def test_human_principal_passes_i2_and_needs_claims(tmp_path):
+    """I2 accepts the human: syntax; U (spec §17.7) then asks for the token claims it was validated from."""
     c = v2chain.Chain()
     v2chain.rulepack_change(c)
     v2chain.register(c)
     short_task(c, principal="human:entra-moi:" + "6" * 64)
-    assert run(c, tmp_path)[0] == 0
+    assert run(c, tmp_path) == (1, "FAIL seq=3 principal claims malformed")
 
 
 def test_declared_runtime_identity_is_a_valid_agent_id(tmp_path):

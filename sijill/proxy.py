@@ -140,7 +140,7 @@ class Node:
         humans = pol.principals.issuers if pol.principals else ()
         return oidc.build_jwks([*pol.agents.oidc_issuers, *humans], self.settings.jwks_dir, self.idp)
 
-    async def human(self, request: Request, task: dict | None) -> dict | None:
+    async def human(self, request: Request, task: dict | None, margin: float = 0.0) -> dict | None:
         """The validated human principal of a call (spec §17.2), bound to its task (§17.2.8). None when no
         principals: block is configured, or a token is optional and absent. Raises oidc.OidcError."""
         pcfg = self.policy.principals
@@ -150,7 +150,7 @@ class Node:
         bound = task is not None and task["principal"].startswith("human:")
         if token is None and not pcfg.require and not bound:
             return None
-        h = await oidc.human(pcfg, self.jwks, token, agents.clock())
+        h = await oidc.human(pcfg, self.jwks, token, agents.clock(), margin)
         if task is not None and h["principal"] != task["principal"]:
             raise oidc.OidcError("task_principal", 409, h["principal"])
         if h["display"]:
@@ -301,7 +301,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     "X-Sijill-Record-Hash": rec["record_hash"], "X-Sijill-Overhead-Ms": f"{overhead:.3f}"}
 
         try:
-            human = await n.human(request, task)
+            # The record is sealed when the answer is complete: a token must outlive the upstream timeout (U1).
+            human = await n.human(request, task, settings.upstream_timeout)
         except oidc.OidcError as e:
             # Sealed like the halt, outside any task so check I holds (spec §17.2.7); nothing is forwarded.
             refused = oidc.hit(e.code)
