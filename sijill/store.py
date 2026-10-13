@@ -126,10 +126,11 @@ class Store:
                                  (str(task_seq),)).fetchall()
         return [dict(r) for r in rows]
 
-    def baseline(self, lockfile_hash: str) -> int | None:
-        """The newest integrity_baseline sealed for that lockfile (spec §2.4.4); its seq is a drift's parent."""
+    def baseline(self, lockfile_hash: str, agent_id: str) -> int | None:
+        """The newest integrity_baseline this agent sealed for that lockfile (spec §2.4.4); its seq is a drift's
+        parent. Another agent's baseline is never one."""
         row = self.conn.execute("SELECT seq FROM records WHERE type = 'integrity_baseline' AND input_hash = ? "
-                                "ORDER BY seq DESC LIMIT 1", (lockfile_hash,)).fetchone()
+                                "AND agent_id = ? ORDER BY seq DESC LIMIT 1", (lockfile_hash, agent_id)).fetchone()
         return row[0] if row else None
 
     def has_child(self, type_: str, parent_seq: str) -> bool:

@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -27,6 +28,8 @@ from .pipeline import Call, Pipeline, Refusal
 from .rules import NOT_ALLOWLISTED
 
 MAX_PAGES = 64      # tools/list pages read from the wrapped server before it is refused
+MAX_TOOLS = 1024    # tools, and bytes of their definitions as JSON, taken from the wrapped server in one listing
+MAX_TOOLS_BYTES = 4 * 2 ** 20
 ELICIT_SCHEMA = {"type": "object", "properties": {"allow": {"type": "boolean"}}, "required": ["allow"]}
 
 
@@ -102,11 +105,16 @@ class Guard:
         self.sessions: set = set()
         self.upstream = None
         self.init: dict = {}
-        self.lock_bytes = Path(cfg.lockfile).read_bytes() if cfg.lockfile and Path(cfg.lockfile).exists() else None
-        self.lock_doc = integrity.read(cfg.lockfile) if self.lock_bytes is not None else None
+        self.lock_bytes, self.lock_doc, self.lock_stamp = None, None, None
+        self.lock()
+        self._base = None
         self.removed: dict[str, list[str]] = {}      # tool -> the integrity rules that took it away
+        self.changed: list[dict] = []                # drift found by the last applied check
+        self.seen: list[dict] = []                   # the tools that check read
+        self.unchecked, self.checked_at = True, 0.0  # no applied check yet, or the last one failed
+        self.gen = self.applied = 0
         self.sealed_drift: set[str] = set()
-        self.drift_lock = threading.Lock()
+        self.drift_lock, self.state_lock = threading.Lock(), threading.Lock()
 
     async def start(self) -> None:
         s = self.server
@@ -122,37 +130,94 @@ class Guard:
             "clientInfo": {"name": "sijil-guard", "version": "0.1.0"}})
         await self.upstream.notify("notifications/initialized")
 
+    @property
+    def base(self) -> Pipeline:
+        """The rule pack and pins, for a check made before any session."""
+        if self._base is None:
+            self._base = Pipeline(self.ledger, "", self.cfg)
+        return self._base
+
+    def lock(self) -> None:
+        """Re-read the lockfile when its mtime or size changed (`tools pin` ran, or someone edited it). A lockfile
+        that was there and is gone, or does not parse, is an error: drift cannot be measured."""
+        path = self.cfg.lockfile
+        if not path:
+            return
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            if self.lock_stamp is not None:
+                raise mcp.RpcError(mcp.SIJIL, f"Sijil: lockfile {path} is gone; tools cannot be checked")
+            return
+        stamp = (st.st_mtime_ns, st.st_size)
+        if stamp != self.lock_stamp:
+            try:
+                data = Path(path).read_bytes()
+                self.lock_doc = json.loads(data)
+            except (OSError, ValueError) as e:
+                raise mcp.RpcError(mcp.SIJIL, f"Sijil: lockfile {path} is unreadable: {e}")
+            self.lock_bytes, self.lock_stamp = data, stamp
+
     async def tools(self) -> list[dict]:
-        """Every tool the wrapped server lists, all pages: the set that is pinned, checked and relayed."""
-        out, cursor = [], None
+        """The tools the harness would get (allow/deny applied), all pages: the set that is pinned, checked and
+        relayed. Bounded by pages, tools and bytes; a repeated cursor is refused."""
+        out, cursor, seen, size = [], None, set(), 0
         for _ in range(MAX_PAGES):
             try:
                 result = await self.upstream.request("tools/list", {"cursor": cursor} if cursor else None)
             except mcp.RpcError as e:      # its message and data are not relayed
                 raise mcp.RpcError(_code(e.code), "wrapped server failed tools/list")
             raw = result.get("tools")
-            out += [t for t in raw if isinstance(t, dict) and isinstance(t.get("name"), str)] \
-                if isinstance(raw, list) else []
+            for t in raw if isinstance(raw, list) else []:
+                if isinstance(t, dict) and isinstance(t.get("name"), str):
+                    size += _wire(t)
+                    if len(out) >= MAX_TOOLS or size > MAX_TOOLS_BYTES:
+                        raise mcp.RpcError(mcp.INTERNAL, "wrapped server lists more tools than sijil-guard relays")
+                    if self.server.allowed(t["name"]):
+                        out.append(t)
             cursor = result.get("nextCursor")
             if not isinstance(cursor, str) or not cursor:
                 return out
+            if cursor in seen:
+                raise mcp.RpcError(mcp.INTERNAL, "wrapped server repeated a tools/list cursor")
+            seen.add(cursor)
         raise mcp.RpcError(mcp.INTERNAL, f"wrapped server listed more than {MAX_PAGES} pages of tools")
 
-    async def check_tools(self, session: "GuardSession") -> list[dict]:
-        """The wrapped server's tools, their drift against the lockfile, the removed set, and integrity_drift
-        sealed once per new state (spec §5.3, §7.3). Returns the tools that were checked."""
-        tools = await self.tools()
-        changed = integrity.changes(self.lock_doc, self.server.name, tools)
-        p = session.pipeline
-        self.removed = integrity.removed(p.pack, p.pins, changed)
-        if changed and self.lock_doc is not None:
-            await asyncio.to_thread(self.seal_drift, session, changed, tools)
+    async def check_tools(self, session: "GuardSession | None" = None) -> list[dict]:
+        """The wrapped server's tools, their drift against the lockfile, and the removed set. With a live session
+        the drift is also sealed, once per new state (spec §5.3, §7.3); without one it is left pending and the
+        next session's check seals it. A check that fails leaves the state unchecked, and calls are refused until
+        one succeeds. Results are applied in the order the checks began: an older never overwrites a newer."""
+        self.gen += 1
+        gen = self.gen
+        try:
+            self.lock()
+            tools = await self.tools()
+            changed = integrity.changes(self.lock_doc, self.server.name, tools)
+            p = session.pipeline if session else self.base
+            removed = integrity.removed(p.pack, p.pins, changed, gone=True)
+            if session and changed and self.lock_doc is not None:
+                await asyncio.to_thread(self.seal_drift, session, changed, tools)
+        except Exception:
+            with self.state_lock:
+                if gen > self.applied:
+                    self.applied, self.unchecked = gen, True
+            raise
+        with self.state_lock:
+            if gen > self.applied:
+                self.applied, self.unchecked, self.checked_at = gen, False, time.monotonic()
+                self.removed, self.changed, self.seen = removed, changed, tools
         return tools
 
+    async def fresh(self, session: "GuardSession") -> None:
+        """Before a call: the last check must be recent, or it is redone (spec §5.3). Raises when it cannot be."""
+        if self.unchecked or time.monotonic() - self.checked_at >= self.cfg.recheck_seconds:
+            await self.check_tools(session)
+
     def seal_drift(self, session: "GuardSession", changed: list[dict], tools: list[dict]) -> None:
-        before = sha256_hex(self.lock_bytes)
-        after = sha256_hex(integrity.render(integrity.with_server(self.lock_doc, self.server.name, tools)))
         with self.drift_lock:
+            before = sha256_hex(self.lock_bytes)
+            after = sha256_hex(integrity.render(integrity.with_server(self.lock_doc, self.server.name, tools)))
             if after in self.sealed_drift:
                 return
             try:
@@ -182,10 +247,13 @@ class Guard:
 
     async def upstream_note(self, method: str, params: dict) -> None:
         if method == "notifications/tools/list_changed":
-            live = [s for s in self.sessions if s.pipeline]
-            if live:      # a rug-pull mid-session is caught before the next call
+            # a rug-pull mid-session is caught before the next call: checked under a live session whose task is
+            # open (the first that works); with none, or when the check fails, calls are refused until one succeeds
+            self.unchecked = True
+            for s in [s for s in self.sessions if s.pipeline and not s.closed]:
                 try:
-                    await self.check_tools(live[0])
+                    await self.check_tools(s)
+                    break
                 except (Unreachable, Refused, mcp.RpcError) as e:
                     print(f"sijil-guard: tool check after list_changed failed: {e}", file=sys.stderr)
             for s in list(self.sessions):
@@ -251,16 +319,23 @@ class GuardSession(mcp.Session):
 
     async def initialize(self, params: dict) -> dict:
         self.elicit = "elicitation" in (params.get("capabilities") or {}) and self.client.can_request
+        g = self.guard
+        try:      # before any task is started or joined: a server that cannot be checked leaves nothing behind
+            await g.check_tools()
+        except (Unreachable, Refused) as e:
+            raise _ledger_error(e)
         try:
             state, self.task_seq, self.owned = await asyncio.to_thread(self._join_or_start)
         except (Unreachable, Refused, ValueError, OSError) as e:
             raise mcp.RpcError(mcp.SIJIL, f"Sijil: no agent session or task: {e}")
         self.agent_session = state.agent_session
         self.pipeline = Pipeline(self.guard.ledger, state.agent_session, self.guard.cfg)
-        try:
-            await self.guard.check_tools(self)
-        except (Unreachable, Refused) as e:
-            raise _ledger_error(e)
+        if g.changed and g.lock_doc is not None:
+            try:
+                await asyncio.to_thread(g.seal_drift, self, g.changed, g.seen)
+            except (Unreachable, Refused) as e:
+                await self.close()
+                raise _ledger_error(e)
         return {"protocolVersion": self.guard.init.get("protocolVersion", mcp.PROTOCOL),
                 "capabilities": {"tools": {"listChanged": True}},
                 "serverInfo": self.guard.init.get("serverInfo", {"name": self.guard.server.name, "version": "0"}),
@@ -272,7 +347,7 @@ class GuardSession(mcp.Session):
             tools = await g.check_tools(self)
         except (Unreachable, Refused) as e:
             raise _ledger_error(e)
-        return {"tools": [t for t in tools if g.server.allowed(t["name"]) and t["name"] not in g.removed]}
+        return {"tools": [t for t in tools if t["name"] not in g.removed]}
 
     def _confirm(self, rule) -> str:
         """Elicitation for a confirm rule (spec §5.7); runs on the pipeline's worker thread."""
@@ -295,6 +370,12 @@ class GuardSession(mcp.Session):
         call = Call(rule_tool=f"mcp:{s.name}:{name}", tool=name, server=s.name, args=args, harness=cfg.harness,
                     session_id=self.session_id, observed_by="mcp_guard", parent_names=[name, f"mcp__{s.name}__{name}"],
                     command_arg=s.command_arg, task_seq=self.task_seq)
+        try:      # a call is never made on an old approval: the tools are re-checked when the last check is stale
+            await self.guard.fresh(self)
+        except (Unreachable, Refused) as e:
+            raise _ledger_error(e)
+        except mcp.RpcError as e:
+            raise mcp.RpcError(mcp.SIJIL, f"Sijil: tool integrity could not be checked: {e.message}")
         forced = [NOT_ALLOWLISTED] if not s.allowed(name) else self.guard.removed.get(name)
         try:
             sealed = await asyncio.to_thread(self.pipeline.check, call, self._confirm if self.elicit else None, forced)
@@ -495,14 +576,23 @@ async def pin(cfg: Config, server_name: str, ledger: Ledger) -> tuple[int, int]:
         raise ValueError(f"cannot list the tools of {server_name}: {e.message}") from None
     finally:
         await guard.aclose()
+    old = Path(cfg.lockfile).read_bytes() if Path(cfg.lockfile).exists() else None
     data, doc = integrity.pin(cfg.lockfile, server_name, tools)
-    h, state = sha256_hex(data), await asyncio.to_thread(guard.state)
-    p = Pipeline(ledger, state.agent_session, cfg)
+    h = sha256_hex(data)
     ext = {"lockfile": os.path.relpath(os.path.realpath(cfg.lockfile), cfg.repo), "lockfile_hash": h,
            "entries": len(doc["entries"]), "files": 0, "mcp_tools": len(doc["entries"]), "roots": [],
            "tool": integrity.TOOL, "invisible_unicode_entries": 0}
-    r = await asyncio.to_thread(p.seal, None, lambda: {"type": "integrity_baseline", "input_hash": h,
-                                                       "rulepack_hash": p.pack.hash, "ext": ext})
+    try:
+        state = await asyncio.to_thread(guard.state)
+        p = Pipeline(ledger, state.agent_session, cfg)
+        r = await asyncio.to_thread(p.seal, None, lambda: {"type": "integrity_baseline", "input_hash": h,
+                                                           "rulepack_hash": p.pack.hash, "ext": ext})
+    except BaseException:      # no baseline was sealed: the lockfile goes back to what it was
+        if old is None:
+            Path(cfg.lockfile).unlink(missing_ok=True)
+        else:
+            Path(cfg.lockfile).write_bytes(old)
+        raise
     return r["seq"], len(tools)
 
 

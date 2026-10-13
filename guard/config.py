@@ -12,11 +12,12 @@ import yaml
 
 PRINCIPAL = re.compile(r"oidc:[a-z0-9.-]+:\S+|email:[0-9a-f]{64}|local:[0-9a-f]{64}|human:[a-z0-9-]{1,32}:[0-9a-f]{64}")
 SECTIONS = {"version", "sijil", "identity", "task", "state_path", "repo", "rulepack", "egress", "context_window",
-            "correlation", "results", "servers", "allowed_command_dirs", "mcp", "lockfile"}
+            "correlation", "results", "servers", "allowed_command_dirs", "mcp", "lockfile", "integrity"}
 KEYS = {"sijil": {"url", "token_env", "on_unreachable"},
         "identity": {"agent_id", "auth", "key_path", "registered_by", "display_name", "oidc_token_env"},
         "task": {"intent", "harness", "principal_header"},
-        "egress": {"pins"}, "correlation": {"require_parent"}, "results": {"max_result_bytes", "invisible_unicode"}, "mcp": {"allowed_origins", "tools_token_env", "tls_cert", "tls_key"}}
+        "egress": {"pins"}, "correlation": {"require_parent"}, "results": {"max_result_bytes", "invisible_unicode"}, "mcp": {"allowed_origins", "tools_token_env", "tls_cert", "tls_key"},
+        "integrity": {"recheck_seconds"}}
 TOOLS_KEYS = {"allow", "deny"}
 SERVER_KEYS = {"name", "transport", "command", "args", "env", "url", "headers", "label", "tools", "command_arg"}
 SERVER_NAME = re.compile(r"[a-z0-9_-]{1,32}")                      # source_label mcp:<name> (spec §17.1)
@@ -140,6 +141,7 @@ class Config:
     tls_cert: str                 # serve --http off loopback needs both, and the token
     tls_key: str
     lockfile: str                 # pinned tool definitions (spec §7.4); "" = none, only invisible Unicode is checked
+    recheck_seconds: float        # tools/call re-checks the wrapped server's tools when the last check is older
 
 
 def _path(p: str, name: str, base: Path) -> str:
@@ -169,8 +171,12 @@ def load(path: str) -> Config:
     unknown = set(doc) - SECTIONS
     if unknown:
         raise ValueError(f"{path}: sections {sorted(unknown)} are not supported by this guard")
-    sijil, ident, task, egress, corr, res, mcp = (_section(doc, n, path) for n in
-                                                  ("sijil", "identity", "task", "egress", "correlation", "results", "mcp"))
+    sijil, ident, task, egress, corr, res, mcp, integ = (
+        _section(doc, n, path) for n in ("sijil", "identity", "task", "egress", "correlation", "results", "mcp",
+                                         "integrity"))
+    recheck = integ.get("recheck_seconds", 30)
+    if type(recheck) not in (int, float) or not 0 <= recheck <= 86400:
+        raise ValueError(f"{path}: integrity.recheck_seconds must be a number from 0 to 86400")
     if sijil.get("on_unreachable", "closed") != "closed":
         raise ValueError(f"{path}: sijil.on_unreachable must be closed (the open mode is not built)")
     if not sijil.get("url") or not ident.get("agent_id"):
@@ -221,4 +227,4 @@ def load(path: str) -> Config:
                   tools_token=os.environ.get(tools_env, "") if tools_env else "",
                   tls_cert=_path(mcp.get("tls_cert", ""), "mcp.tls_cert", base),
                   tls_key=_path(mcp.get("tls_key", ""), "mcp.tls_key", base),
-                  lockfile=_path(doc.get("lockfile", ""), "lockfile", base))
+                  lockfile=_path(doc.get("lockfile", ""), "lockfile", base), recheck_seconds=float(recheck))

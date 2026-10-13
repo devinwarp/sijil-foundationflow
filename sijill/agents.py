@@ -478,8 +478,8 @@ def router(require_admin) -> APIRouter:
 
     @r.get("/api/agent/baseline")
     async def baseline(request: Request, lockfile_hash: str, sess: dict = Depends(require_session)):
-        """The baseline a guard's integrity_drift points at (spec §2.4.5, check C)."""
-        seq = node(request).store.baseline(lockfile_hash)
+        """The calling agent's own baseline that a guard's integrity_drift points at (spec §2.4.5, check C)."""
+        seq = node(request).store.baseline(lockfile_hash, sess["agent_id"])
         if seq is None:
             raise HTTPException(404, "no integrity_baseline for that lockfile_hash")
         return {"seq": seq}
