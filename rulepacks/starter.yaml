@@ -1,0 +1,185 @@
+# Sijil starter rule pack (spec §8.2). Apache-2.0, see guard/LICENSE; fork it freely.
+# The ledger hashes this file's bytes: any edit, comments included, is a new rulepack_hash and is sealed
+# as a rulepack_change at the next reload. The guard must load the same bytes (409 rulepack mismatch).
+
+rulepack_id: sijil-starter
+version: 0.1.0
+defaults: { action: allow }
+rules:
+
+  - id: no-net-exec-from-untrusted
+    description: Fetch-and-execute (npx/npm exec/pnpm dlx/bunx, curl|sh, wget|sh, unpinned pip/pipx) while the context contains a telemetry, web, MCP or memory result
+    incident: Agentjacking (Tenet, Jun 2026); ClawHavoc (Feb 2026)
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:*:run_command", "mcp:*:execute_command", "mcp:*:shell"]
+      command_regex: '(^|[;&|]\s*)(npx|npm\s+exec|pnpm\s+dlx|bunx|uvx|pipx\s+run)\b|(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z|da)?sh\b|pip3?\s+install\b(?![^;&|]*==)|(^|[;&|]\s*)(sh|bash|zsh)\s+-c\s+["'']?\$\('
+      context_labels_any: ["telemetry", "web", "mcp:*", "memory"]
+    action: block
+
+  - id: no-net-exec-unpinned
+    description: Same fetch-and-execute patterns with no untrusted context; still ask
+    incident: ClawHavoc
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:*:run_command", "mcp:*:execute_command", "mcp:*:shell"]
+      command_regex: '(^|[;&|]\s*)(npx|npm\s+exec|pnpm\s+dlx|bunx|uvx|pipx\s+run)\b|(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z|da)?sh\b|pip3?\s+install\b(?![^;&|]*==)'
+    action: confirm
+
+  - id: env-secret-in-command
+    description: Command references a credential-looking environment variable
+    incident: Agentjacking (dev creds exfiltrated via npx argument)
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:*:run_command", "mcp:*:execute_command", "mcp:*:shell"]
+      env_refs_any: ["*TOKEN*", "*SECRET*", "*PASSWORD*", "*PASSWD*", "*API_KEY*", "*APIKEY*", "AWS_*", "GITHUB_PAT", "GH_TOKEN", "NPM_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+    action: block
+
+  - id: no-agent-config-writes
+    description: Write/edit to any agent configuration, hook, instruction or MCP-launch path
+    incident: Kiro (~/.kiro/settings/mcp.json); TrapDoor
+    on: tool_call
+    match:
+      tool: ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "mcp:*:write_file", "mcp:*:edit_file", "mcp:*:create_file", "mcp:*:move_file"]
+      path_mode: write
+      path_glob: ["CLAUDE.md", "**/CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "**/AGENTS.md", ".cursorrules", ".cursor/**", ".claude/**", ".mcp.json", "**/SKILL.md", "MEMORY.md", "GEMINI.md", ".windsurfrules", ".github/copilot-instructions.md", ".sijil/**", "rulepacks/**",
+                  "~/.claude/**", "~/.claude.json", "~/.codex/**", "~/.cursor/**", "~/.gemini/**", "~/.kiro/**", "~/.config/zed/**", "~/.continue/**", "~/.windsurf/**"]
+    action: block
+
+  - id: no-shell-profile-writes
+    description: Write to shell startup files or launch agents (persistence)
+    incident: Kiro-class persistence
+    on: tool_call
+    match:
+      tool: ["Write", "Edit", "Bash", "mcp:*:write_file", "mcp:*:edit_file"]
+      path_mode: write
+      path_glob: ["~/.bashrc", "~/.bash_profile", "~/.zshrc", "~/.zprofile", "~/.profile", "~/.config/fish/**", "~/Library/LaunchAgents/**", "~/.config/systemd/user/**", "/etc/**"]
+    action: block
+
+  - id: no-credential-reads
+    description: Read of credential stores unless the rule pack is explicitly relaxed
+    incident: EchoLeak/Cowork exfil chains begin with a read
+    on: tool_call
+    match:
+      tool: ["Read", "Bash", "Grep", "Glob", "mcp:*:read_file", "mcp:*:read_text_file", "mcp:*:search_files", "mcp:*:list_directory"]
+      path_mode: read
+      path_glob: ["~/.aws/**", "~/.ssh/**", "~/.gnupg/**", "~/.netrc", "~/.npmrc", "~/.pypirc", "~/.docker/config.json", "~/.kube/config", "~/.config/gcloud/**", "~/.azure/**", "**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/id_rsa*", "**/id_ed25519*", "~/.claude/credentials*", "~/.codex/auth.json", "~/Library/Keychains/**", "~/.sijil/**"]
+    action: block
+
+  - id: egress-only-pinned-hosts
+    description: Outbound connection to a host not in .sijil/egress.yaml
+    incident: EchoLeak / SearchLeak / Cowork (vendor-allowlisted exfil)
+    on: egress
+    match:
+      egress_host_not_pinned: true
+    action: block
+
+  - id: egress-static-unpinned-host
+    description: Command contains a URL whose host is not pinned (checked before execution)
+    incident: EchoLeak-class
+    on: tool_call
+    match:
+      tool: ["Bash", "WebFetch", "mcp:*:fetch", "mcp:*:run_command"]
+      egress_host_not_pinned: true
+    action: block
+
+  - id: no-raw-ip-or-tunnel-egress
+    description: Connection to a literal IP, a non-standard port, or a known tunnel/paste host
+    incident: exfil staging
+    on: egress
+    match:
+      egress_host_regex: '^(\d{1,3}\.){3}\d{1,3}$|^\[?[0-9a-f:]+\]?$|(^|\.)(ngrok(-free)?\.app|ngrok\.io|trycloudflare\.com|loca\.lt|serveo\.net|pastebin\.com|transfer\.sh|requestbin\.com|webhook\.site|burpcollaborator\.net|oastify\.com)$'
+    action: block
+
+  - id: invisible-unicode-in-result
+    description: Tool result contains zero-width, Tag, bidi or other flagged code points
+    incident: TrapDoor (planted via package install output), rug-pull descriptions
+    on: tool_result
+    match:
+      invisible_unicode: true
+    action: record          # the guard's results.invisible_unicode setting decides strip/block; this rule makes it a hit
+
+  - id: invisible-unicode-in-instructions
+    description: A locked instruction/config file or MCP tool description contains flagged code points
+    incident: TrapDoor (Socket, May 2026)
+    on: integrity
+    match:
+      drift_kind: ["invisible_unicode"]
+    action: block
+
+  - id: mcp-tool-description-changed
+    description: An MCP tool's name/description/inputSchema differs from the lockfile
+    incident: MCP tool-description rug-pull
+    on: integrity
+    match:
+      drift_kind: ["tool_description"]
+    action: block
+
+  - id: instruction-file-drift
+    description: A locked instruction, hook, skill or MCP config file was modified, added or removed since baseline
+    incident: TrapDoor; ClawHavoc; Kiro
+    on: integrity
+    match:
+      drift_kind: ["modified", "added", "removed"]
+    action: confirm
+
+  - id: result-from-telemetry
+    description: Mark every result from a telemetry/error-tracking source so later rules can see it in context
+    incident: Agentjacking
+    on: tool_result
+    match:
+      source_label: ["telemetry", "mcp:sentry", "mcp:datadog", "mcp:bugsnag", "mcp:rollbar", "mcp:honeycomb"]
+    action: record
+
+  - id: result-from-web-with-exec-hint
+    description: A web/telemetry/memory result contains an install-or-execute instruction token
+    incident: Agentjacking; ClawHavoc
+    on: tool_result
+    match:
+      source_label: ["web", "telemetry", "memory", "mcp:*"]
+      exec_hints_any: ["npx", "npm exec", "pnpm dlx", "bunx", "curl", "wget", "pip install", "sh -c", "bash -c", "powershell", "base64 -d"]
+    action: record
+
+  - id: memory-write-confirm
+    description: Writes to memory stores (MEMORY.md, memory MCP servers) require confirmation
+    incident: memory poisoning
+    on: tool_call
+    match:
+      tool: ["mcp:memory:*", "mcp:*:create_entities", "mcp:*:add_observations", "mcp:*:create_relations", "Write", "Edit"]
+      path_glob: ["MEMORY.md", ".claude/memory/**", "memory/**", "~/.claude/projects/**/memory/**"]
+      path_mode: write
+    action: confirm
+
+  - id: no-git-push-default-branch
+    description: git push to main/master/trunk/develop, or force-push anywhere
+    incident: supply-chain hygiene
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:*:run_command", "mcp:git:git_push", "mcp:github:push_files"]
+      command_regex: 'git\s+push\b(?=[^;&|]*(\s(origin|upstream)\s+(main|master|trunk|develop)\b|\s(--force|-f|--force-with-lease)\b|\sHEAD:(main|master|trunk|develop)\b))'
+    action: block
+
+  - id: no-pr-merge
+    description: gh pr merge, or merge via the GitHub MCP server
+    incident: supply-chain hygiene
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:github:merge_pull_request", "mcp:*:merge_pull_request"]
+      command_regex: '(^|[;&|]\s*)gh\s+pr\s+merge\b'
+    action: block
+
+  - id: no-package-manager-publish
+    description: npm publish, pip upload, twine, cargo publish, gem push
+    incident: supply-chain hygiene
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:*:run_command"]
+      command_regex: '(^|[;&|]\s*)(npm|pnpm|yarn)\s+publish\b|(^|[;&|]\s*)twine\s+upload\b|(^|[;&|]\s*)cargo\s+publish\b|(^|[;&|]\s*)gem\s+push\b|(^|[;&|]\s*)python3?\s+setup\.py\s+upload\b'
+    action: block
+
+  - id: tool-not-allowlisted
+    description: Reserved id written by the guard when a tools.allow/deny filter rejects a call; not matchable from YAML
+    incident: rug-pull / scope creep
+    on: tool_call
+    match: { reserved: true }
+    action: block
