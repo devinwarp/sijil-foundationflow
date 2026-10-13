@@ -49,6 +49,7 @@ class Call:
     method: str = ""
     path_template: str = ""
     task_seq: int | str | None = None      # None: the session's only open task
+    qualified: str = ""           # HTTP adapter: http:<server>:<tool> (spec §17.3.3); else the name the model used
 
 
 @dataclass
@@ -127,7 +128,8 @@ class Pipeline:
                     answer["c"] = confirm(rule) if confirm else "unavailable"
             decision, mode = rules.outcome(action, answer.get("c"))
             ext = {"harness": call.harness, "session_id": call.session_id, "tool": call.tool,
-                   "server": call.server, "qualified": name or call.rule_tool, "correlation": correlation,
+                   "server": call.server, "qualified": call.qualified or name or call.rule_tool,
+                   "correlation": correlation,
                    "observed_by": call.observed_by, "summary": summary, "context_labels": ctx["labels"],
                    "context_seqs": ctx["seqs"], **({"tool_use_id": tool_use_id} if tool_use_id else {}),
                    **({"confirmation": answer["c"]} if action == "confirm" else {})}

@@ -213,16 +213,18 @@ def demo() -> Chain:
     return c
 
 
-def gov() -> Chain:
+def gov(rp: str = "") -> Chain:
     """Golden vectors 70-79 (spec §17.8), byte for byte but for prev_hash, after a prefix that registers their
-    agent under their rule pack; policy_change filler keeps the vectors at their own seq numbers."""
+    agent under their rule pack; policy_change filler keeps the vectors at their own seq numbers. `rp` puts
+    the whole chain under another rule pack hash (a real file's, for --rulepack)."""
     import vectors_v2
+    rp = rp or vectors_v2.GOV_RP
     c = Chain()
-    rulepack_change(c, after=vectors_v2.GOV_RP)
+    rulepack_change(c, after=rp)
     register(c)
     while len(c.bodies) < 69:
         c.add("policy_change")
-    for body in c.bodies:
-        body["rulepack_hash"] = vectors_v2.GOV_RP
     c.bodies += [{f: vectors_v2.out[seq][f] for f in record.BODY_FIELDS} for seq in range(70, 80)]
+    for body in c.bodies:
+        body["rulepack_hash"] = rp
     return c

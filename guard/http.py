@@ -239,7 +239,7 @@ class Adapter:
                     session_id=request.headers.get("x-sijil-session-id", ""), observed_by="http_adapter",
                     parent_names=[op.id] if op else [], tool_use_id=request.headers.get("x-sijil-tool-use-id", ""),
                     command_arg=server.command_arg, method=request.method, path_template=op.template if op else "",
-                    task_seq=request.headers.get("x-sijil-task-seq") or None)
+                    task_seq=request.headers.get("x-sijil-task-seq") or None, qualified=f"http:{server.name}:{name}")
         call.summary = {"method": request.method, "host": upstream_host, "path_template": call.path_template,
                         "arg_keys": sorted(call.args)}
         try:

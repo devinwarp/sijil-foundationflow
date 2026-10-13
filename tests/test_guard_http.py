@@ -122,7 +122,7 @@ def test_case_note_round_trip_seals_call_egress_and_result(env):
     assert (call["type"], call["input_hash"], x["correlation"], x["tool_use_id"]) == \
         ("tool_call", record.sha256_hex(record.canonical_json(NOTE)), "tool_use_id", cid)
     assert (x["observed_by"], x["harness"], x["qualified"], x["tool"], x["server"]) == \
-        ("http_adapter", "foundry", "addCaseNote", "addCaseNote", "case-api")
+        ("http_adapter", "foundry", "http:case-api:addCaseNote", "addCaseNote", "case-api")
     assert x["summary"] == {"method": "POST", "host": "case.moi.internal", "path_template": "/cases/{caseId}/notes",
                             "arg_keys": ["caseId", "note"]}
     assert (egress["type"], egress["parent_seq"]) == ("egress", str(call["seq"]))
