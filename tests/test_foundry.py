@@ -334,3 +334,17 @@ def test_a_list_of_supported_items_is_forwarded(relay):
     given = [{"type": "message", "role": "user", "content": "hi"}]
     assert portal(client, given).status_code == 200
     assert foundry.seen[0][1]["input"] == given
+
+
+def test_the_relay_verdict_blocks_a_command_over_the_cap_unparsed(tmp_path):
+    from types import SimpleNamespace
+
+    from conftest import ROOT
+    from guard import rules
+    from sijill import foundry
+    path = str(ROOT / "rulepacks" / "starter.yaml")
+    n = SimpleNamespace(rulepack=SimpleNamespace(path=path, hash=rules.load(path).hash),
+                        store=SimpleNamespace(in_task=lambda seq: []))
+    over = foundry.verdict(n, {"seq": 1}, "mcp:shell:run_command", {"command": "ls " + "a" * rules.MAX_COMMAND}, 9)
+    assert (over.hits, over.action) == (["command-too-long"], "block")
+    assert foundry.verdict(n, {"seq": 1}, "mcp:shell:run_command", {"command": "ls"}, 9).action == "allow"

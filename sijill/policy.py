@@ -21,7 +21,7 @@ RESUME_HIT = "resumed"
 # v2.4 (spec §17.1): rule ids the ledger and guard seal themselves; a rule pack may not reuse them.
 GOV_HITS = ("principal-missing", "principal-invalid", "principal-expired", "principal-assurance-low",
             "principal-task-mismatch", "principal-jwks-unavailable", "http-operation-unknown",
-            "http-task-ambiguous", "approval-timeout")
+            "http-task-ambiguous", "approval-timeout", "command-too-long")
 RESERVED_IDS = (UPSTREAM_ERROR_HIT, HALT_HIT, RESUME_HIT, *GOV_HITS)
 RESERVED_PREFIXES = ("budget:",)
 ATTESTATION_MODES = ("weights", "api")    # spec §3.1

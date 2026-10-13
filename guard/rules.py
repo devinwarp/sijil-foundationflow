@@ -23,7 +23,8 @@ RULE_ID = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 # The ledger's reserved ids (sijill/policy.py RESERVED_IDS, RESERVED_PREFIXES): the node seals those itself.
 RESERVED_IDS = ("upstream_error", "halted", "resumed", "principal-missing", "principal-invalid",
                 "principal-expired", "principal-assurance-low", "principal-task-mismatch",
-                "principal-jwks-unavailable", "http-operation-unknown", "http-task-ambiguous", "approval-timeout")
+                "principal-jwks-unavailable", "http-operation-unknown", "http-task-ambiguous", "approval-timeout",
+                "command-too-long")
 RESERVED_PREFIXES = ("budget:",)
 NOT_ALLOWLISTED = "tool-not-allowlisted"       # written by the guard's tools.allow/deny filter (spec §5.2)
 RULE_KEYS = {"id", "on", "action", "match", "description", "incident"}
@@ -45,6 +46,11 @@ COMMAND_ARGS = ("command", "cmd", "script", "commandLine")             # what a 
 # An argument is a path when its name says so, or its value looks like one; text payloads are never paths.
 PATH_NAMES = {"pattern", "glob", "src", "source", "dest", "destination", "target", "output", "filename"}
 PATH_SUFFIXES = ("path", "paths", "file", "files", "dir", "directory", "folder", "uri")
+# A command longer than this is not parsed or matched: it is blocked as COMMAND_TOO_LONG, never truncated. Sized so
+# the starter pack's command_regex rules, evaluated together on benign filler at the cap, take about 40 ms; past it
+# their backtracking grows quadratically and, holding the GIL, would stall the whole guard and the ledger's relay.
+MAX_COMMAND = 2048
+COMMAND_TOO_LONG = "command-too-long"
 CONTENT_ARGS = {"content", "contents", "text", "body", "data", "message", "old_string", "new_string", "new_source"}
 
 
@@ -230,6 +236,7 @@ class Facts:
     drift_kinds: list[str] = field(default_factory=list)
     method: str = ""
     path_template: str = ""
+    too_long: bool = False        # the command is over MAX_COMMAND: nothing was parsed, the call is blocked
 
 
 def _as_text(command) -> str | None:
@@ -272,6 +279,8 @@ def call_facts(tool: str, bare: str, args: dict, roots: Roots, harness: str, com
     seg = Segment(argv0="", args=[], reads=[] if write else paths, writes=paths if write else [], hosts=hosts)
     if command is None:
         return Facts("tool_call", tool, harness, None, [seg], [], args, hosts, **context), None
+    if len(command) > MAX_COMMAND:
+        return Facts("tool_call", tool, harness, command, [seg], [], args, hosts, too_long=True, **context), None
     parsed = parse(command, roots)
     hosts = sorted(set(hosts) | {h for s in parsed.segments for h in s.hosts})
     segments = parsed.segments + ([seg] if paths else [])
@@ -358,6 +367,8 @@ class Verdict:
 
 
 def evaluate(pack: RulePack, facts: Facts, pins: Pins) -> Verdict:
+    if facts.too_long:                 # fails closed before any rule runs: no regex sees the over-long command
+        return Verdict([COMMAND_TOO_LONG], "block")
     fired = tuple(r for r in pack.rules if matches(r, facts, pins))
     action = max((r.action for r in fired), key=ACTIONS.index, default="allow")
     return Verdict([r.id for r in fired], action, fired)

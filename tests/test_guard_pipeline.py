@@ -290,3 +290,17 @@ def test_an_empty_rulepack_is_a_config_message(g):
     client, s, cfg, state, p = g
     with pytest.raises(ValueError, match="rulepack is required"):
         Pipeline(p.ledger, state.agent_session, cfg.__class__(**{**cfg.__dict__, "rulepack": ""}))
+
+
+def test_a_command_over_the_cap_is_sealed_blocked_and_the_chain_passes(g, monkeypatch, tmp_path):
+    from guard import rules
+    client, s, cfg, state, p = g
+    long = {"command": "echo " + "a" * rules.MAX_COMMAND}
+    monkeypatch.setitem(REQUESTS, "long", ("run_command", long))
+    ask(client, state, "run the long one")
+    with pytest.raises(Refusal, match="Blocked by Sijil rule command-too-long") as e:
+        p.check(call("shell", "run_command", long))
+    rec = rows(s.db_path, f"seq = {e.value.seq}")[0]
+    assert (rec["decision"], rec["mode"], json.loads(rec["rule_hits"])) == ("block", "enforce", ["command-too-long"])
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+    assert verify(s.db_path, s.pubkey_path, "--rulepack", f"{tmp_path}/starter.yaml")[0] == 0

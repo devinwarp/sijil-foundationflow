@@ -436,4 +436,38 @@ EVASIONS = [      # (rule, command with {p} where padding goes) that the 300/100
 @pytest.mark.parametrize("pad", PAD, ids=["300", "1500", "20000"])
 def test_padding_does_not_hide_a_command_from_the_rules(pad, env):
     for rule_id, template in EVASIONS:
-        assert rule_id in call(env, "Bash", {"command": template.replace("{p}", pad)}).hits, (rule_id, template)
+        command = template.replace("{p}", pad)
+        v = call(env, "Bash", {"command": command})
+        if len(command) > rules.MAX_COMMAND:          # over the cap: blocked unparsed, which hides nothing either
+            assert (v.hits, v.action) == ([rules.COMMAND_TOO_LONG], "block"), (rule_id, template)
+        else:
+            assert rule_id in v.hits, (rule_id, template)
+
+
+FILLER = ("a", " ", ";", "&", "|", "nc ", "unset ", "sed ", " ;&|")     # benign filler, no attack strings
+
+
+def _fill(unit: str, n: int) -> str:
+    return (unit * (n // len(unit) + 1))[:n]
+
+
+def test_a_command_over_the_cap_is_blocked_unparsed_and_one_at_the_cap_is_evaluated(env):
+    under = call(env, "Bash", {"command": "ls " + _fill("a", rules.MAX_COMMAND - 3)})
+    assert (under.hits, under.action) == ([], "allow")
+    for args in ({"command": "ls " + _fill("a", rules.MAX_COMMAND - 2)},
+                 {"cmd": ["ls", _fill("a", rules.MAX_COMMAND)]}):
+        over = call(env, "Bash", args)
+        assert (over.hits, over.action) == ([rules.COMMAND_TOO_LONG], "block")
+    facts, parsed = rules.call_facts("Bash", "Bash", {"command": _fill("a", rules.MAX_COMMAND + 1)}, env[2], "x")
+    assert parsed is None and facts.too_long and facts.command == _fill("a", rules.MAX_COMMAND + 1)   # never truncated
+    assert rules.COMMAND_TOO_LONG in rules.RESERVED_IDS
+
+
+@pytest.mark.parametrize("unit", FILLER)
+def test_the_whole_pack_evaluates_a_command_at_the_cap_in_well_under_100_ms(env, unit):
+    import time
+    pack, pins, roots = env
+    facts, _ = rules.call_facts("Bash", "Bash", {"command": _fill(unit, rules.MAX_COMMAND)}, roots, "x")
+    start = time.perf_counter()
+    rules.evaluate(pack, facts, pins)
+    assert time.perf_counter() - start < 0.1      # measured about 40 ms worst; the margin absorbs slow CI
