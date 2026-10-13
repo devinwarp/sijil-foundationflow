@@ -185,6 +185,7 @@ rules:
   # alternative is anchored at a segment start (the parser has already unwrapped sudo, env, bash -c ...).
   # Ceiling for all four: they key on literal words (sijil, a device path, /etc/sudoers), so a pid, a glob
   # (pkill -f 'sij*') or variable indirection through a name not listed here ($X=sijill.db) gets past them,
+  # (every wildcard is bounded to 300 characters so a 50 KB command cannot make the engine backtrack),
   # as do interpreter one-liners other than the socket ones listed; the guard's other layers cover those.
 
   - id: no-destructive-fs
@@ -196,17 +197,17 @@ rules:
       command_regex: '(?ix)
 
         (^|[;&|]\s*) rm\b
-          (?= [^;&|]*\s (-[a-z]*r[a-z]*|--recursive) (\s|$) )
-          (?= [^;&|]*\s ["'']? ( /+\*? | /\. | ~\w*/?\*? | \$\{?(HOME|PWD)\}?/?\*? | \.{1,2}/?\*? | \*\.? ) ["'']? (\s|$|[;&|]) )
+          (?= [^;&|\n]{0,300}\s (-[a-z]*r[a-z]*|--recursive) (\s|$) )
+          (?= [^;&|\n]{0,300}\s ["'']? ( /+\*? | /\. | ~\w*/?\*? | \$\{?(HOME|PWD)\}?/?\*? | \.{1,2}/?\*? | \*\.? ) ["'']? (\s|$|[;&|]) )
 
         | (^|[;&|]\s*) (mkfs(\.\w+)?|wipefs|shred)\b
 
-        | (^|[;&|]\s*) dd\b [^;&|]* \bof=/dev/
+        | (^|[;&|]\s*) dd\b [^;&|\n]{0,300} \bof=/dev/
 
         | >\s*/dev/(sd|hd|vd|nvme|mmcblk|r?disk)
 
         | (^|[;&|]\s*) find\s+(-[HLP]\s+)* ["'']? (/|~|\$\{?HOME\}?) /? ["'']? \s
-            [^;&|]* ( -delete\b | -exec(dir)?\s+(\S*/)?rm\b )'
+            [^;&|\n]{0,300} ( -delete\b | -exec(dir)?\s+(\S*/)?rm\b )'
     action: block
 
   # no-perm-escalation: octal modes that are world-writable or setuid/setgid, symbolic o/a +w or =w, any +s;
@@ -237,10 +238,10 @@ rules:
         | (^|[;&|]\s*) su(\s+(-l?|--login))?(\s+root)?\s*($|[;&|])
         | (^|[;&|]\s*) pkexec\b
         | \bvisudo\b
-        | (>>?|\btee\b[^;&|]*)\s*["'']?/etc/sudoers
-        | \b(cp|mv|install|ln)\b [^;&|]* /etc/sudoers \S* \s* ($|[;&|])
-        | \bsed\b [^;&|]* \s-\S*i [^;&|]* /etc/sudoers
-        | \bdd\b [^;&|]* \bof=/etc/sudoers'
+        | (>>?|\btee\b[^;&|\n]{0,300})\s*["'']?/etc/sudoers
+        | \b(cp|mv|install|ln)\b [^;&|\n]{0,300} /etc/sudoers \S* \s* ($|[;&|])
+        | \bsed\b (?= [^;&|\n]{0,300}\s-\S*i ) [^;&|\n]{0,300} /etc/sudoers
+        | \bdd\b [^;&|\n]{0,300} \bof=/etc/sudoers'
     action: confirm
 
   - id: no-reverse-shell
@@ -253,18 +254,18 @@ rules:
 
         /dev/(tcp|udp)/
 
-        | \b(nc|ncat|netcat)(\.\w+)?\s+ ([^;&|]*\s)? (?-i:-[a-zA-Z]*[ec]\b | --(sh-|lua-)?exec\b)
+        | \b(nc|ncat|netcat)(\.\w+)?\s+ ([^;&|\n]{0,300}\s)? (?-i:-[a-zA-Z]*[ec]\b | --(sh-|lua-)?exec\b)
 
-        | \bsocat\b [^;&|]* \b(exec|system):
+        | \bsocat\b [^;&|\n]{0,300} \b(exec|system):
 
-        | \bmkfifo\b .* \|\s*(nc|ncat|netcat)\b
-        | \b(nc|ncat|netcat)(\.\w+)?\b [^;&|]* (<\s*\S+\s*)? \|\s*(ba|z|da|k)?sh\b
-        | \|\s*(ba|z|da|k)?sh\b [^;&|]* \|\s*(nc|ncat|netcat)\b
+        | \bmkfifo\b .{0,300} \|\s*(nc|ncat|netcat)\b
+        | \b(nc|ncat|netcat)(\.\w+)?\b [^;&|\n]{0,300} (<\s*\S+\s*)? \|\s*(ba|z|da|k)?sh\b
+        | \|\s*(ba|z|da|k)?sh\b [^;&|\n]{0,300} \|\s*(nc|ncat|netcat)\b
 
         | \b(python[\d.]*|perl|ruby|php|node(js)?)\b
-            (?= .*(socket|fsockopen) )
-            (?= .*(connect|fsockopen|\.(open|new)\() )
-            (?= .*(exec|pty|subprocess|spawn|dup2|system|popen|/bin/(ba)?sh) )'
+            (?= .{0,1000}(socket|fsockopen) )
+            (?= .{0,1000}(connect|fsockopen|\.(open|new)\() )
+            (?= .{0,1000}(exec|pty|subprocess|spawn|dup2|system|popen|/bin/(ba)?sh) )'
     action: block
 
   - id: no-oversight-tamper
@@ -276,20 +277,20 @@ rules:
       # The ledger's database defaults to sijill.db (sijill/proxy.py Settings.db_path, env DATABASE_PATH).
       command_regex: '(?ix)
 
-        \b(kill|pkill|killall)\b [^;&|]* sijil
+        \b(kill|pkill|killall)\b [^;&|\n]{0,300} sijil
 
         | \b(systemctl|launchctl|service|docker|podman|supervisorctl)\b
-            (?= [^;&|]* \b(stop|disable|kill|mask|unload|bootout|remove|rm)\b )
-            (?= [^;&|]* sijil )
+            (?= [^;&|\n]{0,300} \b(stop|disable|kill|mask|unload|bootout|remove|rm)\b )
+            (?= [^;&|\n]{0,300} sijil )
 
-        | (^|[;&|]\s*) (rm|unlink|truncate|shred|sqlite3|mv|tee|chmod|chown|chattr|sed\b[^;&|]*\s-\S*i)\b
-            [^;&|]* (sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
+        | (^|[;&|]\s*) (rm|unlink|truncate|shred|sqlite3|mv|tee|chmod|chown|chattr|sed\b(?=[^;&|\n]{0,300}\s-\S*i))\b
+            [^;&|\n]{0,300} (sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
         | (^|[;&|]\s*) (cp|install|ln)\b
-            [^;&|]* (sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*)) \S*["'']? \s* ($|[;&|])
-        | (^|[;&|]\s*) dd\b [^;&|]* \bof=\S*(sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
+            [^;&|\n]{0,300} (sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*)) \S*["'']? \s* ($|[;&|])
+        | (^|[;&|]\s*) dd\b [^;&|\n]{0,300} \bof=\S*(sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
         | >\s*["'']?\S*(sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
 
-        | \bunset\s+([^;&|]*\s)?SIJILL?_\w*
+        | \bunset\s+([^;&|\n]{0,300}\s)?SIJILL?_\w*
         | \benv\s+(-\S+\s+)*(-u\s*|--unset[=\s]\s*)SIJILL?_\w*
         | \bexport\s+-n\s+SIJILL?_
         | (^|[;&|]\s*) (export\s+)? (\w+=\S*\s+)* SIJILL?_\w*='

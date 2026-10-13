@@ -391,3 +391,33 @@ def test_loader_refuses_unknown_rule_level_keys(tmp_path):
                                      "rules: [{id: x, on: tool_call, match: {tool: [Bash]}, action: block, enabled: false}]\n")
     with pytest.raises(ValueError, match="unknown keys.*enabled"):
         rules.load(str(tmp_path / "p.yaml"))
+
+
+def _adversarial(n=50_000):
+    """50 KB commands that make a backtracking regex quadratic or worse: repeated flags, wrappers, spaces."""
+    rep = lambda unit: (unit * (n // len(unit) + 1))[:n]
+    return [rep("sed -i "), "sed " + rep("-i "), "sudo " + rep("-u x "), rep("sudo "), rep("chmod "), "chmod " + rep("-R "),
+            "chmod " + rep("a+r,"), "rm " + rep("-r "), "rm " + rep("-f ") + "-r", "rm" + " " * n, "sudo" + " " * n,
+            "sed " + " " * n + "-i", rep("-"), rep("nc "), "nc " + rep("-x "), "python " + rep("a "), rep("python "),
+            rep("env "), "env " + rep("-i "), rep("kill "), "kill " + rep("a "), rep("systemctl "), "find / " + rep("-x "),
+            rep("export "), rep("A=b "), rep("cp "), "cp " + rep("a "), rep("dd "), "dd " + rep("a "), rep("mkfifo "),
+            rep("sij"), rep("/etc/sudoers "), rep("tee "), rep("| sh "), rep("doas "), rep("su "), rep("docker ")]
+
+
+def test_every_starter_rule_is_linear_on_adversarial_commands(env):
+    import time
+    pack, pins, _ = env
+    slow = []
+    for cmd in _adversarial():
+        for r in pack.rules:
+            if r.match.get("command_regex") is None:
+                continue
+            t = time.perf_counter()
+            r.match["command_regex"].search(cmd)
+            if time.perf_counter() - t > 0.5:
+                slow.append((r.id, cmd[:20], round(time.perf_counter() - t, 1)))
+    assert not slow
+    t = time.perf_counter()
+    for cmd in _adversarial():
+        call(env, "Bash", {"command": cmd})
+    assert time.perf_counter() - t < 0.5 * len(_adversarial())
