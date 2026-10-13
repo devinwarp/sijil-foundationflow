@@ -542,17 +542,26 @@ def rule_hits(rec):
 
 
 def pack_checks(st, rec, x):
-    """W2 cost on any inference, in a task or not: under the pack's hash a priced, forwarded inference carries
-    the cost the pack's pricing gives, and a cost_micro that is present is an int that recomputes."""
+    """W2 cost on any inference, in a task or not: under the pack's hash, whether a model is priced is the
+    pack's word; a priced, forwarded inference carries the pack's price_rule and the cost it gives, an unpriced
+    one carries neither."""
     if rec["type"] != "inference":
         return
     if "cost_micro" in x and type(x["cost_micro"]) is not int:
         raise Fail("cost_mismatch", "cost mismatch")
     if st.pack and rec["rulepack_hash"] == st.pack["hash"]:
         st.rulepack_matched += 1
-        priced = any(fnmatch.fnmatchcase(rec["model_digest"], str(p.get("model"))) for p in st.pack["pricing"])
-        if ("cost_micro" in x or (priced and rec["decision"] != "block")) \
-                and x.get("cost_micro") != cost(st.pack, rec["model_digest"], x):
+        digest = rec["model_digest"]
+        price = next((p for p in st.pack["pricing"] if fnmatch.fnmatchcase(digest, str(p.get("model")))), None)
+        carried = any(k in x for k in ("price_rule", "cost_micro"))
+        if price is None:                       # the pack does not price this model: the record claims no price
+            ok = not carried
+        elif rec["decision"] == "block" and not carried:     # blocked before the forward: nothing was priced
+            ok = True
+        else:
+            want = cost(st.pack, digest, x)
+            ok = x.get("price_rule") == price.get("id") and want is not None and x.get("cost_micro") == want
+        if not ok:
             raise Fail("cost_mismatch", "cost mismatch")
 
 

@@ -500,3 +500,25 @@ def test_json_counters_on_a_fail_are_the_ones_seen_so_far(tmp_path):
     c.ext(79, blocked=99)
     code, res = verify_json(*c.write(tmp_path, validate=False))
     assert (code, res["ok"]) == (1, False) and res["budget_hits"] == 1 and res["approvals"]["granted"] == 1
+
+
+def test_53d_priced_by_the_pack_not_by_the_record(tmp_path):
+    c, pack = packed(tmp_path)
+    x = json.loads(c[71]["ext"])
+    for label, ext in (("both deleted", {k: v for k, v in x.items() if k not in ("price_rule", "cost_micro")}),
+                       ("price_rule deleted", {k: v for k, v in x.items() if k != "price_rule"}),
+                       ("price_rule null", x | {"price_rule": None}),
+                       ("wrong price_rule", x | {"price_rule": "other"})):
+        c[71]["ext"] = record_json(ext)
+        assert run(c, tmp_path, "--rulepack", pack) == (1, "FAIL seq=71 cost mismatch"), label
+    c[71]["ext"] = record_json(x)
+    assert run(c, tmp_path, "--rulepack", pack)[0] == 0
+
+
+def test_53e_a_cost_on_a_model_the_pack_does_not_price(tmp_path):
+    c, pack = packed(tmp_path)
+    c[71]["model_digest"] = "api:other:model-1"
+    assert run(c, tmp_path, "--rulepack", pack) == (1, "FAIL seq=71 cost mismatch")
+    x = json.loads(c[71]["ext"])
+    c[71]["ext"] = record_json({k: v for k, v in x.items() if k not in ("price_rule", "cost_micro")})
+    assert run(c, tmp_path, "--rulepack", pack)[0] == 0
