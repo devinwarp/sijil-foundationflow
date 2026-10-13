@@ -23,7 +23,7 @@ EXEC_HINTS = ("npx", "npm exec", "pnpm dlx", "bunx", "curl", "wget", "pip instal
 _HINT_RE = {h: re.compile(r"(?<![\w-])" + re.escape(h).replace(r"\ ", r"\s+") + r"(?![\w-])", re.I) for h in EXEC_HINTS}
 UNICODE_HIT = "invisible-unicode-in-result"
 NO_PARENT = 2 ** 62               # before_seq for an orphan: every result in the task is context
-POLL_S = 8                        # one approval long-poll, inside the ledger client's 10 s timeout
+POLL_S = 3                        # one approval long-poll, inside the ledger client's 10 s timeout
 APPROVALS = 8                     # approvals one guard holds at once; past that a routed confirm is unavailable
 CHECKS = ThreadPoolExecutor(APPROVALS + 16, thread_name_prefix="sijil-check")   # a held approval never takes a default-pool thread
 _held = threading.BoundedSemaphore(APPROVALS)
@@ -74,6 +74,7 @@ class Call:
     path_template: str = ""
     task_seq: int | str | None = None      # None: the session's only open task
     qualified: str = ""           # ext.qualified when the adapter names it (http:<server>:<tool>); else the matched name
+    cancel: threading.Event | None = None   # set when the awaiting adapter is cancelled: stop holding an approval
 
 
 @dataclass
@@ -204,7 +205,7 @@ class Pipeline:
         try:
             approval_id = a["approval_id"]
             give_up = datetime.fromisoformat(a["deadline"].replace("Z", "+00:00")).timestamp() + GRACE_S
-            while time.time() < give_up:
+            while time.time() < give_up and not (call.cancel and call.cancel.is_set()):
                 st = self.ledger.call("GET", f"/api/agent/approval/{approval_id}", self.session,
                                       params={"wait": POLL_S})
                 if st["status"] != "pending":
@@ -302,4 +303,10 @@ class Pipeline:
 
 async def check(p: Pipeline, *args):
     """Pipeline.check on the guard's own pool, so approvals held by named() cannot starve the default one."""
-    return await asyncio.get_running_loop().run_in_executor(CHECKS, p.check, *args)
+    call = args[0]
+    call.cancel = threading.Event()
+    try:
+        return await asyncio.get_running_loop().run_in_executor(CHECKS, p.check, *args)
+    except asyncio.CancelledError:
+        call.cancel.set()          # the polling thread notices within one POLL_S and frees its slot
+        raise

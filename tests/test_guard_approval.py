@@ -164,13 +164,64 @@ def test_a_malformed_decision_is_never_a_grant(status):
     assert confirmation in ("denied", "unavailable")
 
 
-def test_pending_approvals_do_not_stall_another_sessions_tool_call(env):
-    client, s, tools, api = env(PACK.replace("timeout_seconds: 900", "timeout_seconds: 2"))
-    held = [close_case(client, tools) for _ in range(3)]      # three calls held on pending approvals
-    pending_approval(s)
+def test_pending_approvals_do_not_stall_an_ordinary_check(env):
+    from guard import pipeline
+    client, s, tools, api = env(PACK.replace("timeout_seconds: 900", "timeout_seconds: 3"))
+    held = [close_case(client, tools) for _ in range(pipeline.APPROVALS)]
+    end = time.time() + 5
+    while len(rows(s.db_path, "type = 'approval'")) < pipeline.APPROVALS and time.time() < end:
+        time.sleep(0.02)
     t0 = time.time()
-    assert tools.post("/_sijil/task/start", json={"intent": "other", "session_id": "conv-2"},
-                      headers={"X-Sijil-Principal-Token": officer()}).status_code in (200, 409)
-    assert time.time() - t0 < 1.5
+    r = tools.post("/_sijil/task/start", json={"intent": f"Read {CASE}", "session_id": "conv-2"},
+                   headers={"X-Sijil-Principal-Token": officer()})
+    assert r.status_code == 200, r.text
+    t = r.json()
+    reply = client.post("/v1/chat/completions", headers={"X-Sijil-Agent-Session": t["agent_session"],
+                        "X-Sijil-Task-Seq": str(t["task_seq"]), "X-Sijil-Principal-Token": officer()},
+                        json={"model": "llama-3.2-3b-instruct", "messages": [{"role": "user", "content": "get it"}]})
+    call_id = reply.json()["choices"][0]["message"]["tool_calls"][0]["id"]
+    t0 = time.time()
+    got = tools.get(f"/case-api/cases/{CASE}", headers={"X-Sijil-Tool-Use-Id": call_id,
+                                                         "X-Sijil-Task-Seq": str(t["task_seq"])})
+    assert got.status_code == 200, got.text
+    assert time.time() - t0 < 1.5      # an ordinary check, through CHECKS, while 8 wait
     for _, out in held:
         out[0].join(15)
+
+
+def test_a_cancelled_call_frees_its_approval_slot_promptly():
+    import asyncio
+    from guard import pipeline
+    from guard.pipeline import Call, Pipeline
+
+    class Slow:
+        def call(self, method, path, *a, **kw):
+            if method == "POST":
+                return {"approval_id": "ap", "deadline": "2099-01-01T00:00:00Z"}
+            time.sleep(0.2)                      # a short poll: still pending
+            return {"approval_id": "ap", "status": "pending", "decision_seq": None}
+
+    p = object.__new__(Pipeline)
+    p.ledger, p.session = Slow(), "s"
+    calls = [Call("r", "t", "s", {}, "h", "x", "y") for _ in range(pipeline.APPROVALS + 1)]
+
+    def check(self, c, *a):                     # stands in for Pipeline.check: just the named wait
+        return self.named(c, "1", "tool_use_id", "q", "h", ["r"], {})
+    Pipeline.check, saved = check, Pipeline.check
+    try:
+        async def go():
+            tasks = [asyncio.create_task(pipeline.check(p, c)) for c in calls[:pipeline.APPROVALS]]
+            await asyncio.sleep(0.5)
+            assert (await asyncio.to_thread(p.named, calls[-1], "1", "t", "q", "h", ["r"], {}))[0] == "unavailable"
+            for t in tasks:
+                t.cancel()
+            await asyncio.sleep(0.6)             # one short poll later the threads let go
+            t0 = time.time()
+            nine = asyncio.create_task(pipeline.check(p, calls[-1]))
+            await asyncio.sleep(0.5)
+            assert not nine.done()               # it holds a slot rather than being refused at once
+            calls[-1].cancel.set()
+            assert (await nine)[0] == "unavailable" and time.time() - t0 < 3
+        asyncio.run(go())
+    finally:
+        Pipeline.check = saved
