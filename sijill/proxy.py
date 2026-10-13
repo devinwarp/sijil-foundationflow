@@ -122,6 +122,11 @@ class Node:
             self.store.close()
             raise RuntimeError(f"chain in {settings.db_path} is under rule pack {self.rulepack_hash[:12]}; set "
                                f"SIJILL_RULEPACK_PATH (a record without rulepack_hash fails check E)")
+        try:
+            rulepack.check_policy(self.rulepack, self.policy)
+        except ValueError:
+            self.store.close()
+            raise
         # The writer trusts its own memory of the head, not the database: a record
         # deleted or edited at the tail while running still shows up as a break.
         self.head = self.store.head()
@@ -551,6 +556,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         try:
             new = policy.load(settings.policy_path)
             n.check_attestation(new)
+            rulepack.check_policy(n.rulepack, new)
             jwks = n.keys_for(new)
         except Exception as e:
             raise HTTPException(400, f"policy not loaded: {e}")
@@ -567,6 +573,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             raise HTTPException(400, "no rule pack configured: set SIJILL_RULEPACK_PATH")
         try:
             new = rulepack.load(settings.rulepack_path)
+            rulepack.check_policy(new, n.policy)
         except Exception as e:
             raise HTTPException(400, f"rule pack not loaded: {e}")
         old = n.rulepack

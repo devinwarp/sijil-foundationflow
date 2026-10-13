@@ -72,6 +72,7 @@ class RulePack:
     path: str
     hash: str                     # sha256 of the file bytes, as the ledger computes it (sijill/rulepack.py)
     rules: tuple[Rule, ...]
+    approval: str = "self"        # hitl.channel: self (elicitation) or entra (named approval through the ledger)
 
     def rule(self, rule_id: str) -> Rule | None:
         return next((r for r in self.rules if r.id == rule_id), None)
@@ -120,9 +121,12 @@ def load(path: str) -> RulePack:
     doc = yaml.safe_load(raw)
     if not isinstance(doc, dict) or not doc.get("rulepack_id") or not doc.get("version"):
         raise ValueError(f"{path}: rulepack_id and version are required")
-    unknown = set(doc) - {"rulepack_id", "version", "description", "defaults", "rules", "hitl"}
-    if unknown:    # dlp:, mode: and arg_max_length are row 18; hitl: routes are read by row 18g
+    unknown = set(doc) - {"rulepack_id", "version", "description", "defaults", "rules", "hitl", "budgets", "pricing"}
+    if unknown:    # dlp:, mode: and arg_max_length are row 18. hitl routes, budgets and pricing are the ledger's
         raise ValueError(f"{path}: top-level keys {sorted(unknown)} are not supported")
+    approval = (doc.get("hitl") or {}).get("channel", "self") if isinstance(doc.get("hitl") or {}, dict) else None
+    if approval not in ("self", "entra"):
+        raise ValueError(f"{path}: hitl.channel must be self or entra")
     if (doc.get("defaults") or {"action": "allow"}) != {"action": "allow"}:
         raise ValueError(f"{path}: defaults.action must be allow (a rule fires or the call proceeds)")
     rules, seen = [], set()
@@ -145,7 +149,7 @@ def load(path: str) -> RulePack:
             raise ValueError(f"{path}: {NOT_ALLOWLISTED} is written by the guard; its match must be {{reserved: true}}")
         rules.append(Rule(rid, r["on"], r["action"], _compile(rid, r["on"], r.get("match")), False,
                           str(r.get("description", ""))))
-    return RulePack(str(doc["rulepack_id"]), str(doc["version"]), str(path), sha256_hex(raw), tuple(rules))
+    return RulePack(str(doc["rulepack_id"]), str(doc["version"]), str(path), sha256_hex(raw), tuple(rules), approval)
 
 
 @dataclass(frozen=True)
