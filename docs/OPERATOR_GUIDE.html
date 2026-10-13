@@ -240,6 +240,10 @@ curl -s http://localhost:8000/api/verify   # "ok": true</code></pre>
         <tr><td><code>DATABASE_PATH</code></td><td><code>/data/sijill.db</code></td><td>The append-only record store.</td></tr>
         <tr><td><code>NODE_KEY_PATH</code>, <code>NODE_PUBKEY_PATH</code></td><td><code>/data/node.key</code>, <code>/data/node.pub</code></td><td>File signing key (created on first run) and the public key auditors verify with.</td></tr>
         <tr><td><code>SIJILL_HALT_PATH</code></td><td><code>/data/sijill.halt</code></td><td>While this file exists, every call is blocked and sealed.</td></tr>
+        <tr><td><code>SIJILL_TOKEN</code></td><td>unset</td><td>Secret; never commit it. Token agents send as <code>X-Sijil-Token</code> to <code>/api/agent/*</code> (revoke uses the admin token). Unset disables those endpoints (503); a wrong token gets 401.</td></tr>
+        <tr><td><code>SIJILL_RULEPACK_PATH</code></td><td>unset</td><td>Path to the rule pack file. Unset means no rule pack, and the rule pack reload endpoint returns 400.</td></tr>
+        <tr><td><code>SIJILL_UPSTREAM_PROVIDER</code></td><td>unset</td><td>Provider name of the upstream route, lowercase letters, digits and hyphens. Required when the policy sets <code>attestation: api</code>; sealed as <code>api:&lt;provider&gt;:&lt;model&gt;</code>.</td></tr>
+        <tr><td><code>SIJILL_JWKS_DIR</code></td><td><code>/data/jwks</code></td><td>Writable directory for JWKS snapshots of the policy's OIDC issuers, stored by hash.</td></tr>
         <tr><td><code>SIJILL_PKCS11_MODULE</code></td><td>unset</td><td>Vendor PKCS#11 library. Setting it switches signing to the HSM.</td></tr>
         <tr><td><code>SIJILL_PKCS11_TOKEN</code>, <code>_KEY</code>, <code>_PIN</code></td><td>unset</td><td>Token label, key label and user PIN on the HSM.</td></tr>
       </tbody>
