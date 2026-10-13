@@ -121,7 +121,7 @@ def test_a_named_approval_round_trip_is_sealed_and_verifies(tmp_path, monkeypatc
         assert r.status_code == 409 and "parent already consumed" in r.text          # one call per tool_use (M2c)
         again, again_id = think(client, sess, task)                                   # the model asks once more
         r = seal_call(client, sess, again, again_id, st["decision_seq"])
-        assert r.status_code == 409 and "approval already used" in r.text             # V3
+        assert r.status_code == 409 and "another call" in r.text      # a grant is bound to its parent (Ruling 28 amended)
         assert end(client, sess, task).json()["confirmed"] == 1
     x, dx = (json.loads(r["ext"]) for r in rows(s.db_path, "type = 'approval'"))
     assert (x["phase"], x["approver_set"], x["min_assurance"], x["timeout_ms"], x["sod"], x["on_timeout"]) == \
@@ -264,3 +264,50 @@ def open_task_again(client, sess) -> tuple[dict, int]:
                     headers={"X-Sijil-Agent-Session": sess["agent_session"], "X-Sijil-Principal-Token": officer()})
     assert r.status_code == 200, r.text
     return sess, r.json()["seq"]
+
+
+def test_an_unused_grant_does_not_cross_to_another_parent_after_a_halt(tmp_path):
+    client, s, _ = gov_node(tmp_path)
+    with client:
+        sess, task = open_task(client)
+        parent, call_id = think(client, sess, task)
+        a = ask(client, sess, parent).json()
+        decide(client, a["approval_id"])
+        seq = status(client, sess, a["approval_id"])["decision_seq"]
+        assert client.post("/api/admin/halt", json={"halted": True}, headers=ADMIN).status_code == 200
+        assert seal_call(client, sess, parent, call_id, seq).json()["decision"] == "block"   # the grant stays unused
+        assert client.post("/api/admin/halt", json={"halted": False}, headers=ADMIN).status_code == 200
+        parent2, call2 = think(client, sess, task, "close the case again")
+        r = seal_call(client, sess, parent2, call2, seq)                   # the probe: same call, another parent
+        assert r.status_code == 409 and "another call" in r.text
+        b = ask(client, sess, parent2).json()
+        decide(client, b["approval_id"])
+        assert seal_call(client, sess, parent2, call2, status(client, sess, b["approval_id"])["decision_seq"]).status_code == 200
+        assert end(client, sess, task).status_code == 200
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+    assert verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))[0] == 0
+
+
+def test_a_grant_covers_only_the_confirm_hits_its_request_listed(tmp_path):
+    second = "case-closure-second-look"
+    client, s, _ = gov_node(tmp_path, pack=PACK.replace("hitl:", f"""  - id: {second}
+    on: tool_call
+    match: {{ tool: ["http:case-api:closeCase"] }}
+    action: confirm
+hitl:"""))
+    with client:
+        sess, task = open_task(client)
+        parent, call_id = think(client, sess, task)
+        a = ask(client, sess, parent).json()                                # asked about RULE only
+        decide(client, a["approval_id"])
+        seq = status(client, sess, a["approval_id"])["decision_seq"]
+        r = seal_call(client, sess, parent, call_id, seq, rule_hits=[RULE, second])
+        assert r.status_code == 409 and "not asked about these hits" in r.text
+        b = ask(client, sess, parent, rule_hits=[RULE, second]).json()
+        decide(client, b["approval_id"])
+        r = seal_call(client, sess, parent, call_id, status(client, sess, b["approval_id"])["decision_seq"],
+                      rule_hits=[RULE, second])
+        assert r.status_code == 200, r.text
+        assert end(client, sess, task).status_code == 200
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+    assert verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))[0] == 0

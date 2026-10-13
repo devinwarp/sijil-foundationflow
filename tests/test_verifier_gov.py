@@ -542,3 +542,28 @@ def test_a_confirm_hit_let_through_without_a_citation_fails_under_the_rulepack(t
         c.ext(79, confirmed=int("confirmation" not in drop))
         assert run(c, tmp_path)[0] == 0                                    # without the pack, rule actions are unseen
         assert run(c, tmp_path, "--rulepack", str(p)) == (1, "FAIL seq=77 tool_call approval mismatch")
+
+
+def test_a_grant_is_bound_to_the_parent_its_request_named(tmp_path):
+    def chain(parent):
+        c = v2chain.gov()
+        c.bodies[73] = {**c[71], "ts": c[74]["ts"]}          # seq 74 becomes a second inference of the task
+        budget = json.loads(c[74]["ext"])["budget"]
+        budget["case-agent"]["model_spend_micro"]["used"] = json.loads(c[71]["ext"])["cost_micro"]
+        c.ext(74, budget=budget)
+        c.ext(79, inference=2)
+        c[77]["parent_seq"] = parent
+        return c
+    assert run(chain("71"), tmp_path)[0] == 0
+    assert run(chain("74"), tmp_path) == (1, "FAIL seq=77 tool_call approval mismatch")
+
+
+def test_a_grant_covers_only_the_hits_its_request_listed(tmp_path):
+    def chain(asked):
+        c = v2chain.gov()
+        c.ext(77, budget={"case-agent": {"tool_calls": {"limit": 1, "used": 1}}})
+        c[77]["rule_hits"] = '["case-closure-needs-approval","budget:case-agent:tool_calls"]'
+        c[75]["rule_hits"] = json.dumps(asked, separators=(",", ":"))
+        return c
+    assert run(chain(["case-closure-needs-approval", "budget:case-agent:tool_calls"]), tmp_path)[0] == 0
+    assert run(chain(["case-closure-needs-approval"]), tmp_path) == (1, "FAIL seq=77 tool_call approval mismatch")

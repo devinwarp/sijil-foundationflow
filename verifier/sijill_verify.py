@@ -584,14 +584,18 @@ def approval_checks(st, rec, x, parent, task):
         if not ok:
             raise Fail("approval_request_malformed", "approval request malformed")
         st.approvals[aid] = {"seq": seq, "task": rec["task_seq"], "qualified": x["qualified"],
-                             "input_hash": rec["input_hash"], "deadline": at + x["timeout_ms"],
+                             "input_hash": rec["input_hash"], "parent": rec["parent_seq"], "hits": set(rule_hits(rec)), "deadline": at + x["timeout_ms"],
                              "min_assurance": x["min_assurance"], "sod": x["sod"] is True, "decided": None}
         task["pending"].add(aid)
     elif t == "tool_call" and "approval_seq" in x:                                    # V2, V3
         d = st.decisions.get(x["approval_seq"]) if type(x["approval_seq"]) is int else None
         granted = d is not None and d["outcome"] == "granted"
+        hits, pack = rule_hits(rec), st.pack if st.pack and rec["rulepack_hash"] == st.pack["hash"] else None
+        asked = {h for h in hits if h.startswith("budget:") or (pack and confirm_hit(pack, h))}   # a grant covers
         if (d is None or d["request"]["task"] != rec["task_seq"] or d["request"]["qualified"] != x.get("qualified")
-                or d["request"]["input_hash"] != rec["input_hash"] or (x.get("confirmation") == "granted") != granted
+                or d["request"]["input_hash"] != rec["input_hash"] or d["request"]["parent"] != rec["parent_seq"]
+                or (granted and not asked <= d["request"]["hits"])                       # only what it was asked
+                or (x.get("confirmation") == "granted") != granted
                 or (rec["decision"], rec["mode"]) != (("flag", "record") if granted else ("block", "enforce"))):
             raise Fail("approval_mismatch", "tool_call approval mismatch")
         if d["used"]:

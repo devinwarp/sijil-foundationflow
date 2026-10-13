@@ -222,7 +222,7 @@ async def gate(n, task: dict, inference: dict, item: dict, conv_hash: str, deny:
                 [*(h for h in hits if not h.startswith("budget:")), policy.HALT_HIT]),
                 "ext": cj({**halted, **({"confirmation": "denied"} if "approval_seq" in ext else {})})}
         if "approval_seq" in ext:                 # what the verifier's V2 and V3 would refuse
-            agents.check_approval(n.store, body, ext)
+            agents.check_approval(n.store, n.rulepack, body, ext)
         return budgets.stamp(n, task, body, ext, hits, confirmation == "granted")
     rec = await seal_in(n, task, build)
     return rec["seq"], rec["decision"] != "block"

@@ -238,16 +238,22 @@ def check_parent(store, body: dict, ext: dict) -> None:
         raise HTTPException(400, "drift baseline mismatch")
 
 
-def check_approval(store, body: dict, x: dict) -> None:
-    """What the verifier's V2 and V3 would refuse: the cited decision answers this very call, once."""
+def check_approval(store, pack, body: dict, x: dict) -> None:
+    """What the verifier's V2 and V3 would refuse: the cited decision answers this very call, from the same parent,
+    once; a grant covers only the confirm hits its request listed."""
     d = store.get(x["approval_seq"]) if type(x["approval_seq"]) is int else None
     dx = json.loads(d["ext"]) if d and d["type"] == "approval" else {}
     if dx.get("phase") != "decision" or d["task_seq"] != body["task_seq"]:
         raise HTTPException(400, "approval_seq must be the seq of an approval decision in this task")
     req = store.get(int(d["parent_seq"]))
-    if json.loads(req["ext"])["qualified"] != x.get("qualified") or req["input_hash"] != body["input_hash"]:
+    if json.loads(req["ext"])["qualified"] != x.get("qualified") or req["input_hash"] != body["input_hash"] \
+            or req["parent_seq"] != body["parent_seq"]:
         raise HTTPException(409, "the approval is for another call")
     granted = dx["outcome"] == "granted"
+    hits = json.loads(body["rule_hits"])
+    asked = [h for h in hits if h.startswith("budget:")] + (pack.confirm_hits(hits) if pack else [])
+    if granted and not set(asked) <= set(json.loads(req["rule_hits"])):
+        raise HTTPException(409, "the approval was not asked about these hits: ask again")
     if (x.get("confirmation") == "granted") != granted or \
             (body["decision"], body["mode"]) != (("flag", "record") if granted else ("block", "enforce")):
         raise HTTPException(400, "confirmation, decision and mode must follow the approval's outcome (spec §2.5)")
@@ -463,7 +469,7 @@ def router(require_admin) -> APIRouter:
                 raise HTTPException(409, "task already ended")
             check_parent(n.store, body, x)
             if t == "tool_call" and "approval_seq" in x:
-                check_approval(n.store, body, x)
+                check_approval(n.store, n.rulepack, body, x)
             elif t == "tool_call" and body["decision"] != "block" and n.rulepack is not None \
                     and n.rulepack.hitl is not None and n.rulepack.hitl.channel == "entra" \
                     and (x.get("confirmation") == "granted" or n.rulepack.confirm_hits(hits)):
