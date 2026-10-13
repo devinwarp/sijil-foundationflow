@@ -19,6 +19,7 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from typing import Awaitable, Callable
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -491,9 +492,21 @@ def _error(status: int, code: int, message: str, rid=None) -> JSONResponse:
     return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}, status)
 
 
-def http_app(new_session: NewSession) -> FastAPI:
+def origin_ok(origin: str, allowed: tuple = ()) -> bool:
+    """MCP 2025-06-18 DNS-rebinding defence: loopback origins and the configured ones pass."""
+    if origin in allowed:
+        return True
+    try:
+        u = urlsplit(origin)
+        return u.scheme in ("http", "https") and u.hostname in ("localhost", "127.0.0.1", "::1")
+    except ValueError:
+        return False
+
+
+def http_app(new_session: NewSession, allowed_origins: tuple = ()) -> FastAPI:
     """Streamable HTTP, JSON answers only. initialize opens a session (Mcp-Session-Id); DELETE closes it.
-    At most MAX_SESSIONS sessions are open, and one idle for SESSION_TTL seconds is closed."""
+    At most MAX_SESSIONS sessions are open, and one idle for SESSION_TTL seconds is closed. A request whose
+    Origin header is present and neither loopback nor in allowed_origins gets 403."""
     sessions: dict[str, Session] = {}
     touched: dict[str, float] = {}
     opening = [0]                                   # initializes in flight, counted against MAX_SESSIONS
@@ -521,6 +534,13 @@ def http_app(new_session: NewSession) -> FastAPI:
                 await drop(sid)
 
     app = FastAPI(lifespan=lifespan)
+
+    @app.middleware("http")
+    async def check_origin(request: Request, call_next):
+        origin = request.headers.get("origin")
+        if origin is not None and not origin_ok(origin, allowed_origins):
+            return _error(403, INVALID_REQUEST, "Origin not allowed")
+        return await call_next(request)
 
     async def body_of(request: Request) -> bytes | None:
         body = b""

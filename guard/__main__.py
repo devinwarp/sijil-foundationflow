@@ -4,13 +4,15 @@
   session open                      prove the key (or present the OIDC token); write the state file
   task start --intent TEXT [--delegate] [--session-id ID]   print the task_seq
   task end --outcome OUTCOME
+  serve --server NAME [--http HOST:PORT]   the MCP guard for one wrapped server (stdio unless --http)
 """
 
 import argparse
+import asyncio
 import os
 import sys
 
-from . import config, identity, task
+from . import config, identity, serve, task
 from .ledger import Ledger, Refused, Unreachable
 
 
@@ -34,6 +36,8 @@ def main(argv: list[str] | None = None, ledger: Ledger | None = None) -> int:
     ap.add_argument("--outcome", default="completed")
     ap.add_argument("--admin-token-env", default="SIJILL_ADMIN_TOKEN")
     ap.add_argument("--principal-token-env", default="SIJIL_PRINCIPAL_TOKEN")
+    ap.add_argument("--server")
+    ap.add_argument("--http", default="")
     a = ap.parse_args(argv)
     cfg = config.load(a.config)
     ledger = ledger or ledger_for(cfg)
@@ -56,6 +60,8 @@ def main(argv: list[str] | None = None, ledger: Ledger | None = None) -> int:
         elif cmd == "task end":
             r = update(cfg, ledger, lambda st: task.end(ledger, st, a.outcome))
             print(f"task_end seq={r['seq']} tool_calls={r['tool_calls']} blocked={r['blocked']}")
+        elif cmd == "serve":
+            asyncio.run(serve.run(cfg, a.server, ledger, a.http))
         else:
             ap.error(f"unknown command: {cmd}")
     except (Refused, Unreachable, ValueError, OSError) as e:
