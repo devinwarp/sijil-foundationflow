@@ -4,6 +4,7 @@ after the tool ran, scan its result and seal the tool_result. The adapters only 
 """
 
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -14,12 +15,14 @@ from .ledger import Ledger, Refused
 
 EXEC_HINTS = ("npx", "npm exec", "pnpm dlx", "bunx", "curl", "wget", "pip install", "sh -c", "bash -c",
               "powershell", "base64 -d")
-_HINT_RE = {h: re.compile(r"(?<![\w-])" + re.escape(h).replace(r"\ ", r"\s+") + r"(?![\w-])") for h in EXEC_HINTS}
+_HINT_RE = {h: re.compile(r"(?<![\w-])" + re.escape(h).replace(r"\ ", r"\s+") + r"(?![\w-])", re.I) for h in EXEC_HINTS}
+UNICODE_HIT = "invisible-unicode-in-result"
 NO_PARENT = 2 ** 62               # before_seq for an orphan: every result in the task is context
 
 
 def exec_hints(text: str) -> list[str]:
-    """Sorted distinct tokens of the fixed §2.4.2 list found in the text: a lexical scan, not a classifier."""
+    """Sorted distinct tokens of the fixed §2.4.2 list found in the text (any case): a lexical scan, not a
+    classifier."""
     return sorted(h for h, rx in _HINT_RE.items() if rx.search(text))
 
 
@@ -27,9 +30,20 @@ class Refusal(Exception):
     """The call does not proceed. `seq` is the sealed record that says why, or None when nothing could be
     sealed (no parent under require_parent, an ambiguous task, an unreachable ledger)."""
 
-    def __init__(self, message: str, seq: int | None = None, hits: list | None = None):
+    def __init__(self, message: str, seq: int | None = None, hits: list | None = None, status: int | None = None,
+                 detail=None):
         super().__init__(message)
-        self.seq, self.hits = seq, hits or []
+        self.seq, self.hits, self.status, self.detail = seq, hits or [], status, detail
+
+
+@contextmanager
+def _refusals():
+    """A 4xx from the ledger (ambiguous or no open task, revoked agent, a parent already consumed, ...) is a
+    Refusal with nothing sealed, so adapters handle one type. Unreachable (5xx, transport) propagates."""
+    try:
+        yield
+    except Refused as e:
+        raise Refusal(f"Sijil ledger refused the call: {e.detail}", status=e.status, detail=e.detail) from e
 
 
 @dataclass
@@ -74,6 +88,8 @@ class Pipeline:
         self.ledger, self.session, self.cfg = ledger, session, cfg
         self.roots = roots or Roots(cwd=cfg.repo, repo=cfg.repo, home=Roots.here().home)
         self.pins = pins if pins is not None else rules.load_pins(cfg.egress_pins)
+        if not cfg.rulepack:
+            raise ValueError(f"{cfg.path}: rulepack is required (the file the ledger was given in SIJILL_RULEPACK_PATH)")
         self.pack = rules.load(cfg.rulepack)
 
     def seal(self, task_seq, build: Callable[[], dict]) -> dict:
@@ -103,6 +119,10 @@ class Pipeline:
               forced: list[str] | None = None) -> Sealed:
         """Seal the tool_call. Raises Refusal when the call must not run (blocked, denied, or unsealable);
         returns the sealed call otherwise. `forced` hits (a filter's) block without evaluating the pack."""
+        with _refusals():
+            return self._check(call, confirm, forced)
+
+    def _check(self, call: Call, confirm, forced) -> Sealed:
         h = args_hash(call.args)
         parent, correlation, tool_use_id, name = self._parent(call, h)
         if not parent and self.cfg.require_parent:
@@ -111,20 +131,21 @@ class Pipeline:
                                   self.cfg.context_window)
         facts, parsed = rules.call_facts(call.rule_tool, call.tool, call.args, self.roots, call.harness,
                                          call.command_arg, context_labels=ctx["labels"],
-                                         context_exec_hints=bool(ctx.get("exec_hints")), method=call.method,
+                                         context_exec_hints=bool(ctx["exec_hints"]), method=call.method,
                                          path_template=call.path_template)
         summary = call.summary or (parsed.summary() if parsed else {"arg_keys": sorted(call.args)})
         answer, body = {}, {}
 
         def build() -> dict:
+            pack = self.pack
             if forced:
                 hits, action = forced, "block"
             else:
-                v = rules.evaluate(self.pack, facts, self.pins)
+                v = rules.evaluate(pack, facts, self.pins)
                 hits, action = v.hits, v.action
                 if action == "confirm" and "c" not in answer:
                     rule = next(r for r in v.fired if r.action == "confirm")
-                    answer["c"] = confirm(rule) if confirm else "unavailable"
+                    answer["c"] = (confirm(rule) if confirm else None) or "unavailable"
             decision, mode = rules.outcome(action, answer.get("c"))
             ext = {"harness": call.harness, "session_id": call.session_id, "tool": call.tool,
                    "server": call.server, "qualified": name or call.rule_tool, "correlation": correlation,
@@ -132,7 +153,7 @@ class Pipeline:
                    "context_seqs": ctx["seqs"], **({"tool_use_id": tool_use_id} if tool_use_id else {}),
                    **({"confirmation": answer["c"]} if action == "confirm" else {})}
             body.update({"type": "tool_call", "parent_seq": parent, "mode": mode, "decision": decision,
-                         "rule_hits": hits, "input_hash": h, "rulepack_hash": self.pack.hash, "ext": ext})
+                         "rule_hits": hits, "input_hash": h, "rulepack_hash": pack.hash, "ext": ext})
             return body
         r = self.seal(call.task_seq, build)
         sealed = Sealed(r["seq"], r["decision"], body["rule_hits"], parent, body["ext"]["qualified"])
@@ -145,6 +166,10 @@ class Pipeline:
                source_label: str, raw: bytes | None = None, http_status: int | None = None,
                truncate: bool = True) -> Result:
         """Seal the tool_result. output_hash and bytes commit to what arrived, before any stripping (§2.4.2)."""
+        with _refusals():
+            return self._result(call, sealed, text, status, content_types, source_label, raw, http_status, truncate)
+
+    def _result(self, call, sealed, text, status, content_types, source_label, raw, http_status, truncate) -> Result:
         data = raw if raw is not None else text.encode("utf-8", "surrogatepass")
         scan = unicode.scan(text)
         mode_u = self.cfg.invisible_unicode if scan["found"] else "none"
@@ -165,13 +190,17 @@ class Pipeline:
         body = {}
 
         def build() -> dict:
-            v = rules.evaluate(self.pack, facts, self.pins)
+            pack = self.pack
+            v = rules.evaluate(pack, facts, self.pins)
+            hits = list(v.hits)
+            if mode_u == "block" and UNICODE_HIT not in hits:
+                hits.append(UNICODE_HIT)          # a pack without that rule still says why the result is withheld
             # confirm has no channel on a result: it blocks, as an unanswered confirm does (spec §2.5)
             action = "block" if mode_u == "block" else v.action
             decision, mode = rules.outcome(action)
             body.update({"type": "tool_result", "parent_seq": str(sealed.seq), "source_label": source_label,
-                         "mode": mode, "decision": decision, "rule_hits": v.hits, "input_hash": "",
-                         "output_hash": sha256_hex(data), "rulepack_hash": self.pack.hash, "ext": ext})
+                         "mode": mode, "decision": decision, "rule_hits": hits, "input_hash": "",
+                         "output_hash": sha256_hex(data), "rulepack_hash": pack.hash, "ext": ext})
             return body
         r = self.seal(call.task_seq, build)
         return Result(r["seq"], out, r["decision"] == "block", body["rule_hits"])
@@ -179,19 +208,23 @@ class Pipeline:
     def egress(self, call: Call, sealed: Sealed, host: str, port: int, proto: str, method: str = "",
                pins: rules.Pins | None = None) -> int:
         """Seal the connection the adapter itself makes upstream (spec §17.3.3); Refusal when it is blocked."""
-        pins = pins or self.pins
+        with _refusals():
+            return self._egress(call, sealed, host, port, proto, method, pins or self.pins)
+
+    def _egress(self, call, sealed, host, port, proto, method, pins) -> int:
         facts = rules.Facts("egress", tool=call.rule_tool, hosts=[host])
         body = {}
 
         def build() -> dict:
-            v = rules.evaluate(self.pack, facts, pins)
+            pack = self.pack
+            v = rules.evaluate(pack, facts, pins)
             decision, mode = rules.outcome(v.action)
             ext = {"host": host, "port": port, "proto": proto, "observed_by": call.observed_by,
                    "allowed_by": "none" if decision == "block" else "rulepack",
                    **({"method": method} if method else {}),
                    **({"pin_source": pins.path} if pins.pinned(host) and pins.path else {})}
             body.update({"type": "egress", "parent_seq": str(sealed.seq), "mode": mode, "decision": decision,
-                         "rule_hits": v.hits, "rulepack_hash": self.pack.hash, "ext": ext})
+                         "rule_hits": v.hits, "rulepack_hash": pack.hash, "ext": ext})
             return body
         r = self.seal(call.task_seq, build)
         if r["decision"] == "block":

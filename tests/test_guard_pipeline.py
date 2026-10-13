@@ -193,3 +193,100 @@ def test_the_task_travels_in_the_seal_body_when_two_are_open(g):
     ask(client, state, "look at the sentry error")          # bound to the first task by its header
     sealed = p.check(call("sentry", "get_issue", ISSUE, task_seq=state.task_seq))
     assert rows(s.db_path, f"seq = {sealed.seq}")[0]["task_seq"] == str(state.task_seq) != str(second)
+
+
+def test_one_inference_authorizes_one_call_even_when_two_race_for_it(g):
+    import threading
+    client, s, cfg, state, p = g
+    ask(client, state, "look at the sentry error")
+    gate, out = threading.Barrier(2), []
+
+    def go():
+        gate.wait()
+        try:
+            out.append(p.check(call("sentry", "get_issue", ISSUE)))
+        except Refusal as e:
+            out.append(e)
+    threads = [threading.Thread(target=go) for _ in range(2)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert sorted(type(o).__name__ for o in out) == ["Refusal", "Sealed"]
+    assert len([r for r in rows(s.db_path) if r["type"] == "tool_call"]) == 1
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_a_replayed_tool_use_id_is_refused_by_the_ledger_and_leaves_no_record(g):
+    client, s, cfg, state, p = g
+    ask(client, state, "list the files")
+    cid = json.loads(rows(s.db_path)[-1]["ext"])["tool_uses"][0]["id"]
+    p.check(call("fs", "list_directory", {"path": "."}, tool_use_id=cid))
+    n = len(rows(s.db_path))
+    # the lookup finds the parent by id, so only the seal can refuse it: 409, mapped to a Refusal
+    with pytest.raises(Refusal, match="parent already consumed") as e:
+        p.check(call("fs", "list_directory", {"path": "."}, tool_use_id=cid))
+    assert (e.value.status, e.value.seq) == (409, None) and len(rows(s.db_path)) == n
+    with pytest.raises(Refusal):                                   # by args_hash alone: no free entry left
+        p.check(call("fs", "list_directory", {"path": "."}))
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def sealed_call(client, state, p):
+    ask(client, state, "look at the sentry error")
+    return call("sentry", "get_issue", ISSUE), None
+
+
+def test_egress_pinned_unpinned_and_blocked_are_sealed_and_verify(g, tmp_path):
+    from guard import rules
+    client, s, cfg, state, p = g
+    c, _ = sealed_call(client, state, p)
+    sealed = p.check(c)
+    pins = tmp_path / "pins.yaml"
+    pins.write_text("hosts:\n  - api.example.org\n")
+    pinned = rules.load_pins(str(pins))
+    seq = p.egress(c, sealed, "api.example.org", 443, "https", "GET", pins=pinned)
+    x = json.loads(rows(s.db_path, f"seq = {seq}")[0]["ext"])
+    assert (x["allowed_by"], x["pin_source"], x["method"], x["host"]) == ("rulepack", str(pins), "GET", "api.example.org")
+    for host, hit in (("other.example.org", "egress-only-pinned-hosts"), ("169.254.169.254", None)):
+        with pytest.raises(Refusal) as e:                      # an unpinned host is blocked, sealed as such
+            p.egress(c, sealed, host, 443, "https", pins=pinned)
+        rec = rows(s.db_path, f"seq = {e.value.seq}")[0]
+        assert (rec["type"], rec["decision"], json.loads(rec["ext"])["allowed_by"]) == ("egress", "block", "none")
+        assert "pin_source" not in json.loads(rec["ext"]) and (hit is None or hit in e.value.hits)
+    assert client.post("/api/admin/halt", json={"halted": True}, headers=ADMIN).status_code == 200
+    with pytest.raises(Refusal) as e:                          # halted: blocked even for a pinned host
+        p.egress(c, sealed, "api.example.org", 443, "https", pins=pinned)
+    assert json.loads(rows(s.db_path, f"seq = {e.value.seq}")[0]["rule_hits"]) == ["halted"]
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_forced_hits_block_without_evaluating_the_pack(g):
+    client, s, cfg, state, p = g
+    c, _ = sealed_call(client, state, p)
+    with pytest.raises(Refusal, match="Blocked by Sijil rule tool-not-allowlisted") as e:
+        p.check(c, forced=["tool-not-allowlisted"])
+    rec = rows(s.db_path, f"seq = {e.value.seq}")[0]
+    assert (rec["decision"], rec["mode"], json.loads(rec["rule_hits"])) == ("block", "enforce", ["tool-not-allowlisted"])
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_a_5xx_from_the_ledger_is_unreachable_not_a_refusal_and_a_4xx_is_a_refusal(g):
+    client, s, cfg, state, p = g
+    p.ledger = Ledger("http://x", "t", http=httpx.Client(base_url="http://x", transport=httpx.MockTransport(
+        lambda r: httpx.Response(503, text="down"))))
+    with pytest.raises(Unreachable):
+        p.check(call("sentry", "get_issue", ISSUE))
+    p.ledger = Ledger("http://x", "t", http=httpx.Client(base_url="http://x", transport=httpx.MockTransport(
+        lambda r: httpx.Response(409, json={"detail": "task ambiguous: send X-Sijil-Task-Seq"}))))
+    with pytest.raises(Refusal, match="task ambiguous") as e:
+        p.check(call("sentry", "get_issue", ISSUE))
+    assert (e.value.status, e.value.seq) == (409, None)
+
+
+def test_exec_hints_ignore_case():
+    assert pipeline.exec_hints("PowerShell, CURL and NPX") == ["curl", "npx", "powershell"]
+
+
+def test_an_empty_rulepack_is_a_config_message(g):
+    client, s, cfg, state, p = g
+    with pytest.raises(ValueError, match="rulepack is required"):
+        Pipeline(p.ledger, state.agent_session, cfg.__class__(**{**cfg.__dict__, "rulepack": ""}))

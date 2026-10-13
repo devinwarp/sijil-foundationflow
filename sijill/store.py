@@ -130,6 +130,11 @@ class Store:
         return self.conn.execute("SELECT 1 FROM records WHERE type = ? AND parent_seq = ?",
                                  (type_, parent_seq)).fetchone() is not None
 
+    def children(self, type_: str, parent_seq: str) -> list[dict]:
+        rows = self.conn.execute("SELECT input_hash, ext FROM records WHERE type = ? AND parent_seq = ? ORDER BY seq",
+                                 (type_, parent_seq)).fetchall()
+        return [dict(r) for r in rows]
+
     def tool_use(self, task_seq: str, tool_use_id: str = "", name: str = "", args_hash: str = "") -> dict | None:
         """Newest tool_use_index entry of an inference in this task: by id, or by (name, args_hash) among
         entries no tool_call has consumed yet (spec §5.4 mechanisms 1 and 2)."""

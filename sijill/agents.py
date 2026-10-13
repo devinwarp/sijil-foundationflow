@@ -210,9 +210,18 @@ def check_parent(store, body: dict, ext: dict) -> None:
         raise HTTPException(400, "parent in a different task")
     if t == "tool_call":
         uses = json.loads(parent["ext"]).get("tool_uses", []) if parent["ext"] else []
-        if not any(u.get("args_hash") == body["input_hash"] and ext.get("tool_use_id", u.get("id")) == u.get("id")
-                   for u in uses if isinstance(u, dict)):
+        fits = [u for u in uses if isinstance(u, dict) and u.get("args_hash") == body["input_hash"]
+                and ext.get("tool_use_id", u.get("id")) == u.get("id")]
+        if not fits:
             raise HTTPException(400, "tool_call args not requested by parent")
+        # one requested tool_use authorizes one tool_call: each earlier child consumed an entry (by its id, else
+        # by its args_hash); under the seal lock, so two concurrent calls cannot both take the last one
+        used = [(json.loads(c["ext"]).get("tool_use_id", "") if c["ext"] else "", c["input_hash"])
+                for c in store.children("tool_call", p)]
+        free = [u for u in fits if u.get("id") not in {i for i, _ in used if i}]
+        free = free[:max(0, len(free) - sum(1 for i, h in used if not i and h == body["input_hash"]))]
+        if not free:
+            raise HTTPException(409, "parent already consumed")
     if t == "tool_result" and store.has_child("tool_result", p):
         raise HTTPException(409, f"duplicate tool_result for parent {p}")
     if t == "integrity_drift" and body["input_hash"] != parent["input_hash"]:
