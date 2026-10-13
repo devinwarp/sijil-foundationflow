@@ -4,13 +4,19 @@ streamable HTTP, both towards the wrapped server (upstream) and towards the harn
 The guard sits in the middle, so it is a client upstream and a server downstream. Downstream HTTP answers
 with application/json only: it never opens an SSE stream, so it cannot send the harness a request; a session
 there reports `can_request = False` and `confirm` rules get no elicitation (spec §5.7: unavailable).
+
+The wrapped server is untrusted. Every request ends in its result, an `RpcError` or a timeout; every pending
+entry is removed on every exit path; the reader dying for any reason fails all pending requests; and nothing
+the server sends is buffered past MAX_LINE bytes (a line, an HTTP body, or one SSE stream).
 """
 
 import asyncio
 import itertools
 import json
+import logging
 import os
 import secrets
+import time
 from contextlib import asynccontextmanager
 from typing import Awaitable, Callable
 
@@ -20,6 +26,14 @@ from fastapi.responses import JSONResponse
 
 PROTOCOL = "2025-06-18"
 METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL, SIJIL = -32601, -32602, -32603, -32000
+INVALID_REQUEST = -32600
+MAX_LINE = 2 ** 24            # most bytes taken from the wrapped server in one line, body or stream
+MAX_REQUEST = 2 ** 22         # most bytes taken from the harness in one HTTP request body
+MAX_TASKS = 64                # notification handlers in flight per transport; more are dropped and logged
+MAX_SESSIONS = 256            # downstream HTTP sessions open at once
+SESSION_TTL = 3600.0          # seconds a downstream HTTP session may sit idle
+
+log = logging.getLogger("sijil.guard.mcp")
 
 
 class RpcError(Exception):
@@ -38,15 +52,88 @@ async def _ignore(method: str, params: dict) -> None:
     return None
 
 
-_background: set = set()
+class _Tasks:
+    """Handlers spawned off a transport's reader: they may call back into that transport (a tools/list after
+    list_changed), which would deadlock the reader if awaited in place. Bounded, observed and cancellable."""
+
+    def __init__(self, cap: int = MAX_TASKS):
+        self.cap, self.live = cap, set()
+
+    def spawn(self, coro, force: bool = False) -> None:
+        if len(self.live) >= self.cap and not force:
+            coro.close()
+            log.warning("dropped a handler: %d already running", len(self.live))
+            return
+        t = asyncio.ensure_future(coro)
+        self.live.add(t)
+        t.add_done_callback(self._done)
+
+    def _done(self, t: asyncio.Task) -> None:
+        self.live.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            log.warning("handler failed: %r", t.exception())
+
+    async def wait(self) -> None:
+        while self.live:
+            await asyncio.gather(*self.live, return_exceptions=True)
+
+    async def cancel(self) -> None:
+        others = [t for t in self.live if t is not asyncio.current_task()]
+        for t in others:
+            t.cancel()
+        await asyncio.gather(*others, return_exceptions=True)
 
 
-def _spawn(coro) -> None:
-    """Run a notification handler on its own: it may call back into the transport that delivered it (a
-    tools/list after list_changed), which would deadlock the reader if awaited in place."""
-    t = asyncio.ensure_future(coro)
-    _background.add(t)
-    t.add_done_callback(_background.discard)
+def _params(msg: dict) -> dict:
+    p = msg.get("params")
+    return p if isinstance(p, dict) else {}
+
+
+def _fail_all(pending: dict, reason: str) -> None:
+    for fut in pending.values():
+        if not fut.done():
+            fut.set_exception(RpcError(INTERNAL, reason))
+    pending.clear()
+
+
+def _resolve(pending: dict, msg: dict) -> None:
+    """Give an answer to the request waiting for it. Ids that are not plain ints or strings (a list is
+    unhashable, True == 1) match nothing."""
+    rid = msg.get("id")
+    if isinstance(rid, bool) or not isinstance(rid, (int, str)):
+        return
+    fut = pending.pop(rid, None)
+    if fut is not None and not fut.done():
+        fut.set_result(msg)
+
+
+def _result(msg: dict) -> dict:
+    if "error" in msg:
+        e = msg["error"]
+        if not isinstance(e, dict):
+            raise RpcError(INTERNAL, "wrapped peer sent a malformed error")
+        raise RpcError(e.get("code", INTERNAL), str(e.get("message", "")), e.get("data"))
+    result = msg.get("result")
+    if not isinstance(result, dict):
+        raise RpcError(INTERNAL, "wrapped peer sent an answer without a result object")
+    return result
+
+
+async def _call(pending: dict, rid, send: Callable[[], Awaitable[None]], timeout: float) -> dict:
+    """Send a request and wait for its answer. Ends in the result, an RpcError or a timeout; the pending
+    entry is removed whichever way it ends."""
+    fut = asyncio.get_running_loop().create_future()
+    pending[rid] = fut
+    try:
+        await send()
+        msg = await asyncio.wait_for(fut, timeout)
+    except asyncio.TimeoutError:
+        raise RpcError(INTERNAL, f"no answer within {timeout}s") from None
+    except OSError as e:
+        raise RpcError(INTERNAL, f"send failed: {e}") from e
+    finally:
+        pending.pop(rid, None)
+    return _result(msg)
 
 
 class StdioUpstream:
@@ -54,52 +141,67 @@ class StdioUpstream:
 
     def __init__(self, command: str, args: list[str], env: dict, on_notification: Notify = _ignore):
         self.command, self.args, self.env, self.on_notification = command, args, env, on_notification
-        self.ids, self.pending, self.proc, self.reader = itertools.count(1), {}, None, None
+        self.ids, self.pending, self.proc, self.reader, self.tasks = itertools.count(1), {}, None, None, _Tasks()
 
     async def start(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
             self.command, *self.args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            env={**os.environ, **self.env}, limit=2 ** 24)
+            env={**os.environ, **self.env}, limit=MAX_LINE)
         self.reader = asyncio.create_task(self._read())
 
     async def _read(self) -> None:
-        async for line in self.proc.stdout:
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(msg, dict):
-                continue
-            if "method" not in msg and msg.get("id") in self.pending:
-                self.pending.pop(msg["id"]).set_result(msg)
-            elif "method" in msg and "id" in msg:     # server-to-client requests are not relayed
-                await self._send({"jsonrpc": "2.0", "id": msg["id"],
-                                  "error": RpcError(METHOD_NOT_FOUND, "not supported through sijil-guard").obj()})
-            elif "method" in msg:
-                _spawn(self.on_notification(msg["method"], msg.get("params") or {}))
-        for fut in self.pending.values():
-            fut.set_exception(RpcError(INTERNAL, "wrapped server exited"))
-        self.pending.clear()
+        try:
+            while line := await self.proc.stdout.readline():
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    log.warning("skipped a line from the wrapped server that is not JSON")
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if "method" not in msg:
+                    _resolve(self.pending, msg)
+                elif not isinstance(msg["method"], str):
+                    continue
+                elif "id" in msg:                   # server-to-client requests are not relayed
+                    self.tasks.spawn(self._refuse(msg["id"]))
+                else:
+                    self.tasks.spawn(self.on_notification(msg["method"], _params(msg)))
+        except Exception as e:                      # an oversize line, or any bug: the session is no longer trusted
+            log.warning("wrapped server stream failed: %r", e)
+            if self.proc.returncode is None:
+                self.proc.kill()
+        finally:
+            _fail_all(self.pending, "wrapped server exited")
+
+    async def _refuse(self, rid) -> None:
+        try:
+            await self._send({"jsonrpc": "2.0", "id": rid,
+                              "error": RpcError(METHOD_NOT_FOUND, "not supported through sijil-guard").obj()})
+        except OSError:
+            pass
 
     async def _send(self, msg: dict) -> None:
         self.proc.stdin.write(json.dumps(msg, ensure_ascii=False).encode() + b"\n")
         await self.proc.stdin.drain()
 
+    def _alive(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None and not self.reader.done()
+
     async def request(self, method: str, params: dict | None = None, timeout: float = 120.0) -> dict:
-        if self.proc.returncode is not None or self.reader.done():
+        if not self._alive():
             raise RpcError(INTERNAL, "wrapped server exited")
         rid = next(self.ids)
-        fut = asyncio.get_running_loop().create_future()
-        self.pending[rid] = fut
-        await self._send({"jsonrpc": "2.0", "id": rid, "method": method, **({"params": params} if params else {})})
-        msg = await asyncio.wait_for(fut, timeout)
-        if "error" in msg:
-            e = msg["error"]
-            raise RpcError(e.get("code", INTERNAL), e.get("message", ""), e.get("data"))
-        return msg.get("result", {})
+        body = {"jsonrpc": "2.0", "id": rid, "method": method, **({"params": params} if params else {})}
+        return await _call(self.pending, rid, lambda: self._send(body), timeout)
 
     async def notify(self, method: str, params: dict | None = None) -> None:
-        await self._send({"jsonrpc": "2.0", "method": method, **({"params": params} if params else {})})
+        if not self._alive():
+            raise RpcError(INTERNAL, "wrapped server exited")
+        try:
+            await self._send({"jsonrpc": "2.0", "method": method, **({"params": params} if params else {})})
+        except OSError as e:
+            raise RpcError(INTERNAL, f"send failed: {e}") from e
 
     async def close(self) -> None:
         if self.proc and self.proc.returncode is None:
@@ -109,6 +211,29 @@ class StdioUpstream:
             except asyncio.TimeoutError:
                 self.proc.kill()
                 await self.proc.wait()
+        if self.reader:
+            self.reader.cancel()
+            await asyncio.gather(self.reader, return_exceptions=True)
+        _fail_all(self.pending, "wrapped server exited")
+        await self.tasks.cancel()
+
+
+async def _capped(r: httpx.Response):
+    """The chunks of a response body, never more than MAX_LINE bytes of it in all."""
+    total = 0
+    async for chunk in r.aiter_bytes():
+        total += len(chunk)
+        if total > MAX_LINE:
+            raise RpcError(INTERNAL, "wrapped server sent too much")
+        yield chunk
+
+
+async def _lines(r: httpx.Response):
+    buf = b""
+    async for chunk in _capped(r):
+        *done, buf = (buf + chunk).split(b"\n")
+        for line in done:
+            yield line.rstrip(b"\r").decode("utf-8", "replace")
 
 
 class HttpUpstream:
@@ -117,8 +242,8 @@ class HttpUpstream:
     def __init__(self, url: str, headers: dict, on_notification: Notify = _ignore,
                  http: httpx.AsyncClient | None = None):
         self.url, self.headers, self.on_notification = url, headers, on_notification
-        self.http = http or httpx.AsyncClient(timeout=120.0)
-        self.ids, self.session_id, self.version = itertools.count(1), None, None
+        self.http, self.own_http = http or httpx.AsyncClient(timeout=120.0), http is None
+        self.ids, self.session_id, self.version, self.tasks = itertools.count(1), None, None, _Tasks()
 
     async def start(self) -> None:
         return None
@@ -128,53 +253,97 @@ class HttpUpstream:
                 **({"Mcp-Session-Id": self.session_id} if self.session_id else {}),
                 **({"MCP-Protocol-Version": self.version} if self.version else {})}
 
-    async def request(self, method: str, params: dict | None = None) -> dict:
+    async def request(self, method: str, params: dict | None = None, timeout: float = 120.0) -> dict:
         rid = next(self.ids)
         body = {"jsonrpc": "2.0", "id": rid, "method": method, **({"params": params} if params else {})}
         try:
+            msg = await asyncio.wait_for(self._post(method, rid, body), timeout)
+        except asyncio.TimeoutError:
+            raise RpcError(INTERNAL, f"no answer within {timeout}s") from None
+        except httpx.HTTPError as e:
+            raise RpcError(INTERNAL, f"wrapped server unreachable: {e}") from e
+        result = _result(msg)
+        if method == "initialize":
+            v = result.get("protocolVersion", PROTOCOL)
+            self.version = v if isinstance(v, str) else PROTOCOL
+        return result
+
+    async def _post(self, method: str, rid: int, body: dict) -> dict:
+        async with self.http.stream("POST", self.url, json=body, headers=self._headers()) as r:
+            if r.status_code >= 400:
+                raise RpcError(INTERNAL, f"wrapped server answered HTTP {r.status_code}")
+            if method == "initialize":
+                self.session_id = r.headers.get("mcp-session-id")
+            if r.headers.get("content-type", "").startswith("text/event-stream"):
+                return await self._sse(r, rid)
+            raw = b"".join([c async for c in _capped(r)])
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            raise RpcError(INTERNAL, "wrapped server answered with a body that is not JSON") from None
+        if not isinstance(msg, dict):
+            raise RpcError(INTERNAL, "wrapped server answered with something other than a JSON object")
+        return msg
+
+    async def _sse(self, r: httpx.Response, rid: int) -> dict:
+        data = []
+        async for line in _lines(r):
+            if line.startswith("data:"):
+                data.append(line[6:] if line.startswith("data: ") else line[5:])
+            elif line == "" and data:
+                raw, data = "\n".join(data), []
+                try:
+                    msg = json.loads(raw)
+                except ValueError:
+                    log.warning("skipped an SSE event that is not JSON")
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if "method" not in msg:
+                    if type(msg.get("id")) is int and msg["id"] == rid:
+                        return msg
+                elif not isinstance(msg["method"], str):
+                    continue
+                elif "id" in msg:                   # a server-to-client request, refused as on stdio
+                    self.tasks.spawn(self._refuse(msg["id"]))
+                else:
+                    self.tasks.spawn(self.on_notification(msg["method"], _params(msg)))
+        raise RpcError(INTERNAL, "wrapped server closed the stream without an answer")
+
+    async def _refuse(self, rid) -> None:
+        body = {"jsonrpc": "2.0", "id": rid,
+                "error": RpcError(METHOD_NOT_FOUND, "not supported through sijil-guard").obj()}
+        try:
+            await self._ack(body)
+        except (httpx.HTTPError, RpcError):
+            pass
+
+    async def _ack(self, body: dict, timeout: float = 30.0) -> None:
+        """POST a message that wants no answer; only the status is read."""
+        async def go():
             async with self.http.stream("POST", self.url, json=body, headers=self._headers()) as r:
                 if r.status_code >= 400:
                     raise RpcError(INTERNAL, f"wrapped server answered HTTP {r.status_code}")
-                if method == "initialize":
-                    self.session_id = r.headers.get("mcp-session-id")
-                msg = await self._answer(r, rid)
-        except httpx.HTTPError as e:
-            raise RpcError(INTERNAL, f"wrapped server unreachable: {e}") from e
-        if "error" in msg:
-            e = msg["error"]
-            raise RpcError(e.get("code", INTERNAL), e.get("message", ""), e.get("data"))
-        if method == "initialize":
-            self.version = msg.get("result", {}).get("protocolVersion", PROTOCOL)
-        return msg.get("result", {})
-
-    async def _answer(self, r: httpx.Response, rid: int) -> dict:
-        if r.headers.get("content-type", "").startswith("text/event-stream"):
-            data = []
-            async for line in r.aiter_lines():
-                if line.startswith("data:"):
-                    data.append(line[5:].lstrip())
-                elif line == "" and data:
-                    msg, data = json.loads("\n".join(data)), []
-                    if msg.get("id") == rid and "method" not in msg:
-                        return msg
-                    if "method" in msg and "id" not in msg:
-                        _spawn(self.on_notification(msg["method"], msg.get("params") or {}))
-            raise RpcError(INTERNAL, "wrapped server closed the stream without an answer")
-        return json.loads(await r.aread())
+        try:
+            await asyncio.wait_for(go(), timeout)
+        except asyncio.TimeoutError:
+            raise RpcError(INTERNAL, f"no answer within {timeout}s") from None
 
     async def notify(self, method: str, params: dict | None = None) -> None:
-        body = {"jsonrpc": "2.0", "method": method, **({"params": params} if params else {})}
         try:
-            await self.http.post(self.url, json=body, headers=self._headers())
+            await self._ack({"jsonrpc": "2.0", "method": method, **({"params": params} if params else {})})
         except httpx.HTTPError as e:
             raise RpcError(INTERNAL, f"wrapped server unreachable: {e}") from e
 
     async def close(self) -> None:
+        await self.tasks.cancel()
         if self.session_id:
             try:
-                await self.http.delete(self.url, headers=self._headers())
-            except httpx.HTTPError:
+                await asyncio.wait_for(self.http.delete(self.url, headers=self._headers()), 5)
+            except (httpx.HTTPError, asyncio.TimeoutError):
                 pass
+        if self.own_http:
+            await self.http.aclose()
 
 
 class Client:
@@ -208,46 +377,73 @@ class StdioClient(Client):
     can_request = True
 
     def __init__(self, write: Callable[[bytes], Awaitable[None]]):
-        self.write, self.ids, self.pending = write, itertools.count(1), {}
+        self.write, self.ids, self.pending, self.closed = write, itertools.count(1), {}, False
+
+    def close(self) -> None:
+        """The harness is gone: fail what waits for it, and every request made from here on."""
+        self.closed = True
+        _fail_all(self.pending, "the harness closed the stream")
 
     async def send(self, msg: dict) -> None:
         await self.write(json.dumps(msg, ensure_ascii=False).encode() + b"\n")
 
     async def request(self, method: str, params: dict, timeout: float = 300.0) -> dict:
+        if self.closed:
+            raise RpcError(INTERNAL, "the harness closed the stream")
         rid = f"sijil-{next(self.ids)}"
-        fut = asyncio.get_running_loop().create_future()
-        self.pending[rid] = fut
-        await self.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-        msg = await asyncio.wait_for(fut, timeout)
-        if "error" in msg:
-            raise RpcError(msg["error"].get("code", INTERNAL), msg["error"].get("message", ""))
-        return msg.get("result", {})
+        body = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+        return await _call(self.pending, rid, lambda: self.send(body), timeout)
 
     async def notify(self, method: str, params: dict) -> None:
-        await self.send({"jsonrpc": "2.0", "method": method, "params": params})
+        try:
+            await self.send({"jsonrpc": "2.0", "method": method, "params": params})
+        except OSError as e:
+            raise RpcError(INTERNAL, f"send failed: {e}") from e
 
 
 async def _answer(session: Session, msg: dict) -> dict:
+    method, params = msg["method"], msg.get("params")
     try:
-        result = await session.handle(msg["method"], msg.get("params") or {})
-        return {"jsonrpc": "2.0", "id": msg["id"], "result": result}
+        if not isinstance(method, str):
+            raise RpcError(INVALID_REQUEST, "method must be a string")
+        if params is not None and not isinstance(params, dict):
+            raise RpcError(INVALID_PARAMS, "params must be an object")
+        return {"jsonrpc": "2.0", "id": msg["id"], "result": await session.handle(method, params or {})}
     except RpcError as e:
         return {"jsonrpc": "2.0", "id": msg["id"], "error": e.obj()}
-    except Exception as e:                      # a guard bug must not hang the harness
-        return {"jsonrpc": "2.0", "id": msg["id"], "error": RpcError(INTERNAL, f"sijil-guard: {e}").obj()}
+    except Exception:                               # a guard bug must not hang the harness
+        log.exception("session.handle failed")
+        return {"jsonrpc": "2.0", "id": msg["id"], "error": RpcError(INTERNAL, "sijil-guard: internal error").obj()}
 
 
 async def serve_stdio(new_session: NewSession, reader: asyncio.StreamReader,
                       write: Callable[[bytes], Awaitable[None]]) -> None:
-    """One session over a line stream; returns at EOF after closing the session (spec §5.9: task_end)."""
+    """One session over a line stream; returns at EOF after closing the session (spec §5.9: task_end).
+    A line over MAX_LINE ends the session. On any exit the handlers still running are cancelled."""
     client = StdioClient(write)
     session = await new_session(client, {})
-    tasks = set()
+    tasks = _Tasks()
 
     async def run(msg: dict) -> None:
-        await client.send(await _answer(session, msg))
+        try:
+            await client.send(await _answer(session, msg))
+        except OSError:
+            log.warning("could not write an answer: the harness is gone")
+
+    async def notified(method: str, params: dict) -> None:
+        await session.notified(method, params)
     try:
-        while line := await reader.readline():
+        while True:
+            try:
+                line = await reader.readline()
+            except ValueError:
+                await client.send({"jsonrpc": "2.0", "id": None,
+                                   "error": {"code": INVALID_REQUEST, "message": "line too long"}})
+                return                              # fail closed: the handlers still running are cancelled below
+            if not line:
+                break
+            if not line.strip():
+                continue
             try:
                 msg = json.loads(line)
             except ValueError:
@@ -256,23 +452,25 @@ async def serve_stdio(new_session: NewSession, reader: asyncio.StreamReader,
             if not isinstance(msg, dict):
                 continue
             if "method" in msg and "id" in msg:
-                t = asyncio.create_task(run(msg))
-                tasks.add(t)
-                t.add_done_callback(tasks.discard)
-            elif "method" in msg:
-                await session.notified(msg["method"], msg.get("params") or {})
-            elif msg.get("id") in client.pending:
-                client.pending.pop(msg["id"]).set_result(msg)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+                tasks.spawn(run(msg), force=True)
+            elif isinstance(msg.get("method"), str):
+                tasks.spawn(notified(msg["method"], _params(msg)))
+            elif "method" not in msg:
+                _resolve(client.pending, msg)
+        client.close()
+        await tasks.wait()
     finally:
-        await session.close()
+        client.close()
+        try:
+            await tasks.cancel()
+        finally:
+            await session.close()
 
 
 async def stdio_streams() -> tuple[asyncio.StreamReader, Callable[[bytes], Awaitable[None]]]:
     """The process's own stdin and stdout as an asyncio line reader and an awaitable writer."""
     loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader(limit=2 ** 24)
+    reader = asyncio.StreamReader(limit=MAX_LINE)
     await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), os.fdopen(0, "rb", 0))
     out = os.fdopen(1, "wb", 0)
 
@@ -281,47 +479,91 @@ async def stdio_streams() -> tuple[asyncio.StreamReader, Callable[[bytes], Await
     return reader, write
 
 
+def _error(status: int, code: int, message: str, rid=None) -> JSONResponse:
+    return JSONResponse({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}, status)
+
+
 def http_app(new_session: NewSession) -> FastAPI:
-    """Streamable HTTP, JSON answers only. initialize opens a session (Mcp-Session-Id); DELETE closes it."""
+    """Streamable HTTP, JSON answers only. initialize opens a session (Mcp-Session-Id); DELETE closes it.
+    At most MAX_SESSIONS sessions are open, and one idle for SESSION_TTL seconds is closed."""
     sessions: dict[str, Session] = {}
+    touched: dict[str, float] = {}
+
+    async def drop(sid: str) -> None:
+        session = sessions.pop(sid, None)
+        touched.pop(sid, None)
+        if session is not None:
+            try:
+                await session.close()
+            except Exception:
+                log.exception("closing a session failed")
+
+    async def expire() -> None:
+        now = time.monotonic()
+        for sid in [s for s, t in touched.items() if now - t > SESSION_TTL]:
+            await drop(sid)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        yield
-        for session in list(sessions.values()):   # shutting down ends every open task (spec §5.9)
-            await session.close()
-        sessions.clear()
+        try:
+            yield
+        finally:
+            for sid in list(sessions):                # shutting down ends every open task (spec §5.9)
+                await drop(sid)
 
     app = FastAPI(lifespan=lifespan)
 
+    async def body_of(request: Request) -> bytes | None:
+        body = b""
+        async for chunk in request.stream():
+            body += chunk
+            if len(body) > MAX_REQUEST:
+                return None
+        return body
+
     @app.post("/mcp")
     async def post(request: Request):
+        raw = await body_of(request)
+        if raw is None:
+            return _error(413, INVALID_REQUEST, "request body too large")
         try:
-            msg = await request.json()
+            msg = json.loads(raw)
         except ValueError:
-            return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}},
-                                400)
+            return _error(400, -32700, "parse error")
+        if isinstance(msg, list):
+            return _error(400, INVALID_REQUEST, "batches are not supported")
         if not isinstance(msg, dict) or "method" not in msg:
-            return Response(status_code=202)       # responses and batches: nothing this server asked for
+            return Response(status_code=202)       # responses: nothing this server asked for
+        await expire()
         sid = request.headers.get("mcp-session-id")
         if msg["method"] == "initialize" and "id" in msg:
+            if len(sessions) >= MAX_SESSIONS:
+                return _error(503, SIJIL, "too many open sessions", msg["id"])
             sid = "ms_" + secrets.token_hex(16)
-            sessions[sid] = await new_session(Client(), dict(request.headers))
-        elif sid not in sessions:
-            return JSONResponse({"jsonrpc": "2.0", "id": msg.get("id"),
-                                 "error": {"code": -32600, "message": "unknown or missing Mcp-Session-Id"}}, 404)
-        session = sessions[sid]
+            session = await new_session(Client(), dict(request.headers))
+            out = await _answer(session, msg)
+            if "error" in out or len(sessions) >= MAX_SESSIONS:     # a failed initialize opens nothing
+                await session.close()
+                return JSONResponse(out) if "error" in out else _error(503, SIJIL, "too many open sessions", msg["id"])
+            sessions[sid], touched[sid] = session, time.monotonic()
+            return JSONResponse(out, headers={"Mcp-Session-Id": sid})
+        if sid not in sessions:
+            return _error(404, INVALID_REQUEST, "unknown or missing Mcp-Session-Id", msg.get("id"))
+        session, touched[sid] = sessions[sid], time.monotonic()
         if "id" not in msg:
-            await session.notified(msg["method"], msg.get("params") or {})
+            try:
+                await session.notified(msg["method"], _params(msg))
+            except Exception:
+                log.exception("session.notified failed")
             return Response(status_code=202)
         return JSONResponse(await _answer(session, msg), headers={"Mcp-Session-Id": sid})
 
     @app.delete("/mcp")
     async def delete(request: Request):
-        session = sessions.pop(request.headers.get("mcp-session-id", ""), None)
-        if session is None:
+        sid = request.headers.get("mcp-session-id", "")
+        if sid not in sessions:
             return Response(status_code=404)
-        await session.close()
+        await drop(sid)
         return Response(status_code=204)
 
     @app.get("/mcp")
