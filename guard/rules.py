@@ -7,13 +7,15 @@ in pack order and the strictest action wins (block > confirm > record > allow). 
 import fnmatch
 import json
 import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import unquote
 
 import yaml
 
 from .canon import sha256_hex
-from .cmdparse import URL, Parsed, Roots, Segment, host_of, normalise, parse
+from .cmdparse import URL, Parsed, Roots, Segment, host_of, normalise, parse, path_like
 
 ON = ("tool_call", "tool_result", "egress", "integrity")
 ACTIONS = ("allow", "record", "confirm", "block")
@@ -24,25 +26,34 @@ RESERVED_IDS = ("upstream_error", "halted", "resumed", "principal-missing", "pri
                 "principal-jwks-unavailable", "http-operation-unknown", "http-task-ambiguous", "approval-timeout")
 RESERVED_PREFIXES = ("budget:",)
 NOT_ALLOWLISTED = "tool-not-allowlisted"       # written by the guard's tools.allow/deny filter (spec §5.2)
+RULE_KEYS = {"id", "on", "action", "match", "description", "incident"}
 MATCH_KEYS = {
-    "tool_call": {"tool", "harness", "command_regex", "argv0", "path_glob", "path_mode", "arg_regex", "env_refs_any",
+    "tool_call": {"tool", "harness", "command_regex", "argv0", "path_glob", "path_glob_not", "path_mode", "arg_regex", "env_refs_any",
                   "context_labels_any", "context_exec_hints", "egress_host_not_pinned", "http_method", "http_path"},
     "tool_result": {"tool", "harness", "source_label", "invisible_unicode", "exec_hints_any"},
     "egress": {"tool", "egress_host_not_pinned", "egress_host_regex"},
     "integrity": {"drift_kind", "invisible_unicode"},
 }
 REGEX_KEYS = ("command_regex", "egress_host_regex")
-LIST_KEYS = ("tool", "harness", "argv0", "path_glob", "env_refs_any", "context_labels_any", "source_label",
+LIST_KEYS = ("tool", "harness", "argv0", "path_glob", "path_glob_not", "env_refs_any", "context_labels_any", "source_label",
              "exec_hints_any", "drift_kind", "http_method", "http_path")
 BOOL_KEYS = ("context_exec_hints", "egress_host_not_pinned", "invisible_unicode")
-WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "write_file", "edit_file", "create_file", "move_file",
-               "create_directory", "delete_file"}
-PATH_ARGS = ("path", "paths", "file_path", "filename", "file", "source", "destination", "target", "dir",
-             "directory", "notebook_path")
+WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "write_file", "write_text_file", "edit_file",
+               "create_file", "move_file", "create_directory", "delete_file"}
+SHELL_TOOLS = {"Bash", "run_command", "execute_command", "shell"}      # the tools the pack's command rules name
+COMMAND_ARGS = ("command", "cmd", "script", "commandLine")             # what a shell tool may call its command
+# An argument is a path when its name says so, or its value looks like one; text payloads are never paths.
+PATH_NAMES = {"pattern", "glob", "src", "source", "dest", "destination", "target", "output", "filename"}
+PATH_SUFFIXES = ("path", "paths", "file", "files", "dir", "directory", "folder", "uri")
+CONTENT_ARGS = {"content", "contents", "text", "body", "data", "message", "old_string", "new_string", "new_source"}
 
 
-def glob_re(pattern: str) -> re.Pattern:
-    """Path glob: `*` and `?` stay inside one segment, `**/` is zero or more directories, `**` anything."""
+def glob_re(pattern: str, ignore_case: bool = False) -> re.Pattern:
+    """Path glob: `*` and `?` stay inside one segment, `**/` is zero or more directories, `**` anything.
+    A trailing `/**` also matches the directory itself (`cp -r ~/.ssh x` names no file below it)."""
+    tail = ""
+    if pattern.endswith("/**"):
+        pattern, tail = pattern[:-3], "(?:/.*)?"
     out, i = "", 0
     while i < len(pattern):
         if pattern.startswith("**/", i):
@@ -52,7 +63,7 @@ def glob_re(pattern: str) -> re.Pattern:
         else:
             out += {"*": "[^/]*", "?": "[^/]"}.get(pattern[i], re.escape(pattern[i]))
             i += 1
-    return re.compile(out + r"\Z", re.S)
+    return re.compile(out + tail + r"\Z", re.S | (re.I if ignore_case else 0))
 
 
 @dataclass(frozen=True)
@@ -97,7 +108,7 @@ def _compile(rule_id: str, on: str, match) -> dict:
         elif k in LIST_KEYS:
             if not isinstance(v, list) or not v or not all(isinstance(x, str) for x in v):
                 raise ValueError(f"rule {rule_id!r}: {k} must be a non-empty list of strings")
-            out[k] = [glob_re(p) for p in v] if k in ("path_glob", "http_path") else v
+            out[k] = [glob_re(p, k != "http_path") for p in v] if k in ("path_glob", "path_glob_not", "http_path") else v
         elif k in BOOL_KEYS:
             if not isinstance(v, bool):
                 raise ValueError(f"rule {rule_id!r}: {k} must be true or false")
@@ -110,8 +121,8 @@ def _compile(rule_id: str, on: str, match) -> dict:
             if not isinstance(v, dict) or not v:
                 raise ValueError(f"rule {rule_id!r}: arg_regex must map argument keys to regexes")
             out[k] = {key: _re(rule_id, f"arg_regex.{key}", rx) for key, rx in v.items()}
-    if "path_mode" in out and "path_glob" not in out:
-        raise ValueError(f"rule {rule_id!r}: path_mode needs path_glob")
+    if ("path_mode" in out or "path_glob_not" in out) and "path_glob" not in out:
+        raise ValueError(f"rule {rule_id!r}: path_mode and path_glob_not need path_glob")
     return out
 
 
@@ -129,6 +140,8 @@ def load(path: str) -> RulePack:
     for r in doc.get("rules") or []:
         r = {("on" if k is True else k): v for k, v in r.items()} if isinstance(r, dict) else {}
         rid = r.get("id")
+        if set(r) - RULE_KEYS:    # `enabled: false` must not be silently ignored on a block rule
+            raise ValueError(f"{path}: rule {rid!r} has unknown keys {sorted(set(r) - RULE_KEYS)}")
         if not isinstance(rid, str) or not RULE_ID.fullmatch(rid) or rid in seen:
             raise ValueError(f"{path}: rule id must be kebab-case and unique: {rid!r}")
         if rid in RESERVED_IDS or rid.startswith(RESERVED_PREFIXES):
@@ -156,6 +169,7 @@ class Pins:
     suffixes: tuple = ()
 
     def pinned(self, host: str) -> bool:
+        host = host.lower().rstrip(".")
         return host in self.hosts or any(host.endswith("." + s) for s in self.suffixes)
 
 
@@ -193,29 +207,60 @@ class Facts:
     path_template: str = ""
 
 
+def _as_text(command) -> str | None:
+    """A command as the shell would read it: a list is an argv, anything else is its string form."""
+    if command is None or isinstance(command, str):
+        return command
+    if isinstance(command, (list, tuple)):
+        return shlex.join(str(x) for x in command)
+    return str(command)
+
+
+def _file_uri_path(s: str) -> str:
+    """`file:///a/b` and `file://localhost/a/b` are /a/b; anything else is returned as written."""
+    if not s.lower().startswith("file://"):
+        return s
+    rest = unquote(s[7:])
+    return rest[len("localhost"):] if rest.lower().startswith("localhost/") else rest
+
+
+def _path_args(args: dict):
+    for k, v in args.items():
+        if k in CONTENT_ARGS:
+            continue
+        named = k in PATH_NAMES or k.lower().endswith(PATH_SUFFIXES)
+        for s in v if isinstance(v, list) else [v]:
+            if isinstance(s, str) and s and (named or path_like(s)):
+                yield _file_uri_path(s)
+
+
 def call_facts(tool: str, bare: str, args: dict, roots: Roots, harness: str, command_arg: str = "command",
                **context) -> tuple[Facts, Parsed | None]:
-    """Facts for a tool_call. A shell-like tool carries its command in `command_arg`; any other tool's paths
-    come from its path-like arguments, written when the tool is a write tool."""
-    command = args.get(command_arg) if command_arg else None
-    if tool == "Bash":
-        command = args.get("command")
-    if isinstance(command, str):
-        parsed = parse(command, roots)
-        hosts = sorted({h for s in parsed.segments for h in s.hosts})
-        return Facts("tool_call", tool, harness, command, parsed.segments, parsed.env_refs, args, hosts,
-                     **context), parsed
-    raw = [v for k in PATH_ARGS for v in (args.get(k) if isinstance(args.get(k), list) else [args.get(k)])
-           if isinstance(v, str) and v]
-    paths = [n for p in raw for n in normalise(p, roots)]
+    """Facts for a tool_call. A shell tool carries its command in `command_arg` (or cmd, script, commandLine);
+    every tool's path-like arguments are paths too, written when the tool is a write tool. Over-seeing a path
+    is acceptable, missing one is not."""
+    names = ([command_arg] if command_arg else []) + (list(COMMAND_ARGS) if bare in SHELL_TOOLS else [])
+    command = _as_text(next((args[n] for n in names if args.get(n) is not None), None))
+    paths = [n for p in _path_args(args) for n in normalise(p, roots)]
     write = bare in WRITE_TOOLS
     hosts = sorted({h for v in args.values() if isinstance(v, str) for m in URL.findall(v) if (h := host_of(m))})
     seg = Segment(argv0="", args=[], reads=[] if write else paths, writes=paths if write else [], hosts=hosts)
-    return Facts("tool_call", tool, harness, None, [seg], [], args, hosts, **context), None
+    if command is None:
+        return Facts("tool_call", tool, harness, None, [seg], [], args, hosts, **context), None
+    parsed = parse(command, roots)
+    hosts = sorted(set(hosts) | {h for s in parsed.segments for h in s.hosts})
+    segments = parsed.segments + ([seg] if paths else [])
+    return Facts("tool_call", tool, harness, command, segments, parsed.env_refs, args, hosts, **context), parsed
 
 
 def _any_glob(values, patterns) -> bool:
     return any(fnmatch.fnmatchcase(v, p) for v in values for p in patterns)
+
+
+def _named(m: dict, f: Facts) -> bool:
+    """The rule names this MCP tool exactly (no wildcard): the tool alone is the signal when the call carries
+    no command or path to look at, as `mcp:github:merge_pull_request` carries none."""
+    return f.tool.startswith("mcp:") and f.tool in m.get("tool", ())
 
 
 def _segment_ok(m: dict, seg: Segment) -> bool:
@@ -224,6 +269,7 @@ def _segment_ok(m: dict, seg: Segment) -> bool:
     if "path_glob" in m:
         mode = m.get("path_mode", "any")
         paths = seg.reads if mode == "read" else seg.writes if mode == "write" else seg.reads + seg.writes
+        paths = [p for p in paths if not any(rx.match(p) for rx in m.get("path_glob_not", ()))]
         if not any(rx.match(p) for p in paths for rx in m["path_glob"]):
             return False
     return True
@@ -239,10 +285,15 @@ def matches(rule: Rule, f: Facts, pins: Pins) -> bool:
         return False
     if "command_regex" in m:   # the whole command, and each segment on its own (bash -c 'npx x' is a segment)
         texts = [f.command or ""] + [" ".join([s.argv0, *s.args]) for s in f.segments if s.argv0]
-        if f.command is None or not any(m["command_regex"].search(t) for t in texts):
+        if f.command is None:
+            if not _named(m, f):
+                return False
+        elif not any(m["command_regex"].search(t) for t in texts):
             return False
+    carries_path = any(s.reads or s.writes for s in f.segments)
     if ("argv0" in m or "path_glob" in m) and not any(_segment_ok(m, s) for s in f.segments):
-        return False
+        if "argv0" in m or carries_path or not _named(m, f):
+            return False
     if "arg_regex" in m:
         for key, rx in m["arg_regex"].items():
             v = f.args.get(key)
@@ -254,9 +305,10 @@ def matches(rule: Rule, f: Facts, pins: Pins) -> bool:
         return False
     if "context_exec_hints" in m and f.context_exec_hints != m["context_exec_hints"]:
         return False
-    if "egress_host_not_pinned" in m and any(not pins.pinned(h) for h in f.hosts) != m["egress_host_not_pinned"]:
+    hosts = [h.lower().rstrip(".") for h in f.hosts]
+    if "egress_host_not_pinned" in m and any(not pins.pinned(h) for h in hosts) != m["egress_host_not_pinned"]:
         return False
-    if "egress_host_regex" in m and not any(m["egress_host_regex"].search(h) for h in f.hosts):
+    if "egress_host_regex" in m and not any(m["egress_host_regex"].search(h) for h in hosts):
         return False
     if "source_label" in m and not _any_glob([f.source_label], m["source_label"]):
         return False
