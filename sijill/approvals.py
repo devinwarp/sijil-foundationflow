@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 
@@ -128,6 +127,9 @@ def schedule(n, p: Pending) -> None:
 
 async def start(n) -> None:
     """Startup: every request still pending gets its timer; one already past its deadline is sealed now."""
+    if n.rulepack and n.rulepack.hitl and n.rulepack.hitl.channel == "entra" and not n.settings.public_url:
+        print("sijill: SIJILL_PUBLIC_URL is empty: approval notifications cannot carry a link and are not sent",
+              file=sys.stderr)
     for p in list(n.approvals.items.values()):
         schedule(n, p)
 
@@ -144,14 +146,17 @@ async def notify(n, p: Pending) -> None:
     url = os.environ.get(env) if env else None
     if not url:
         return
+    if not n.settings.public_url:
+        print("sijill: approval notification skipped: SIJILL_PUBLIC_URL is empty", file=sys.stderr)
+        return
     x = p.x
     link = f"{n.settings.public_url.rstrip('/')}/approval/{x['approval_id']}"
     text = (f"Sijil approval needed: {x['tool']} on {x['server']} (route {x['route_id']}, rules "
             f"{', '.join(json.loads(p.request['rule_hits']))}). Answer before {p.deadline}: {link}")
     try:
         await n.idp.post(url, json={"text": text})
-    except httpx.HTTPError:
-        pass
+    except Exception as e:          # an invalid URL as much as a network error: delivery only, never fatal
+        print(f"sijill: approval notification failed: {e!r}", file=sys.stderr)
 
 
 async def request_approval(n, sess: dict | None, task: dict, b: dict) -> Pending:

@@ -338,3 +338,24 @@ def test_the_timeout_timer_survives_a_failed_seal_and_retries(tmp_path, capsys):
     assert verify(s.db_path, s.pubkey_path)[0] == 0
     assert verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))[0] == 0
 
+
+def test_a_notification_never_fails_and_needs_a_public_url(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("SIJIL_TEST_TEAMS_WEBHOOK", "https://teams.test/hook")
+    idp = Hooked()
+    client, s, _ = gov_node(tmp_path, idp=idp)                       # SIJILL_PUBLIC_URL left empty
+    with client:
+        n = client.app.state.node
+        assert "SIJILL_PUBLIC_URL is empty" in capsys.readouterr().err        # warned at startup
+        sess, task = open_task(client)
+        parent, _ = think(client, sess, task)
+        p = n.approvals.items[ask(client, sess, parent).json()["approval_id"]]
+        asyncio.run(approvals.notify(n, p))
+        assert idp.posted == [] and "notification skipped" in capsys.readouterr().err
+        n.settings.public_url = "https://sijil.moi.internal"
+        async def invalid(*a, **k):
+            raise ValueError("invalid URL")          # not an httpx.HTTPError, as httpx.InvalidURL is not
+        monkeypatch.setattr(n.idp, "post", invalid)
+        asyncio.run(approvals.notify(n, p))
+        assert "notification failed" in capsys.readouterr().err
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+    assert verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))[0] == 0
