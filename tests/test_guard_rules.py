@@ -394,30 +394,46 @@ def test_loader_refuses_unknown_rule_level_keys(tmp_path):
 
 
 def _adversarial(n=50_000):
-    """50 KB commands that make a backtracking regex quadratic or worse: repeated flags, wrappers, spaces."""
+    """50 KB commands that make a backtracking regex quadratic or worse: repeated words, flags, separators, spaces."""
     rep = lambda unit: (unit * (n // len(unit) + 1))[:n]
-    return [rep("sed -i "), "sed " + rep("-i "), "sudo " + rep("-u x "), rep("sudo "), rep("chmod "), "chmod " + rep("-R "),
-            "chmod " + rep("a+r,"), "rm " + rep("-r "), "rm " + rep("-f ") + "-r", "rm" + " " * n, "sudo" + " " * n,
-            "sed " + " " * n + "-i", rep("-"), rep("nc "), "nc " + rep("-x "), "python " + rep("a "), rep("python "),
-            rep("env "), "env " + rep("-i "), rep("kill "), "kill " + rep("a "), rep("systemctl "), "find / " + rep("-x "),
-            rep("export "), rep("A=b "), rep("cp "), "cp " + rep("a "), rep("dd "), "dd " + rep("a "), rep("mkfifo "),
-            rep("sij"), rep("/etc/sudoers "), rep("tee "), rep("| sh "), rep("doas "), rep("su "), rep("docker ")]
+    return [rep("sed -i "), "sed " + rep("-i "), "sudo " + rep("-u x "), rep("sudo "), "chmod " + rep("a+r,"), "chmod a+" + "w" * n,
+            "rm " + rep("-r "), "rm" + " " * n, "sudo" + " " * n, rep("nc "), "nc " + rep("-x "), rep("python "), rep(";python "),
+            rep("env "), "env " + rep("-i "), rep("kill "), "kill " + rep("a "), rep("systemctl "), rep("tee "), rep("cp "),
+            rep("mkfifo "), rep("| sh "), rep(">"), rep("> a "), "> " + "a" * n, "export " + rep("A=b "), rep("A=b "), rep("unset ")]
 
 
-def test_every_starter_rule_is_linear_on_adversarial_commands(env):
+def test_starter_command_regexes_stay_linear_on_adversarial_commands(env):
+    """A rule that backtracks stalls evaluate for seconds on one hostile command (the old sed alternative: 12 s)."""
     import time
-    pack, pins, _ = env
-    slow = []
-    for cmd in _adversarial():
-        for r in pack.rules:
-            if r.match.get("command_regex") is None:
-                continue
-            t = time.perf_counter()
-            r.match["command_regex"].search(cmd)
-            if time.perf_counter() - t > 0.5:
-                slow.append((r.id, cmd[:20], round(time.perf_counter() - t, 1)))
-    assert not slow
-    t = time.perf_counter()
-    for cmd in _adversarial():
-        call(env, "Bash", {"command": cmd})
-    assert time.perf_counter() - t < 0.5 * len(_adversarial())
+    pack = env[0]
+    ids = ("no-destructive-fs", "no-perm-escalation", "no-reverse-shell", "no-oversight-tamper")
+    rxs = [pack.rule(i).match["command_regex"] for i in ids]
+
+    def took(n):
+        t = time.perf_counter()
+        for cmd in _adversarial(n):
+            for rx in rxs:
+                rx.search(cmd)
+        return time.perf_counter() - t
+
+    small, large = took(5_000), took(40_000)
+    # 8x the input: about 8x the time when linear, 64x when quadratic; the ratio holds on a slow machine too
+    assert large < 2.5 * 8 * max(small, 0.01) and large < 10, (small, large)
+
+
+PAD = ["a " * 150, "a " * 750, "a " * 10_000]        # 300, 1500, 20000 characters of junk arguments
+EVASIONS = [      # (rule, command with {p} where padding goes) that the 300/1000 character bounds once let through
+    ("no-destructive-fs", "rm -rf {p}/"), ("no-destructive-fs", "rm / {p}-rf"), ("no-destructive-fs", "dd if=/dev/zero {p}of=/dev/sda"),
+    ("no-destructive-fs", "find / {p}-delete"), ("no-oversight-tamper", "rm -f {p}sijill.db"), ("no-oversight-tamper", "kill -9 {p}sijil"),
+    ("no-oversight-tamper", "unset {p}SIJIL_TOKEN"), ("no-oversight-tamper", "systemctl {p}stop sijil"),
+    ("no-oversight-tamper", "mv {p}~/.sijil x"), ("no-oversight-tamper", "dd {p}of=sijill.db"), ("no-oversight-tamper", "sed -i {p}~/.sijil/x"),
+    ("no-oversight-tamper", "cp {p}~/.sijil/x"), ("no-perm-escalation", "sed -i {p}/etc/sudoers"), ("no-perm-escalation", "tee {p}/etc/sudoers"),
+    ("no-reverse-shell", "nc {p}-e /bin/sh"), ("no-reverse-shell", "socat {p}exec:sh"),
+    ("no-reverse-shell", "python3 -c 'x = \"{p}\"\nimport socket\n{p}\ns.connect((1,2))\n{p}\nsubprocess.call([\"/bin/sh\"])'"),
+    ("no-reverse-shell", "mkfifo /tmp/f; {p}; cat /tmp/f | nc h 1")]
+
+
+@pytest.mark.parametrize("pad", PAD, ids=["300", "1500", "20000"])
+def test_padding_does_not_hide_a_command_from_the_rules(pad, env):
+    for rule_id, template in EVASIONS:
+        assert rule_id in call(env, "Bash", {"command": template.replace("{p}", pad)}).hits, (rule_id, template)

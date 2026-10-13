@@ -181,11 +181,15 @@ rules:
   # The next four are not in spec §8.2: the pilot plan carries them into M2d (idea from CUSTOS-CORE's
   # action gate deny list; no code taken). They fill what the egress and credential rules above miss.
   # Case-insensitive like the rules above; a flag whose case changes its meaning is matched with (?-i:).
-  # Each command_regex is verbose ((?x): the folded newlines are ignored), one alternative per line; every
-  # alternative is anchored at a segment start (the parser has already unwrapped sudo, env, bash -c ...).
+  # Each command_regex is verbose ((?x): the folded newlines are ignored), one alternative per line, with no
+  # comment inside it. The engine tests it against the whole command and against each parsed segment (sudo,
+  # env, nohup and bash -c already unwrapped), so an alternative is anchored at a segment start
+  # (^|[;&|]\s*). Anchored, with each wildcard being one [^;&|]* inside its own lookahead, a command costs
+  # time linear in its length however it is padded: there are no length bounds to pad past, and no two
+  # wildcards in sequence to backtrack over. The one place that looks across segments (the interpreter
+  # socket shell) takes its three keyword tests from the start of the text, so it runs once.
   # Ceiling for all four: they key on literal words (sijil, a device path, /etc/sudoers), so a pid, a glob
   # (pkill -f 'sij*') or variable indirection through a name not listed here ($X=sijill.db) gets past them,
-  # (every wildcard is bounded to 300 characters so a 50 KB command cannot make the engine backtrack),
   # as do interpreter one-liners other than the socket ones listed; the guard's other layers cover those.
 
   - id: no-destructive-fs
@@ -197,17 +201,17 @@ rules:
       command_regex: '(?ix)
 
         (^|[;&|]\s*) rm\b
-          (?= [^;&|\n]{0,300}\s (-[a-z]*r[a-z]*|--recursive) (\s|$) )
-          (?= [^;&|\n]{0,300}\s ["'']? ( /+\*? | /\. | ~\w*/?\*? | \$\{?(HOME|PWD)\}?/?\*? | \.{1,2}/?\*? | \*\.? ) ["'']? (\s|$|[;&|]) )
+          (?= [^;&|]*\s (-[a-z]*r[a-z]*|--recursive) (\s|$) )
+          (?= [^;&|]*\s ["'']? ( /+\*? | /\. | ~\w*/?\*? | \$\{?(HOME|PWD)\}?/?\*? | \.{1,2}/?\*? | \*\.? ) ["'']? (\s|$|[;&|]) )
 
         | (^|[;&|]\s*) (mkfs(\.\w+)?|wipefs|shred)\b
 
-        | (^|[;&|]\s*) dd\b [^;&|\n]{0,300} \bof=/dev/
+        | (^|[;&|]\s*) dd\b [^;&|]* \bof=/dev/
 
         | >\s*/dev/(sd|hd|vd|nvme|mmcblk|r?disk)
 
         | (^|[;&|]\s*) find\s+(-[HLP]\s+)* ["'']? (/|~|\$\{?HOME\}?) /? ["'']? \s
-            [^;&|\n]{0,300} ( -delete\b | -exec(dir)?\s+(\S*/)?rm\b )'
+            (?= [^;&|]* ( -delete\b | -exec(dir)?\s+(\S*/)?rm\b ) )'
     action: block
 
   # no-perm-escalation: octal modes that are world-writable or setuid/setgid, symbolic o/a +w or =w, any +s;
@@ -225,7 +229,7 @@ rules:
           ( [0-7]{0,2}[0-7]{2}[2367]
           | [2467][0-7]{3}
           | ([ugoa]*[-+=][rwxXst]*,)*
-            ( [ugoa]*[ao][ugoa]*[+=][rwxXst]*w | [ugoa]*[+=][rwxXst]*s ) \S* )
+            ( [ug]*[ao][ugoa]*[+=][rwxXst]*w | [ugoa]*[+=][rwxXst]*s ) \S* )
           (\s|$)
 
         | (^|[;&|]\s*) chown\s+(-\S+\s+)*["'']?(root|0)\b
@@ -238,10 +242,11 @@ rules:
         | (^|[;&|]\s*) su(\s+(-l?|--login))?(\s+root)?\s*($|[;&|])
         | (^|[;&|]\s*) pkexec\b
         | \bvisudo\b
-        | (>>?|\btee\b[^;&|\n]{0,300})\s*["'']?/etc/sudoers
-        | \b(cp|mv|install|ln)\b [^;&|\n]{0,300} /etc/sudoers \S* \s* ($|[;&|])
-        | \bsed\b (?= [^;&|\n]{0,300}\s-\S*i ) [^;&|\n]{0,300} /etc/sudoers
-        | \bdd\b [^;&|\n]{0,300} \bof=/etc/sudoers'
+        | >>?\s*["'']?/etc/sudoers
+        | (^|[;&|]\s*) tee\b [^;&|]* /etc/sudoers
+        | (^|[;&|]\s*) (cp|mv|install|ln)\b [^;&|]* /etc/sudoers \S* \s* ($|[;&|])
+        | (^|[;&|]\s*) sed\b (?= [^;&|]*\s-\S*i ) [^;&|]* /etc/sudoers
+        | (^|[;&|]\s*) dd\b [^;&|]* \bof=/etc/sudoers'
     action: confirm
 
   - id: no-reverse-shell
@@ -254,18 +259,17 @@ rules:
 
         /dev/(tcp|udp)/
 
-        | \b(nc|ncat|netcat)(\.\w+)?\s+ ([^;&|\n]{0,300}\s)? (?-i:-[a-zA-Z]*[ec]\b | --(sh-|lua-)?exec\b)
+        | (^|[;&|]\s*) (\S*/)? (nc|ncat|netcat)(\.\w+)?\s+ ([^;&|]*\s)? (?-i:-[a-zA-Z]*[ec]\b | --(sh-|lua-)?exec\b)
 
-        | \bsocat\b [^;&|\n]{0,300} \b(exec|system):
+        | (^|[;&|]\s*) (\S*/)? socat\b [^;&|]* \b(exec|system):
 
-        | \bmkfifo\b .{0,300} \|\s*(nc|ncat|netcat)\b
-        | \b(nc|ncat|netcat)(\.\w+)?\b [^;&|\n]{0,300} (<\s*\S+\s*)? \|\s*(ba|z|da|k)?sh\b
-        | \|\s*(ba|z|da|k)?sh\b [^;&|\n]{0,300} \|\s*(nc|ncat|netcat)\b
+        | \A (?= (?s:.*) \bmkfifo\b ) (?= (?s:.*) \|\s*(nc|ncat|netcat)\b )
+        | (^|[;&|]\s*) (\S*/)? (nc|ncat|netcat)(\.\w+)?\b [^;&|]* \|\s*(ba|z|da|k)?sh\b
+        | \|\s*(ba|z|da|k)?sh\b [^;&|]* \|\s*(nc|ncat|netcat)\b
 
-        | \b(python[\d.]*|perl|ruby|php|node(js)?)\b
-            (?= .{0,1000}(socket|fsockopen) )
-            (?= .{0,1000}(connect|fsockopen|\.(open|new)\() )
-            (?= .{0,1000}(exec|pty|subprocess|spawn|dup2|system|popen|/bin/(ba)?sh) )'
+        | \A (?= (?s:.*) (socket|fsockopen) ) (?= (?s:.*) (connect|fsockopen|\.(open|new)\() )
+            (?= (?s:.*) (exec|pty|subprocess|spawn|dup2|system|popen|/bin/(ba)?sh) )
+            (?= (?s:.*) (^|[;&|]\s*) (\S*/)? (python[\d.]*|perl|ruby|php|node(js)?)\b )'
     action: block
 
   - id: no-oversight-tamper
@@ -277,20 +281,20 @@ rules:
       # The ledger's database defaults to sijill.db (sijill/proxy.py Settings.db_path, env DATABASE_PATH).
       command_regex: '(?ix)
 
-        \b(kill|pkill|killall)\b [^;&|\n]{0,300} sijil
+        (^|[;&|]\s*) (kill|pkill|killall)\b [^;&|]* sijil
 
-        | \b(systemctl|launchctl|service|docker|podman|supervisorctl)\b
-            (?= [^;&|\n]{0,300} \b(stop|disable|kill|mask|unload|bootout|remove|rm)\b )
-            (?= [^;&|\n]{0,300} sijil )
+        | (^|[;&|]\s*) (systemctl|launchctl|service|docker|podman|supervisorctl)\b
+            (?= [^;&|]* \b(stop|disable|kill|mask|unload|bootout|remove|rm)\b )
+            (?= [^;&|]* sijil )
 
-        | (^|[;&|]\s*) (rm|unlink|truncate|shred|sqlite3|mv|tee|chmod|chown|chattr|sed\b(?=[^;&|\n]{0,300}\s-\S*i))\b
-            [^;&|\n]{0,300} (sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
+        | (^|[;&|]\s*) (rm|unlink|truncate|shred|sqlite3|mv|tee|chmod|chown|chattr|sed\b(?=[^;&|]*\s-\S*i))\b
+            [^;&|]* (sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
         | (^|[;&|]\s*) (cp|install|ln)\b
-            [^;&|\n]{0,300} (sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*)) \S*["'']? \s* ($|[;&|])
-        | (^|[;&|]\s*) dd\b [^;&|\n]{0,300} \bof=\S*(sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
-        | >\s*["'']?\S*(sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
+            [^;&|]* (sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*)) \S*["'']? \s* ($|[;&|])
+        | (^|[;&|]\s*) dd\b [^;&|]* \bof=\S*(sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
+        | >\s*["'']?[^\s;&|<>]*(sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
 
-        | \bunset\s+([^;&|\n]{0,300}\s)?SIJILL?_\w*
+        | (^|[;&|]\s*) unset\s+([^;&|]*\s)?SIJILL?_\w*
         | \benv\s+(-\S+\s+)*(-u\s*|--unset[=\s]\s*)SIJILL?_\w*
         | \bexport\s+-n\s+SIJILL?_
         | (^|[;&|]\s*) (export\s+)? (\w+=\S*\s+)* SIJILL?_\w*='
