@@ -133,3 +133,44 @@ def test_a_tool_call_under_the_entra_channel_always_cites_its_approval(env):
     out[0].join(10)
     x = json.loads(rows(s.db_path, "type = 'tool_call'")[0]["ext"])
     assert x["confirmation"] in ("granted", "denied") and isinstance(x["approval_seq"], int)
+
+
+class Stub:
+    """A ledger that answers the request, then whatever the test hands back for the status."""
+
+    def __init__(self, status):
+        self.status = status
+
+    def call(self, method, path, *a, **kw):
+        if method == "POST":
+            return {"approval_id": "ap1", "deadline": "2099-01-01T00:00:00Z"}
+        return self.status
+
+
+@pytest.mark.parametrize("status", [
+    {"approval_id": "ap1", "status": "granted", "decision_seq": None},
+    {"approval_id": "ap1", "status": "granted", "decision_seq": True},
+    {"approval_id": "ap1", "status": "granted"},
+    {"approval_id": "other", "status": "granted", "decision_seq": 5},
+    {"status": "granted", "decision_seq": 5},
+    "granted", None, [], {"approval_id": "ap1"},
+])
+def test_a_malformed_decision_is_never_a_grant(status):
+    from guard.pipeline import Pipeline
+    p = object.__new__(Pipeline)
+    p.ledger, p.session = Stub(status), "s"
+    call = type("C", (), {"tool": "t", "server": "s", "args": {}, "task_seq": None})()
+    confirmation, _ = p.named(call, "1", "tool_use_id", "q", "h", ["r"], {})
+    assert confirmation in ("denied", "unavailable")
+
+
+def test_pending_approvals_do_not_stall_another_sessions_tool_call(env):
+    client, s, tools, api = env(PACK.replace("timeout_seconds: 900", "timeout_seconds: 2"))
+    held = [close_case(client, tools) for _ in range(3)]      # three calls held on pending approvals
+    pending_approval(s)
+    t0 = time.time()
+    assert tools.post("/_sijil/task/start", json={"intent": "other", "session_id": "conv-2"},
+                      headers={"X-Sijil-Principal-Token": officer()}).status_code in (200, 409)
+    assert time.time() - t0 < 1.5
+    for _, out in held:
+        out[0].join(15)

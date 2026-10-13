@@ -23,6 +23,7 @@ from . import identity, integrity, mcp, rules, task, unicode
 from .canon import sha256_hex
 from .config import Config, Server, mcp_listen
 from .ledger import Ledger, Refused, Unreachable
+from . import pipeline
 from .pipeline import Call, Pipeline, Refusal
 from .rules import NOT_ALLOWLISTED
 
@@ -414,7 +415,7 @@ class GuardSession(mcp.Session):
         listed = s.allowed(name) and any(t["name"] == name for t in self.guard.seen)
         forced = (s.allowed(name) and self.guard.removed.get(name)) or (None if listed else [NOT_ALLOWLISTED])
         try:
-            sealed = await asyncio.to_thread(p.check, call, self._confirm if self.elicit else None, forced)
+            sealed = await pipeline.check(p, call, self._confirm if self.elicit else None, forced)
         except Refusal as r:
             self.last_blocked = r.seq is not None
             sealed_filter = forced == [NOT_ALLOWLISTED] and r.seq is not None

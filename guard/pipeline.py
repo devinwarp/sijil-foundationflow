@@ -3,8 +3,11 @@ adapter: find the parent inference, read the context window, evaluate the rule p
 after the tool ran, scan its result and seal the tool_result. The adapters only translate their protocol.
 """
 
+import asyncio
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -21,6 +24,9 @@ _HINT_RE = {h: re.compile(r"(?<![\w-])" + re.escape(h).replace(r"\ ", r"\s+") + 
 UNICODE_HIT = "invisible-unicode-in-result"
 NO_PARENT = 2 ** 62               # before_seq for an orphan: every result in the task is context
 POLL_S = 8                        # one approval long-poll, inside the ledger client's 10 s timeout
+APPROVALS = 8                     # approvals one guard holds at once; past that a routed confirm is unavailable
+CHECKS = ThreadPoolExecutor(APPROVALS + 16, thread_name_prefix="sijil-check")   # a held approval never takes a default-pool thread
+_held = threading.BoundedSemaphore(APPROVALS)
 GRACE_S = 60                      # past the deadline with no decision sealed: the ledger's timer is not running
 
 
@@ -179,6 +185,14 @@ class Pipeline:
               summary: dict) -> tuple[str, int | None]:
         """Named approval (spec §17.5.2): the ledger seals the request, then this call waits, long-polling, until
         the ledger seals the decision; the tool_call then cites it. No route for these rules: unavailable."""
+        if not _held.acquire(blocking=False):
+            return "unavailable", None
+        try:
+            return self._named(call, parent, correlation, qualified, args_hash, hits, summary)
+        finally:
+            _held.release()
+
+    def _named(self, call, parent, correlation, qualified, args_hash, hits, summary):
         try:
             a = self.ledger.call("POST", "/api/agent/approval/request", self.session, json={
                 "parent_seq": parent, "correlation": correlation, "tool": call.tool, "server": call.server,
@@ -187,12 +201,19 @@ class Pipeline:
                 **({"task_seq": str(call.task_seq)} if call.task_seq not in (None, "") else {})})
         except Refused:
             return "unavailable", None
-        give_up = datetime.fromisoformat(a["deadline"].replace("Z", "+00:00")).timestamp() + GRACE_S
-        while time.time() < give_up:
-            st = self.ledger.call("GET", f"/api/agent/approval/{a['approval_id']}", self.session,
-                                  params={"wait": POLL_S})
-            if st["status"] != "pending":
-                return ("granted" if st["status"] == "granted" else "denied"), st["decision_seq"]
+        try:
+            approval_id = a["approval_id"]
+            give_up = datetime.fromisoformat(a["deadline"].replace("Z", "+00:00")).timestamp() + GRACE_S
+            while time.time() < give_up:
+                st = self.ledger.call("GET", f"/api/agent/approval/{approval_id}", self.session,
+                                      params={"wait": POLL_S})
+                if st["status"] != "pending":
+                    seq = st["decision_seq"]
+                    if st["status"] == "granted" and type(seq) is int and st["approval_id"] == approval_id:
+                        return "granted", seq
+                    return "denied", seq if type(seq) is int else None
+        except (KeyError, TypeError, ValueError, AttributeError):   # a malformed body is never a grant
+            return "unavailable", None
         return "unavailable", None
 
     def result(self, call: Call, sealed: Sealed, text: str, status: str, content_types: list[str],
@@ -277,3 +298,8 @@ class Pipeline:
             raise Refusal(f"Blocked by Sijil rule {', '.join(body['rule_hits']) or 'halted'}; seq={r['seq']}",
                           r["seq"], body["rule_hits"])
         return r["seq"]
+
+
+async def check(p: Pipeline, *args):
+    """Pipeline.check on the guard's own pool, so approvals held by named() cannot starve the default one."""
+    return await asyncio.get_running_loop().run_in_executor(CHECKS, p.check, *args)

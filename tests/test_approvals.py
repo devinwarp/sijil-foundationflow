@@ -218,3 +218,46 @@ def test_a_tool_call_must_follow_the_decision_it_cites(tmp_path):
     x = json.loads(rows(s.db_path, "type = 'tool_call'")[0]["ext"])
     assert x["confirmation"] == "denied" and "approval_seq" not in x                   # a halted call uses no grant
     assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_a_grant_must_cite_a_grant_for_this_task_and_call(tmp_path):
+    client, s, _ = gov_node(tmp_path)
+    with client:
+        sess, task = open_task(client)
+        parent, call_id = think(client, sess, task)
+        a = ask(client, sess, parent).json()
+        decide(client, a["approval_id"])
+        seq = status(client, sess, a["approval_id"])["decision_seq"]
+        rp = rows(s.db_path)[-1]["rulepack_hash"]
+        ext = {"harness": "http-agent", "session_id": "conv-1", "tool": "closeCase", "server": "case-api",
+               "qualified": "http:case-api:closeCase", "tool_use_id": call_id, "correlation": "tool_use_id",
+               "observed_by": "http_adapter", "confirmation": "granted",
+               "summary": {"arg_keys": sorted(CLOSE)}}
+        body = {"type": "tool_call", "parent_seq": str(parent), "input_hash": h(CLOSE), "rule_hits": [RULE],
+                "decision": "flag", "mode": "record", "rulepack_hash": rp, "ext": ext}
+        hdr = {"X-Sijil-Agent-Session": sess["agent_session"]}
+        r = client.post("/api/agent/seal", json=body, headers=hdr)          # a grant with no citation
+        assert r.status_code == 409 and "must cite its approval_seq" in r.text
+        assert seal_call(client, sess, parent, call_id, 10 ** 6).status_code == 400    # not a decision at all
+        assert seal_call(client, sess, parent, call_id, seq - 1).status_code == 400    # the request, not the decision
+        assert seal_call(client, sess, parent, call_id, seq).status_code == 200
+        assert end(client, sess, task).status_code == 200
+        _, other = open_task_again(client, sess)
+        parent2, call2 = think(client, sess, other)
+        r = seal_call(client, sess, parent2, call2, seq)                    # another task's approval
+        assert r.status_code == 400
+        b = ask(client, sess, parent2).json()
+        decide(client, b["approval_id"], "refuse")
+        denied = status(client, sess, b["approval_id"])["decision_seq"]
+        assert seal_call(client, sess, parent2, call2, denied).status_code == 400      # a denial cited as a grant
+        assert seal_call(client, sess, parent2, call2, denied, granted=False).status_code == 200
+        assert end(client, sess, other).status_code == 200
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def open_task_again(client, sess) -> tuple[dict, int]:
+    r = client.post("/api/agent/task/start", json={"intent_hash": "d" * 64, "harness": "http-agent",
+                                                   "session_id": "conv-1"},
+                    headers={"X-Sijil-Agent-Session": sess["agent_session"], "X-Sijil-Principal-Token": officer()})
+    assert r.status_code == 200, r.text
+    return sess, r.json()["seq"]

@@ -461,6 +461,10 @@ def router(require_admin) -> APIRouter:
             check_parent(n.store, body, x)
             if t == "tool_call" and "approval_seq" in x:
                 check_approval(n.store, body, x)
+            elif t == "tool_call" and x.get("confirmation") == "granted" and n.rulepack is not None \
+                    and n.rulepack.hitl is not None and n.rulepack.hitl.channel == "entra" \
+                    and n.rulepack.route(hits) is not None:
+                raise HTTPException(409, "a grant under the entra channel must cite its approval_seq")
             return body
         try:
             rec = await n.seal(build)

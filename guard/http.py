@@ -35,6 +35,7 @@ from .cmdparse import host_of
 from .config import HARNESSES, Config
 from .ledger import Ledger, Refused, Unreachable
 from .mcp import origin_ok
+from . import pipeline
 from .pipeline import Call, Pipeline, Refusal
 from .rules import NOT_ALLOWLISTED
 
@@ -330,7 +331,7 @@ class Adapter:
         except (Unreachable, OSError, ValueError) as e:
             return unavailable(e)
         try:
-            sealed = await asyncio.to_thread(p.check, call, None, forced)
+            sealed = await pipeline.check(p, call, None, forced)
             u = urlsplit(server.upstream)
             port = u.port or (443 if u.scheme == "https" else 80)
             await asyncio.to_thread(p.egress, call, sealed, upstream_host, port, u.scheme, request.method, self.pins)
