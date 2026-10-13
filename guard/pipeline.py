@@ -164,12 +164,15 @@ class Pipeline:
 
     def result(self, call: Call, sealed: Sealed, text: str, status: str, content_types: list[str],
                source_label: str, raw: bytes | None = None, http_status: int | None = None,
-               truncate: bool = True) -> Result:
-        """Seal the tool_result. output_hash and bytes commit to what arrived, before any stripping (§2.4.2)."""
+               truncate: bool = True, size: int | None = None) -> Result:
+        """Seal the tool_result. output_hash and bytes commit to what arrived, before any stripping (§2.4.2).
+        `raw` replaces the text as the hash input and `size` its byte count, when the caller frames more."""
         with _refusals():
-            return self._result(call, sealed, text, status, content_types, source_label, raw, http_status, truncate)
+            return self._result(call, sealed, text, status, content_types, source_label, raw, http_status, truncate,
+                                size)
 
-    def _result(self, call, sealed, text, status, content_types, source_label, raw, http_status, truncate) -> Result:
+    def _result(self, call, sealed, text, status, content_types, source_label, raw, http_status, truncate,
+                size) -> Result:
         data = raw if raw is not None else text.encode("utf-8", "surrogatepass")
         scan = unicode.scan(text)
         mode_u = self.cfg.invisible_unicode if scan["found"] else "none"
@@ -183,7 +186,7 @@ class Pipeline:
         iu = {"found": scan["found"], "count": scan["count"],
               "action": {"strip": "stripped", "block": "blocked"}.get(mode_u, "none"),
               **({"codepoints": scan["codepoints"]} if scan["found"] else {})}
-        ext = {"tool": call.tool, "server": call.server, "status": status, "bytes": len(data),
+        ext = {"tool": call.tool, "server": call.server, "status": status, "bytes": len(data) if size is None else size,
                "content_types": sorted(set(content_types)), "invisible_unicode": iu,
                **({"exec_hints": hints} if hints else {}), **({"truncated": True} if truncated else {}),
                **({"http_status": http_status} if http_status is not None else {})}

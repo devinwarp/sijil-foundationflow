@@ -31,6 +31,7 @@ BASE64 = re.compile(r"[A-Za-z0-9+/=\s]*")
 ITEMS = {"text": (("text",), ()), "image": (("mimeType",), ("data",)), "audio": (("mimeType",), ("data",)),
          "resource_link": (("uri", "name", "description", "mimeType"), ())}
 RESOURCE = (("uri", "mimeType", "text"), ("blob",))
+REQUIRED = {"text": "text", "image": "data", "audio": "data"}
 CODES = {-32700, -32600, -32601, -32602, -32603}
 
 
@@ -59,6 +60,16 @@ def _decode(data: str, limit: int) -> bytes | None:
         return base64.b64decode("".join(data.split()), validate=True)
     except (binascii.Error, ValueError):
         return None
+
+
+def _size(fields: dict) -> int:
+    """UTF-8 length of the string values of an item's fields (a note's `type` is not relayed text)."""
+    return sum(len(v.encode("utf-8", "surrogatepass")) for k, v in fields.items() if k != "type")
+
+
+def _note(why: str) -> dict:
+    """The text item that replaces a content item the guard does not relay."""
+    return {"type": "text", "text": f"sijil-guard: {why}"}
 
 
 def _ledger_error(e: Exception) -> "mcp.RpcError":
@@ -210,15 +221,15 @@ class GuardSession(mcp.Session):
         except mcp.RpcError as e:      # the call reached the wrapped server: its failure is still a result
             result, failed = {"content": [{"type": "text", "text": e.message}], "isError": True}, e
         content = self._items(result.get("content"))
-        text = "".join(d[k] for _, d, k in self._strings(content))
+        text = "".join(d[k] for _, _, d, k, binary in self._parts(content) if not binary)
         structured = result.get("structuredContent")
         if structured is not None:      # part of the result: sealed, scanned and bounded like the text
             text += json.dumps(structured, ensure_ascii=False, sort_keys=True)
-        status = "error" if result.get("isError") else "ok"
-        raw = self._raw(content, text)
+        is_error = result.get("isError") is True
+        raw, size = self._raw(content, text)
         try:
-            r = await asyncio.to_thread(self.pipeline.result, call, sealed, text, status,
-                                        [c["type"] for c in content], s.label, raw)
+            r = await asyncio.to_thread(self.pipeline.result, call, sealed, text, "error" if is_error else "ok",
+                                        [c["type"] for c in content], s.label, raw, size=size)
         except (Unreachable, Refused, Refusal) as e:      # fail closed: the result is withheld unsealed
             raise _ledger_error(e)
         if r.blocked:
@@ -231,7 +242,7 @@ class GuardSession(mcp.Session):
         out = {"content": content}      # only these keys reach the harness; upstream _meta and the rest are dropped
         if structured is not None and (clean := self._clean(structured)) is not None:
             out["structuredContent"] = clean
-        if result.get("isError") is True:
+        if is_error:
             out["isError"] = True
         return {**out, "_meta": {"sijil": {"seq": r.seq, "parent_seq": sealed.seq}}}
 
@@ -250,56 +261,79 @@ class GuardSession(mcp.Session):
 
     def _items(self, raw) -> list:
         """Each content item rebuilt from the allowlist for its type; _meta, annotations and unknown keys are
-        dropped, and an unknown or malformed item becomes a text item saying so."""
-        out = []
-        for c in raw if isinstance(raw, list) else []:
+        dropped. Every upstream value is shape-checked: a `content` that is not a list, an item that is not an
+        object, a type that is not a known string, an allowlisted field that is not a string, a text item without
+        text, an image or audio item without data, or a payload that is not base64 becomes a text item saying so. One result budget covers the strings and the decoded payloads in
+        item order; a binary item past it becomes a text item saying that. A payload is relayed re-encoded, so
+        the harness gets exactly the bytes that are hashed."""
+        limit, used, out = self.guard.cfg.max_result_bytes, 0, []
+        for c in raw if isinstance(raw, list) else [] if raw is None else [None]:
             c = c if isinstance(c, dict) else {}
-            kind = c.get("type")
-            strs, binary = ITEMS.get(kind, ((), ()))
-            body = {"type": kind, **{k: c[k] for k in strs if isinstance(c.get(k), str)}}
-            if kind == "resource" and isinstance(c.get("resource"), dict):
-                strs, binary = RESOURCE
-                res = c["resource"]
-                body = {"type": kind, "resource": {k: res[k] for k in (*strs, *binary) if isinstance(res.get(k), str)}}
-                bins = [(body["resource"], k) for k in binary if k in body["resource"]]
+            kind = c.get("type") if isinstance(c.get("type"), str) else None
+            holder = c.get("resource") if kind == "resource" else c
+            holder = holder if isinstance(holder, dict) else {}
+            strs, binary = RESOURCE if kind == "resource" else ITEMS.get(kind, ((), ()))
+            known = kind in ITEMS or kind == "resource" and isinstance(c.get("resource"), dict)
+            typed = all(isinstance(holder[k], str) for k in (*strs, *binary) if k in holder)
+            fields = {k: holder[k] for k in strs if k in holder} if typed else {}
+            blobs = {k: _decode(holder[k], limit) for k in binary if k in holder} if typed else {}
+            missing = kind in REQUIRED and REQUIRED[kind] not in holder
+            size = _size(fields) + sum(len(b) for b in blobs.values() if b is not None)
+            if not known or not typed or missing or None in blobs.values():
+                item = _note(f"unsupported content type {str(kind)[:40]}")
+                size = _size(item)
+            elif blobs and used + size > limit:
+                item = _note(f"{kind} over the result budget")
+                size = _size(item)
             else:
-                body.update({k: c[k] for k in binary if isinstance(c.get(k), str)})
-                bins = [(body, k) for k in binary if k in body]
-            ok = (kind in ITEMS or kind == "resource" and "resource" in body) and (kind != "text" or "text" in body)
-            if ok and all(_decode(d[k], self.guard.cfg.max_result_bytes) is not None for d, k in bins):
-                out.append(body)
-            else:
-                out.append({"type": "text", "text": f"sijil-guard: unsupported content type {str(kind)[:40]}"})
+                fields.update({k: base64.b64encode(b).decode("ascii") for k, b in blobs.items()})
+                item = {"type": kind, "resource": fields} if kind == "resource" else {"type": kind, **fields}
+            used += size
+            out.append(item)
         return out
 
-    def _raw(self, content: list, text: str) -> bytes | None:
-        """What output_hash and bytes commit to: the sealed text followed by each decoded binary payload
-        (length-prefixed, in item order), so changing one byte of an image changes the hash. None without any."""
-        limit, blobs = self.guard.cfg.max_result_bytes, []
-        for c in content:
-            holder = c.get("resource", {}) if c["type"] == "resource" else c
-            for k in ("data", "blob"):
-                if k in holder:
-                    b = _decode(holder[k], limit) or b""
-                    blobs.append(len(b).to_bytes(8, "big") + b)
-        return text.encode("utf-8", "surrogatepass") + b"".join(blobs) if blobs else None
+    def _raw(self, content: list, text: str) -> tuple[bytes | None, int | None]:
+        """The pipeline's hash input and byte count. A text-only result is left to the pipeline: output_hash is
+        sha256(utf8(text)) and bytes its length (§2.4.2). With an image, audio or blob payload, where T is
+        utf8(sealed text), P the decoded payload of a binary part, n the index of its content item, t that
+        item's type, and u64 an 8-byte big-endian length or index:
+            output_hash = sha256(0xFF || u64(len T) || T || for each binary part, in item order:
+                                 u64(n) || u64(len t) || t || u64(len P) || P)
+            bytes = len T + the sum of len P (no framing)
+        Every part is length-prefixed, and 0xFF never occurs in UTF-8, so no other result hashes the same."""
+        parts = [(n, c["type"].encode("ascii"), base64.b64decode(d[k])) for n, c, d, k, binary in self._parts(content)
+                 if binary]
+        if not parts:
+            return None, None
+        u64 = lambda v: v.to_bytes(8, "big")
+        t = text.encode("utf-8", "surrogatepass")
+        framed = [b"\xff", u64(len(t)), t]
+        for n, kind, p in parts:
+            framed += [u64(n), u64(len(kind)), kind, u64(len(p)), p]
+        return b"".join(framed), len(t) + sum(len(p) for _, _, p in parts)
 
     @staticmethod
-    def _strings(content: list) -> list:
-        """(item, container, key) for every string of the items that is sealed and cleaned."""
+    def _parts(content: list) -> list:
+        """(index, item, container, key, binary) for every field of the items that reaches the harness, in order:
+        strings (sealed and cleaned), then the base64 payload."""
         found = []
-        for c in content:
+        for n, c in enumerate(content):
             if c["type"] == "resource":
-                holder, keys = c["resource"], RESOURCE[0]
+                holder, (strs, binary) = c["resource"], RESOURCE
             else:
-                holder, keys = c, ITEMS[c["type"]][0]
-            found += [(c, holder, k) for k in keys if k in holder]
+                holder, (strs, binary) = c, ITEMS[c["type"]]
+            found += [(n, c, holder, k, False) for k in strs if k in holder]
+            found += [(n, c, holder, k, True) for k in binary if k in holder]
         return found
 
     def _rewrite(self, content: list) -> list:
-        """Strip and truncate every sealed string, in order, as the pipeline did the whole text."""
+        """Strip and truncate every sealed string, in order, as the pipeline did the whole text. Decoded
+        payloads draw on the same budget; _items already kept them within it."""
         cfg, budget = self.guard.cfg, self.guard.cfg.max_result_bytes
-        for _, d, k in self._strings(content):
+        for _, _, d, k, binary in self._parts(content):
+            if binary:
+                budget -= len(base64.b64decode(d[k]))
+                continue
             t = unicode.strip(d[k]) if cfg.invisible_unicode == "strip" else d[k]
             b = t.encode("utf-8", "surrogatepass")
             d[k], budget = b[:max(budget, 0)].decode("utf-8", "ignore"), budget - len(b)

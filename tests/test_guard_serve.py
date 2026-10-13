@@ -1,8 +1,10 @@
 """Row 8: the MCP guard between a harness and a wrapped server, sealing through a real ledger (spec §5.1-5.9)."""
 
 import asyncio
+import base64
 import json
 import os
+import random
 import subprocess
 import sys
 
@@ -533,7 +535,7 @@ def test_content_items_are_rebuilt_from_an_allowlist_and_sealed(env):
     rec = json.loads(rows(s.db_path, "type = 'tool_result'")[0]["ext"])
     sealed = ("hifile:///an\u200bmfile:///bt\u200btimage/png"       # every string the harness gets, before cleaning
               "sijil-guard: unsupported content type imagesijil-guard: unsupported content type video")
-    assert rec["bytes"] == len(sealed.encode()) + 8 + 2 and rec["invisible_unicode"]["action"] == "stripped"
+    assert rec["bytes"] == len(sealed.encode()) + 2 and rec["invisible_unicode"]["action"] == "stripped"
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
 
@@ -552,5 +554,119 @@ def test_one_changed_byte_of_an_image_changes_the_sealed_output_hash(env):
     asyncio.run(go())
     ra, rb = rows(s.db_path, "type = 'tool_result'")
     a, b = json.loads(ra["ext"]), json.loads(rb["ext"])
-    assert ra["output_hash"] != rb["output_hash"] and a["bytes"] == b["bytes"] == 19
+    assert ra["output_hash"] != rb["output_hash"] and a["bytes"] == b["bytes"] == 11
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+IMG600 = {"type": "image", "data": base64.b64encode(b"\1" * 600).decode(), "mimeType": "image/png"}
+HOSTILE = [{"type": ["x"], "text": "a"}, {"type": {}}, "str", 5, {"type": "text", "text": ["no"]},
+           {"type": "image", "data": 7}, {"type": "image", "mimeType": "image/png"}, {"type": "resource", "resource": "x"},
+           {"type": "resource", "resource": {"uri": {"a": 1}}}, {"type": "resource_link", "uri": "file:///a", "name": 1}]
+REQUESTS.update({"hostile": ("items", {"c": HOSTILE}), "nolist": ("items", {"c": {"type": "text", "text": "x"}}),
+                 "emptyimg": ("items", {"c": [{"type": "text", "text": "a"}, {"type": "image", "data": ""}]}),
+                 "nultext": ("items", {"c": [{"type": "text", "text": "a" + "\0" * 8}]}),
+                 "flood": ("items", {"c": [IMG600] * 3})})
+
+
+def session_of(cfg):
+    """A GuardSession for the pure content methods, with no upstream or ledger."""
+    a = serve.GuardSession.__new__(serve.GuardSession)
+    a.guard = serve.Guard(cfg, cfg.servers[0], None)
+    return a
+
+
+def relayed(cfg, content) -> int:
+    """Bytes the harness gets: the strings and the decoded payloads, after the guard's cleaning."""
+    return sum(len(base64.b64decode(d[k])) if b else len(d[k].encode("utf-8", "surrogatepass"))
+               for _, _, d, k, b in serve.GuardSession._parts(content))
+
+
+def run_calls(cfg, client, words):
+    """Each word's tool call through a real guard and ledger; the results the harness got."""
+    async def go():
+        g = guard(cfg, client, "shell")
+        await g.start()
+        a = await g.new_session(Harness(), {})
+        await a.handle("initialize", INIT)
+        got = []
+        for word in words:
+            await asyncio.to_thread(ask, client, cfg, f"{word} it")
+            got.append(await call(a, *REQUESTS[word]))
+        await g.aclose()
+        return got
+    return asyncio.run(go())
+
+
+def test_fuzzed_result_shapes_never_crash_and_stay_within_the_budget(env):
+    """B3, B5: any JSON value as content or item yields only allowlisted string fields, within one budget."""
+    _, _, cfg = env
+    cfg = cfg.__class__(**{**cfg.__dict__, "max_result_bytes": 1024})
+    a, rng = session_of(cfg), random.Random(7)
+    atoms = [None, 0, 1.5, True, "", "x", "aGk=", "not base64 !!", "\u200b", "y" * 900, [], {}, ["x"], {"a": 1},
+             IMG600["data"]]
+    keys = ["type", "text", "data", "mimeType", "uri", "name", "description", "resource", "blob", "_meta"]
+    types = ["text", "image", "audio", "resource", "resource_link", "video", ["x"], {"t": 1}, None, 3]
+
+    def item(depth=0):
+        if rng.random() < 0.1:
+            return rng.choice(atoms)
+        c = {k: rng.choice(atoms) for k in rng.sample(keys, rng.randint(0, len(keys)))}
+        if rng.random() < 0.8:
+            c["type"] = rng.choice(types)
+        if depth == 0 and rng.random() < 0.4:
+            c["resource"] = item(1)
+        return c
+    for _ in range(3000):
+        raw = rng.choice([[item() for _ in range(rng.randint(0, 6))], item(), rng.choice(atoms)])
+        content = a._items(raw)
+        for c in content:
+            fields = c.get("resource", c) if c["type"] == "resource" else c
+            assert c["type"] in serve.ITEMS or c["type"] == "resource"
+            assert all(isinstance(v, str) for v in fields.values())
+        text = "".join(d[k] for _, _, d, k, b in a._parts(content) if not b)
+        a._raw(content, text)
+        assert relayed(cfg, a._rewrite(content)) <= cfg.max_result_bytes
+
+
+def test_malformed_items_become_notes_and_the_result_is_sealed(env):
+    """B3: a list or object type, a non-string field, a missing payload and a non-list content are notes."""
+    client, s, cfg = env
+    hostile, nolist = run_calls(cfg, client, ["hostile", "nolist"])
+    notes = [c["text"] for c in hostile["content"]]
+    assert all(c["type"] == "text" for c in hostile["content"]) and len(notes) == len(HOSTILE)
+    assert notes[0] == notes[1] == "sijil-guard: unsupported content type None"
+    assert notes[-1] == "sijil-guard: unsupported content type resource_link"
+    assert nolist["content"] == [{"type": "text", "text": "sijil-guard: unsupported content type None"}]
+    assert len(rows(s.db_path, "type = 'tool_result'")) == 2
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_hash_framing_separates_text_from_payloads(env):
+    """B4: text "a" plus an empty image no longer hashes as text "a" and eight NULs; a text-only result still
+    hashes sha256(utf8(text)) (§2.4.2); bytes count text and payload bytes without framing."""
+    client, s, cfg = env
+    a = session_of(cfg)
+    img = a._items([{"type": "text", "text": "a"}, {"type": "image", "data": ""}])
+    assert a._raw(img, "a")[0] != b"a" + bytes(8) and a._raw(a._items([{"type": "text", "text": "a"}]), "a") == (None, None)
+    run_calls(cfg, client, ["emptyimg", "nultext"])
+    ri, rt = rows(s.db_path, "type = 'tool_result'")
+    u64 = lambda v: v.to_bytes(8, "big")
+    framed = b"\xff" + u64(1) + b"a" + u64(1) + u64(5) + b"image" + u64(0)      # the definition in serve._raw
+    assert ri["output_hash"] == record.sha256_hex(framed) and json.loads(ri["ext"])["bytes"] == 1
+    assert rt["output_hash"] == record.sha256_hex(("a" + "\0" * 8).encode()) and json.loads(rt["ext"])["bytes"] == 9
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_binary_payloads_share_one_result_budget(env):
+    """B5: three 600-byte images against a 1024-byte budget: the first is relayed, the rest are notes."""
+    client, s, cfg = env
+    cfg = cfg.__class__(**{**cfg.__dict__, "max_result_bytes": 1024})
+    a = session_of(cfg)
+    over = a._items([{"type": "text", "text": "x" * 1024}, IMG600])
+    assert over[1] == {"type": "text", "text": "sijil-guard: image over the result budget"}
+    (got,) = run_calls(cfg, client, ["flood"])
+    note = {"type": "text", "text": "sijil-guard: image over the result budget"}
+    assert got["content"] == [IMG600, note, note] and relayed(cfg, got["content"]) <= 1024
+    rec = json.loads(rows(s.db_path, "type = 'tool_result'")[0]["ext"])
+    assert rec["bytes"] == len("image/png") + 600 + 2 * len(note["text"])
     assert verify(s.db_path, s.pubkey_path)[0] == 0
