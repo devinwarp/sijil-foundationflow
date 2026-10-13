@@ -26,7 +26,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from . import agents, approvals, budgets, chat, keys, oidc, policy, record, rulepack
+from . import agents, approvals, budgets, chat, foundry, keys, oidc, policy, record, rulepack
 from .digest import DigestResolver
 from .store import Store
 
@@ -142,6 +142,9 @@ class Node:
                                         timeout=settings.upstream_timeout, transport=transport)
         # discovery, JWKS and approval notifications (spec §17.5.1 notify); nothing the model sees
         self.idp = httpx.AsyncClient(timeout=10.0, transport=idp_transport)
+        f = self.policy.foundry        # the Responses relay's upstream (spec §17.4.2); a change needs a restart
+        self.foundry = httpx.AsyncClient(base_url=f.endpoint, timeout=settings.upstream_timeout,
+                                         transport=transport) if f else None
         self.jwks = self.keys_for(self.policy)
 
     def keys_for(self, pol: policy.Policy) -> dict:
@@ -231,6 +234,8 @@ class Node:
     async def aclose(self) -> None:
         await self.client.aclose()
         await self.idp.aclose()
+        if self.foundry:
+            await self.foundry.aclose()
         self.store.close()
         close = getattr(self.key, "close", None)  # HSM signer only; file keys have none
         if close:
@@ -251,6 +256,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         last = n.store.last()
         if last and last["policy_hash"] != n.policy.hash:
             await n.adopt_policy(n.policy, old_hash=last["policy_hash"], old=None)
+        await foundry.register(n)
         await agents.close_expired(n)
         await approvals.start(n)
         yield
@@ -272,6 +278,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
     app.include_router(agents.router(require_admin))
     app.include_router(approvals.router())
     app.include_router(budgets.router())
+    app.include_router(foundry.router())
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):

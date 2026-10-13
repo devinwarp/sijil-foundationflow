@@ -87,11 +87,11 @@ def model(request: httpx.Request) -> httpx.Response:
                                                                              "completion_tokens": 96}})
 
 
-def gov_node(tmp_path, pack=PACK, handler=model, idp=None, **overrides):
+def gov_node(tmp_path, pack=PACK, handler=model, idp=None, policy=POLICY, **overrides):
     """A ledger with the government policy and the case pack at tmp_path/starter.yaml, where guardkit's guard
     config points; (TestClient, Settings, Idp)."""
     (tmp_path / "starter.yaml").write_text(pack)
     idp = idp or Idp({"keys": [rsa_jwk()]})
-    client, s = agent_node(tmp_path, handler, POLICY, idp=idp, rulepack_path=str(tmp_path / "starter.yaml"),
+    client, s = agent_node(tmp_path, handler, policy, idp=idp, rulepack_path=str(tmp_path / "starter.yaml"),
                            **overrides)
     return client, s, idp
