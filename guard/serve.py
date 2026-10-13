@@ -32,6 +32,7 @@ ITEMS = {"text": (("text",), ()), "image": (("mimeType",), ("data",)), "audio": 
          "resource_link": (("uri", "name", "description", "mimeType"), ())}
 RESOURCE = (("uri", "mimeType", "text"), ("blob",))
 REQUIRED = {"text": "text", "image": "data", "audio": "data"}
+MAX_ITEMS = 256      # content items relayed per result; the rest collapse into one note
 CODES = {-32700, -32600, -32601, -32602, -32603}
 
 
@@ -62,9 +63,20 @@ def _decode(data: str, limit: int) -> bytes | None:
         return None
 
 
-def _size(fields: dict) -> int:
-    """UTF-8 length of the string values of an item's fields (a note's `type` is not relayed text)."""
-    return sum(len(v.encode("utf-8", "surrogatepass")) for k, v in fields.items() if k != "type")
+def _wire(value) -> int:
+    """Bytes `value` takes in the JSON the harness gets (json.dumps, ensure_ascii=False, as mcp.py writes it)."""
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8", "surrogatepass"))
+
+
+def _fit(t: str, room: int) -> str:
+    """The longest prefix of `t` whose JSON string, quotes included, takes at most `room` bytes."""
+    if _wire(t) <= room:
+        return t
+    lo, hi = 0, min(len(t), max(room, 0))      # every character takes at least one byte
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        lo, hi = (mid, hi) if _wire(t[:mid]) <= room else (lo, mid - 1)
+    return t[:lo]
 
 
 def _note(why: str) -> dict:
@@ -255,6 +267,7 @@ class GuardSession(mcp.Session):
         raw = json.dumps(value, ensure_ascii=False)
         if self.guard.cfg.invisible_unicode == "strip":
             raw = unicode.strip(raw)
+        raw = raw.encode("utf-8", "replace").decode("utf-8")
         if len(raw.encode("utf-8", "surrogatepass")) > budget:
             return None, True
         try:
@@ -265,12 +278,14 @@ class GuardSession(mcp.Session):
     def _items(self, raw) -> tuple[list, bool]:
         """Each content item rebuilt from the allowlist for its type; _meta, annotations and unknown keys are
         dropped. Every upstream value is shape-checked: a `content` that is not a list, an item that is not an
-        object, a type that is not a known string, an allowlisted field that is not a string, a text item without
-        text, an image or audio item without data, or a payload that is not base64 becomes a text item saying so. One result budget covers the strings and the decoded payloads in
-        item order; a binary item past it becomes a text item saying that. A payload is relayed re-encoded, so
-        the harness gets exactly the bytes that are hashed. (items, whether the budget replaced any)."""
+        object, a type that is not a known string, an allowlisted field that is not a string, a text item
+        without text, an image or audio item without data, or a payload that is not base64 becomes a text item
+        saying so. Items past MAX_ITEMS collapse into one note. A binary item that would take the relayed items
+        (as JSON, before stripping) past the result budget becomes a note. A payload is relayed re-encoded, so
+        the harness gets exactly the bytes that are hashed. (items, whether a limit replaced any)."""
         limit, used, out, replaced = self.guard.cfg.max_result_bytes, 0, [], False
-        for c in raw if isinstance(raw, list) else [] if raw is None else [None]:
+        raw = raw if isinstance(raw, list) else [] if raw is None else [None]
+        for c in raw[:MAX_ITEMS]:
             c = c if isinstance(c, dict) else {}
             kind = c.get("type") if isinstance(c.get("type"), str) else None
             holder = c.get("resource") if kind == "resource" else c
@@ -281,18 +296,18 @@ class GuardSession(mcp.Session):
             fields = {k: holder[k] for k in strs if k in holder} if typed else {}
             blobs = {k: _decode(holder[k], limit) for k in binary if k in holder} if typed else {}
             missing = kind in REQUIRED and REQUIRED[kind] not in holder
-            size = _size(fields) + sum(len(b) for b in blobs.values() if b is not None)
             if not known or not typed or missing or None in blobs.values():
                 item = _note(f"unsupported content type {str(kind)[:40]}")
-                size = _size(item)
-            elif blobs and used + size > limit:
-                item = _note(f"{kind} over the result budget")
-                size, replaced = _size(item), True
             else:
                 fields.update({k: base64.b64encode(b).decode("ascii") for k, b in blobs.items()})
                 item = {"type": kind, "resource": fields} if kind == "resource" else {"type": kind, **fields}
-            used += size
+                if blobs and used + _wire(item) + 2 > limit:
+                    item, replaced = _note(f"{kind} over the result budget"), True
+            used += _wire(item) + 2      # ", " between items
             out.append(item)
+        if len(raw) > MAX_ITEMS:
+            out.append(_note(f"{len(raw) - MAX_ITEMS} more items over the item limit"))
+            replaced = True
         return out, replaced
 
     def _raw(self, content: list, text: str) -> tuple[bytes | None, int | None]:
@@ -330,18 +345,29 @@ class GuardSession(mcp.Session):
         return found
 
     def _rewrite(self, content: list) -> tuple[list, int, bool]:
-        """Strip and truncate every sealed string, in order, as the pipeline did the whole text. Decoded
-        payloads draw on the same budget; _items already kept them within it. (content, budget left, cut)."""
-        cfg, budget, cut = self.guard.cfg, self.guard.cfg.max_result_bytes, False
-        for _, _, d, k, binary in self._parts(content):
-            if binary:
-                budget -= len(base64.b64decode(d[k]))
-                continue
-            t = unicode.strip(d[k]) if cfg.invisible_unicode == "strip" else d[k]
-            b = t.encode("utf-8", "surrogatepass")
-            cut = cut or len(b) > budget
-            d[k], budget = b[:max(budget, 0)].decode("utf-8", "ignore"), budget - len(b)
-        return content, budget, cut
+        """Strip every sealed string, then keep the items, as JSON, within the result budget in order: an item
+        that does not fit has its strings cut to fit; when not even its keys fit, or it carries a payload, it
+        and every later item collapse into one note. (content, budget left, cut)."""
+        cfg, budget, cut, out = self.guard.cfg, self.guard.cfg.max_result_bytes, False, []
+        for n, c in enumerate(content):
+            strings = [(d, k) for _, _, d, k, binary in self._parts([c]) if not binary]
+            for d, k in strings:      # a lone surrogate cannot be written as UTF-8: it becomes "?"
+                t = unicode.strip(d[k]) if cfg.invisible_unicode == "strip" else d[k]
+                d[k] = t.encode("utf-8", "replace").decode("utf-8")
+            if _wire(c) + 2 > budget:
+                cut, whole = True, [d[k] for d, k in strings]
+                for d, k in strings:
+                    d[k] = ""
+                room = budget - _wire(c) - 2
+                if room < 0 or len(strings) < len(self._parts([c])):
+                    out.append(_note(f"{len(content) - n} more items over the result budget"))
+                    return out, 0, cut
+                for (d, k), t in zip(strings, whole):
+                    d[k] = _fit(t, room + 2) if room > 0 else ""
+                    room -= _wire(d[k]) - 2
+            budget -= _wire(c) + 2
+            out.append(c)
+        return out, budget, cut
 
     async def close(self) -> None:
         if self.closed:

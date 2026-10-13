@@ -195,7 +195,7 @@ def test_results_are_stripped_truncated_and_errors_sealed(env):
         return out, e.value, h.notes
     out, err, notes = asyncio.run(go())
     assert out["poisoned"]["content"][0]["text"] == "all good"
-    assert len(out["big"]["content"][0]["text"]) == 262144 and out["fail"]["isError"] is True
+    assert serve._wire(out["big"]["content"]) == 262144 and out["fail"]["isError"] is True      # the budget, as JSON
     assert err.code == -32602 and notes == ["notifications/tools/list_changed"]
     results = {json.loads(r["ext"])["tool"]: json.loads(r["ext"]) for r in rows(s.db_path, "type = 'tool_result'")}
     assert results["poisoned"]["invisible_unicode"]["action"] == "stripped"
@@ -568,6 +568,7 @@ REQUESTS.update({"hostile": ("items", {"c": HOSTILE}), "nolist": ("items", {"c":
                  "flood": ("items", {"c": [IMG600] * 3}),
                  "fatstruct": ("items", {"c": [IMG600], "s": {"v": "y" * 500}}),
                  "thinstruct": ("items", {"c": [IMG600], "s": {"v": "ok"}}),
+                 "many": ("many", {"n": 100000}),
                  "cutz": ("items", {"c": [IMG600, {"type": "text", "text": "z" * 500}]})})
 
 
@@ -578,10 +579,13 @@ def session_of(cfg):
     return a
 
 
-def relayed(cfg, content) -> int:
-    """Bytes the harness gets: the strings and the decoded payloads, after the guard's cleaning."""
-    return sum(len(base64.b64decode(d[k])) if b else len(d[k].encode("utf-8", "surrogatepass"))
-               for _, _, d, k, b in serve.GuardSession._parts(content))
+def relayed(result: dict) -> int:
+    """Bytes the harness gets as JSON: the content and structuredContent, after the guard's cleaning."""
+    extra = serve._wire(result["structuredContent"]) if "structuredContent" in result else 0
+    return serve._wire(result["content"]) + extra
+
+
+MARKER = 80      # the one note a collapse may add past the budget
 
 
 def run_calls(cfg, client, words):
@@ -605,7 +609,8 @@ def test_fuzzed_result_shapes_never_crash_and_stay_within_the_budget(env):
     _, _, cfg = env
     cfg = cfg.__class__(**{**cfg.__dict__, "max_result_bytes": 1024})
     a, rng = session_of(cfg), random.Random(7)
-    atoms = [None, 0, 1.5, True, "", "x", "aGk=", "not base64 !!", "\u200b", "y" * 900, [], {}, ["x"], {"a": 1},
+    atoms = [None, 0, 1.5, True, "", "x", "\ud800", "\x00\"", "aGk=", "not base64 !!", "\u200b", "y" * 900, [], {},
+             ["x"], {"a": 1},
              IMG600["data"]]
     keys = ["type", "text", "data", "mimeType", "uri", "name", "description", "resource", "blob", "_meta"]
     types = ["text", "image", "audio", "resource", "resource_link", "video", ["x"], {"t": 1}, None, 3]
@@ -619,7 +624,9 @@ def test_fuzzed_result_shapes_never_crash_and_stay_within_the_budget(env):
         if depth == 0 and rng.random() < 0.4:
             c["resource"] = item(1)
         return c
-    for _ in range(3000):
+    for n in range(3000):
+        if n == 1500:      # record mode relays what strip mode would remove
+            a = session_of(cfg.__class__(**{**cfg.__dict__, "invisible_unicode": "record"}))
         raw = rng.choice([[item() for _ in range(rng.randint(0, 6))], item(), rng.choice(atoms)])
         content, _ = a._items(raw)
         for c in content:
@@ -628,7 +635,9 @@ def test_fuzzed_result_shapes_never_crash_and_stay_within_the_budget(env):
             assert all(isinstance(v, str) for v in fields.values())
         text = "".join(d[k] for _, _, d, k, b in a._parts(content) if not b)
         a._raw(content, text)
-        assert relayed(cfg, a._rewrite(content)[0]) <= cfg.max_result_bytes
+        relay = a._rewrite(content)[0]
+        assert relayed({"content": relay}) <= cfg.max_result_bytes + MARKER
+        json.dumps(relay, ensure_ascii=False).encode()      # what mcp.py writes: never a lone surrogate
 
 
 def test_malformed_items_become_notes_and_the_result_is_sealed(env):
@@ -650,7 +659,8 @@ def test_hash_framing_separates_text_from_payloads(env):
     client, s, cfg = env
     a = session_of(cfg)
     img, _ = a._items([{"type": "text", "text": "a"}, {"type": "image", "data": ""}])
-    assert a._raw(img, "a")[0] != b"a" + bytes(8) and a._raw(a._items([{"type": "text", "text": "a"}])[0], "a") == (None, None)
+    assert a._raw(img, "a")[0] != b"a" + bytes(8)
+    assert a._raw(a._items([{"type": "text", "text": "a"}])[0], "a") == (None, None)
     run_calls(cfg, client, ["emptyimg", "nultext"])
     ri, rt = rows(s.db_path, "type = 'tool_result'")
     u64 = lambda v: v.to_bytes(8, "big")
@@ -669,7 +679,7 @@ def test_binary_payloads_share_one_result_budget(env):
     assert over[1] == {"type": "text", "text": "sijil-guard: image over the result budget"} and replaced
     (got,) = run_calls(cfg, client, ["flood"])
     note = {"type": "text", "text": "sijil-guard: image over the result budget"}
-    assert got["content"] == [IMG600, note, note] and relayed(cfg, got["content"]) <= 1024
+    assert got["content"] == [IMG600, note, note] and relayed(got) <= 1024
     rec = json.loads(rows(s.db_path, "type = 'tool_result'")[0]["ext"])
     assert rec["bytes"] == len("image/png") + 600 + 2 * len(note["text"]) and rec["truncated"] is True
     assert verify(s.db_path, s.pubkey_path)[0] == 0
@@ -681,18 +691,35 @@ def test_structured_content_shares_the_one_result_budget(env):
     cfg = cfg.__class__(**{**cfg.__dict__, "max_result_bytes": 1024})
     big, small = run_calls(cfg, client, ["fatstruct", "thinstruct"])
     assert "structuredContent" not in big and small["structuredContent"] == {"v": "ok"}
-    assert relayed(cfg, big["content"]) + len(json.dumps(small["structuredContent"])) <= 1024
+    assert relayed(big) <= 1024 and relayed(small) <= 1024
     rb, rs = (json.loads(r["ext"]) for r in rows(s.db_path, "type = 'tool_result'"))
     assert rb["truncated"] is True and "truncated" not in rs
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
 
 def test_truncated_is_recorded_when_payloads_use_the_budget(env):
-    """Concern 3: a text cut only because an image used the budget is recorded as truncated."""
+    """Concern 3: a text cut only because an image used the budget is recorded as truncated; the cut leaves the
+    items, as JSON, within the budget."""
     client, s, cfg = env
     cfg = cfg.__class__(**{**cfg.__dict__, "max_result_bytes": 1024})
     got, whole = run_calls(cfg, client, ["cutz", "emptyimg"])
-    assert got["content"][1]["text"] == "z" * (1024 - 600 - len("image/png"))
+    room = 1024 - serve._wire(IMG600) - 2 - serve._wire({"type": "text", "text": ""}) - 2
+    assert got["content"][1]["text"] == "z" * room and relayed(got) <= 1024
     rc, rw = (json.loads(r["ext"]) for r in rows(s.db_path, "type = 'tool_result'"))
     assert rc["truncated"] is True and "truncated" not in rw
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_item_count_and_item_overhead_are_within_the_budget(env):
+    """B6: 100000 tiny items at a 1 KB budget relay under 2 KB as JSON: at most MAX_ITEMS items, the item keys
+    charged to the budget, the rest collapsed into notes; recorded as truncated and verified."""
+    client, s, cfg = env
+    cfg = cfg.__class__(**{**cfg.__dict__, "max_result_bytes": 1024})
+    a = session_of(cfg)
+    capped, replaced = a._items([{"type": "text", "text": ""}] * (serve.MAX_ITEMS + 5))
+    assert len(capped) == serve.MAX_ITEMS + 1 and replaced
+    assert capped[-1] == {"type": "text", "text": "sijil-guard: 5 more items over the item limit"}
+    (got,) = run_calls(cfg, client, ["many"])
+    assert relayed(got) < 2048 and got["content"][-1]["text"].endswith("more items over the result budget")
+    assert json.loads(rows(s.db_path, "type = 'tool_result'")[0]["ext"])["truncated"] is True
     assert verify(s.db_path, s.pubkey_path)[0] == 0

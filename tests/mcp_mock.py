@@ -57,6 +57,8 @@ def call(name: str, args: dict, ask=None, notify=None) -> dict:
         return {"content": [{"type": "image", "data": args["d"], "mimeType": "image/png"}]}
     if name == "items":           # hidden: the arguments are the result's content and structuredContent, verbatim
         return {"content": args["c"], **({"structuredContent": args["s"]} if "s" in args else {})}
+    if name == "many":            # hidden: n one-character text items
+        return {"content": [{"type": "text", "text": "a"}] * args["n"]}
     if name == "rich":            # hidden: items with _meta, annotations, invisible characters and odd types
         return {"content": [
             {"type": "text", "text": "hi", "_meta": {"x": 1}, "annotations": {"a": 1}, "extra": "e"},
