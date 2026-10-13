@@ -17,7 +17,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import oidc, policy, record, rulepack
+from . import budgets, oidc, policy, record, rulepack
 from .oidc import ts_at
 
 SPIFFE = re.compile(r"spiffe://[a-z0-9.-]+/agent/[a-z0-9._-]+")      # verifier check I2
@@ -27,7 +27,7 @@ PUBKEY = HEX64 = re.compile(r"[0-9a-f]{64}")
 DECIMAL = re.compile(r"[1-9][0-9]{0,17}")      # fits SQLite INTEGER
 OUTCOMES = ("completed", "aborted", "blocked", "error", "timeout")
 SEALABLE = ("tool_call", "tool_result", "egress", "integrity_baseline", "integrity_drift")   # row 5; approval: 18g
-GUARD_HITS = ("http-operation-unknown",)    # the one reserved id the guard seals itself, on a blocked call (§17.3.4)
+GUARD_HITS = ("http-operation-unknown", "command-too-long")   # reserved ids the guard seals itself, on a blocked call
 PARENT_TYPE = {"tool_call": "inference", "tool_result": "tool_call", "egress": "tool_call",
                "integrity_drift": "integrity_baseline"}
 COUNTS = ("inference", "tool_calls", "blocked", "confirmed", "denied", "flagged", "egress")
@@ -171,6 +171,15 @@ def session_of(n, request: Request) -> dict | None:
     return sess
 
 
+async def require_session(request: Request) -> dict:
+    n = request.app.state.node
+    await close_expired(n)
+    sess = session_of(n, request)
+    if sess is None:
+        raise HTTPException(401, "X-Sijil-Agent-Session required")
+    return sess
+
+
 def task_for(n, sess: dict, task_seq) -> dict | None:
     """The open task a call belongs to: the named one, which must be this session's, or else the session's
     only open task, or None when it has none. Several open tasks and no name: 409 (spec §17.3.3)."""
@@ -229,6 +238,29 @@ def check_parent(store, body: dict, ext: dict) -> None:
         raise HTTPException(400, "drift baseline mismatch")
 
 
+def check_approval(store, pack, body: dict, x: dict) -> None:
+    """What the verifier's V2 and V3 would refuse: the cited decision answers this very call, from the same parent,
+    once; a grant covers only the confirm hits its request listed."""
+    d = store.get(x["approval_seq"]) if type(x["approval_seq"]) is int else None
+    dx = json.loads(d["ext"]) if d and d["type"] == "approval" else {}
+    if dx.get("phase") != "decision" or d["task_seq"] != body["task_seq"]:
+        raise HTTPException(400, "approval_seq must be the seq of an approval decision in this task")
+    req = store.get(int(d["parent_seq"]))
+    if json.loads(req["ext"])["qualified"] != x.get("qualified") or req["input_hash"] != body["input_hash"] \
+            or req["parent_seq"] != body["parent_seq"]:
+        raise HTTPException(409, "the approval is for another call")
+    granted = dx["outcome"] == "granted"
+    hits = json.loads(body["rule_hits"])
+    asked = [h for h in hits if h.startswith("budget:")] + (pack.confirm_hits(hits) if pack else [])
+    if granted and not set(asked) <= set(json.loads(req["rule_hits"])):
+        raise HTTPException(409, "the approval was not asked about these hits: ask again")
+    if (x.get("confirmation") == "granted") != granted or \
+            (body["decision"], body["mode"]) != (("flag", "record") if granted else ("block", "enforce")):
+        raise HTTPException(400, "confirmation, decision and mode must follow the approval's outcome (spec §2.5)")
+    if store.approval_used(x["approval_seq"]):
+        raise HTTPException(409, "approval already used")
+
+
 def task_counts(store, task_seq: int) -> dict:
     """task_end counts, as ints, with the verifier's L2 meanings; last_seq is the task_start when empty."""
     c, last = dict.fromkeys(COUNTS, 0), task_seq
@@ -251,6 +283,8 @@ async def end_task(n, start: dict, outcome: str) -> dict:
     def build() -> dict:   # under the seal lock: no record of the task can land between count and seal
         if n.store.task_ended(start["seq"]):
             raise HTTPException(409, "task already ended")
+        if n.approvals.pending_in(start["seq"]):     # V4: every request is decided before task_end
+            raise HTTPException(409, "approval pending in this task")
         x = {"outcome": outcome, **task_counts(n.store, start["seq"])}
         return n.body(n.policy, "task_end", agent_id=start["agent_id"], principal=start["principal"],
                       task_seq=str(start["seq"]), ext=cj(x))
@@ -283,14 +317,6 @@ def router(require_admin) -> APIRouter:
             raise HTTPException(503, "agent endpoints disabled: set SIJILL_TOKEN")
         if not hmac.compare_digest(request.headers.get("x-sijil-token", "").encode(), want.encode()):
             raise HTTPException(401, "X-Sijil-Token required")
-
-    async def require_session(request: Request) -> dict:
-        n = node(request)
-        await close_expired(n)
-        sess = session_of(n, request)
-        if sess is None:
-            raise HTTPException(401, "X-Sijil-Agent-Session required")
-        return sess
 
     async def registrar(request: Request) -> tuple[str | None, str]:
         """(registered_by or None to take the body's, principal_auth): open -> none; closed -> the admin
@@ -409,7 +435,8 @@ def router(require_admin) -> APIRouter:
         if not isinstance(b.get("rulepack_hash"), str):
             raise HTTPException(400, "rulepack_hash must be a string")
         guard_ok = t == "tool_call" and b.get("decision") == "block" and b.get("mode") == "enforce"
-        if any((h in policy.RESERVED_IDS or h.startswith(policy.RESERVED_PREFIXES)) and not (guard_ok and h in GUARD_HITS)
+        if any((h in policy.RESERVED_IDS or h.startswith(policy.RESERVED_PREFIXES))
+               and not (guard_ok and h in GUARD_HITS) and not (t in ("tool_call", "egress") and h.startswith("budget:"))
                for h in hits):
             raise HTTPException(400, "rule_hits may not carry reserved ids; the node adds those itself")
         task = task_for(n, sess, b.get("task_seq"))
@@ -417,9 +444,13 @@ def router(require_admin) -> APIRouter:
             raise HTTPException(409, "no open task in this agent session")
         fields = {k: b.get(k, d) for k, d in (("parent_seq", ""), ("source_label", ""), ("mode", "record"),
                                               ("decision", "allow"), ("input_hash", ""), ("output_hash", ""))}
-        if n.halted and t in ("tool_call", "tool_result", "egress"):   # the operator halt stops agents too
+        halted = n.halted and t in ("tool_call", "tool_result", "egress")
+        if halted:                                    # the operator halt stops agents too
             fields.update(mode="enforce", decision="block")
-            hits = [*hits, policy.HALT_HIT]
+            hits = [*(h for h in hits if not h.startswith("budget:")), policy.HALT_HIT]   # no budget evaluated
+            x = {k: v for k, v in x.items() if k != "budget"}                             # and none sealed
+            if "approval_seq" in x:          # a blocked call consumes no grant (V2)
+                x = {**{k: v for k, v in x.items() if k != "approval_seq"}, "confirmation": "denied"}
         if not all(isinstance(v, str) for v in fields.values()):
             raise HTTPException(400, "parent_seq, source_label, mode, decision, input_hash and output_hash must be strings")
         try:
@@ -437,6 +468,15 @@ def router(require_admin) -> APIRouter:
             if task is not None and n.store.task_ended(task["seq"]):
                 raise HTTPException(409, "task already ended")
             check_parent(n.store, body, x)
+            if t == "tool_call" and "approval_seq" in x:
+                check_approval(n.store, n.rulepack, body, x)
+            elif t == "tool_call" and body["decision"] != "block" and n.rulepack is not None \
+                    and n.rulepack.hitl is not None and n.rulepack.hitl.channel == "entra" \
+                    and (x.get("confirmation") == "granted" or n.rulepack.confirm_hits(hits)):
+                # keyed on the hits, not on `confirmation`, which a caller may leave out
+                raise HTTPException(409, "a confirm hit under the entra channel must cite its approval_seq")
+            if task is not None and t in ("tool_call", "egress") and not halted:
+                return budgets.stamp(n, task, body, x, hits, x.get("confirmation") == "granted")
             return body
         try:
             rec = await n.seal(build)

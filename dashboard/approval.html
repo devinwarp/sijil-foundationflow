@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sijil approval</title>
+<style>
+  :root { --paper: #eef1ef; --sheet: #f8faf9; --ink: #14212b; --muted: #5d6b73; --rule: #cfd7d4; --seal: #0f6b4f;
+          --block: #b3261e; --body: "Avenir Next", "Helvetica Neue", Arial, sans-serif;
+          --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font: 500 17px/1.45 var(--body); }
+  main { max-width: 720px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 26px; margin: 0 0 18px; }
+  dl { display: grid; grid-template-columns: 11em 1fr; gap: 6px 14px; background: var(--sheet);
+       border: 1px solid var(--rule); padding: 16px; margin: 0 0 18px; }
+  dt { color: var(--muted); } dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+  textarea, input { width: 100%; box-sizing: border-box; font: 14px var(--mono); padding: 8px; margin: 4px 0 12px; }
+  button { font: 600 16px var(--body); padding: 9px 18px; margin-right: 10px; cursor: pointer; border-radius: 4px;
+           border: 1.5px solid var(--ink); background: var(--sheet); }
+  #grant { border-color: var(--seal); color: var(--seal); } #refuse { border-color: var(--block); color: var(--block); }
+  #result { margin-top: 16px; font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Sijil: approval requested</h1>
+  <dl id="facts"><dt>Loading</dt><dd></dd></dl>
+  <p>Sign in with Entra ID: the page reads <code>access_token</code> from the address after the sign-in redirect,
+     or paste a token issued for the approvals app.</p>
+  <label>Token <textarea id="token" rows="3"></textarea></label>
+  <label>Reason (sealed as a hash only) <input id="reason" maxlength="1024"></label>
+  <button id="grant">Grant</button><button id="refuse">Refuse</button>
+  <div id="result"></div>
+</main>
+<script>
+  const id = location.pathname.split("/").pop();
+  const fragment = new URLSearchParams(location.hash.slice(1));
+  if (fragment.get("access_token")) document.getElementById("token").value = fragment.get("access_token");
+  if (location.hash) history.replaceState(null, "", location.pathname);   // the token leaves the address bar and history
+  const show = (facts) => {
+    const dl = document.getElementById("facts");
+    dl.replaceChildren();
+    for (const [k, v] of Object.entries(facts)) {
+      const dt = document.createElement("dt"), dd = document.createElement("dd");
+      dt.textContent = k; dd.textContent = Array.isArray(v) ? v.join(", ") : String(v);
+      dl.append(dt, dd);
+    }
+  };
+  fetch(`/api/approval/${id}`).then(r => r.json()).then(a => show({
+    "Tool": a.tool, "Server": a.server, "Operation": a.qualified, "Argument keys": a.arg_keys,
+    "Rules": a.rule_hits, "Route": a.route_id, "Minimum assurance": a.min_assurance,
+    "Answer before": a.deadline, "Status": a.status}));
+  const decide = (decision) => fetch(`/api/approval/${id}/decide`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({decision, reason: document.getElementById("reason").value,
+                            token: document.getElementById("token").value.trim()})})
+    .then(async r => { document.getElementById("result").textContent =
+      r.ok ? `Sealed: ${(await r.json()).outcome}` : `Not sealed (${r.status}): ${JSON.stringify((await r.json()).detail)}`; });
+  document.getElementById("grant").onclick = () => decide("grant");
+  document.getElementById("refuse").onclick = () => decide("refuse");
+</script>
+</body>
+</html>

@@ -1,13 +1,14 @@
 """Policy YAML loading and rule evaluation."""
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
 from . import oidc
-from .record import MODES, sha256_hex
+from .record import _PRINCIPAL, MODES, sha256_hex
 
 RULE_TYPES = ("region_allowlist", "model_allowlist", "keyword_flag")
 
@@ -20,7 +21,7 @@ RESUME_HIT = "resumed"
 # v2.4 (spec §17.1): rule ids the ledger and guard seal themselves; a rule pack may not reuse them.
 GOV_HITS = ("principal-missing", "principal-invalid", "principal-expired", "principal-assurance-low",
             "principal-task-mismatch", "principal-jwks-unavailable", "http-operation-unknown",
-            "http-task-ambiguous", "approval-timeout")
+            "http-task-ambiguous", "approval-timeout", "command-too-long")
 RESERVED_IDS = (UPSTREAM_ERROR_HIT, HALT_HIT, RESUME_HIT, *GOV_HITS)
 RESERVED_PREFIXES = ("budget:",)
 ATTESTATION_MODES = ("weights", "api")    # spec §3.1
@@ -53,6 +54,30 @@ def load_principals(doc) -> PrincipalsConfig | None:
     if len(ids) != len(set(ids)) or len({i["issuer"] for i in cfg.issuers}) != len(ids):
         raise ValueError("principals.issuers: duplicate id or issuer")
     return cfg
+
+
+@dataclass(frozen=True)
+class FoundryConfig:
+    """policy.yaml `foundry:` (spec §17.4): the Responses relay to one Foundry agent. Absent: no relay."""
+    endpoint: str                 # the project endpoint the Responses API is posted under
+    agent_name: str
+    agent_id: str                 # registered with auth: relay at startup (§17.4.5)
+    registered_by: str
+    token_env: str                # the ledger's own Entra access token for the project; never the user's
+
+
+def load_foundry(doc) -> FoundryConfig | None:
+    if doc is None:
+        return None
+    keys = {"endpoint", "agent_name", "agent_id", "registered_by", "token_env"}
+    if not isinstance(doc, dict) or set(doc) != keys or not all(isinstance(doc[k], str) for k in keys):
+        raise ValueError(f"foundry: needs exactly {sorted(keys)}, all strings")
+    if (not doc["endpoint"].startswith("https://") or not doc["agent_name"]
+            or not re.fullmatch(r"spiffe://[a-z0-9.-]+/agent/[a-z0-9._-]+", doc["agent_id"])
+            or not _PRINCIPAL.fullmatch(doc["registered_by"]) or not doc["token_env"]):
+        raise ValueError("foundry: endpoint https://, agent_id spiffe://<domain>/agent/<name>, registered_by a "
+                         "principal, token_env the variable holding the ledger's Entra token")
+    return FoundryConfig(**doc)
 
 
 @dataclass(frozen=True)
@@ -97,6 +122,7 @@ class Policy:
     attestation: str = "weights"
     agents: AgentsConfig = AgentsConfig()
     principals: PrincipalsConfig | None = None
+    foundry: FoundryConfig | None = None
 
     def modes(self) -> dict[str, str]:
         return {r["id"]: r["mode"] for r in self.rules}
@@ -131,6 +157,9 @@ def load(path: str | Path) -> Policy:
     principals = load_principals(doc.get("principals"))
     if agents_cfg.register_policy == "principal_oidc" and principals is None:
         raise ValueError(f"agents.register_policy principal_oidc needs a principals: block in {path}")
+    foundry = load_foundry(doc.get("foundry"))
+    if foundry is not None and principals is None:
+        raise ValueError(f"foundry: needs a principals: block (the relay validates the user's token) in {path}")
     return Policy(
         policy_id=str(doc["policy_id"]),
         version_label=str(doc.get("version_label", "")),
@@ -142,6 +171,7 @@ def load(path: str | Path) -> Policy:
         attestation=attestation,
         agents=agents_cfg,
         principals=principals,
+        foundry=foundry,
     )
 
 

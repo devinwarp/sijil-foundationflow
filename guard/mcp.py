@@ -19,6 +19,7 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Awaitable, Callable
 from urllib.parse import urlsplit
 
@@ -379,6 +380,9 @@ class Session:
     async def notified(self, method: str, params: dict) -> None:
         return None
 
+    def gone(self) -> None:
+        """The client is leaving: stop whatever waits on someone else (a held approval)."""
+
     async def close(self) -> None:
         return None
 
@@ -414,8 +418,12 @@ class StdioClient(Client):
             raise RpcError(INTERNAL, f"send failed: {e}") from e
 
 
+request_id: ContextVar = ContextVar("mcp_request_id", default=None)     # the id of the request being answered
+
+
 async def _answer(session: Session, msg: dict) -> dict:
     method, params = msg["method"], msg.get("params")
+    request_id.set(msg["id"])
     try:
         if not isinstance(method, str):
             raise RpcError(INVALID_REQUEST, "method must be a string")
@@ -471,6 +479,7 @@ async def serve_stdio(new_session: NewSession, reader: asyncio.StreamReader,
             elif "method" not in msg:
                 _resolve(client.pending, msg)
         client.close()
+        session.gone()                  # EOF: a call held on an approval must not keep the close waiting
         await tasks.wait()
     finally:
         client.close()

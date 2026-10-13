@@ -209,7 +209,8 @@ def test_json_output(tmp_path):
     assert code == 0 and res["ok"] and res["records"] == 15 and res["code"] is None and res["seq"] is None
     assert res["attestation"] == {"weights": 0, "api": 2, "api+tee": 0, "none": 0}
     assert set(res) == {"ok", "line", "seq", "code", "records", "attestation", "agent_auth", "orphans",
-                        "unauthenticated", "agents"}
+                        "unauthenticated", "agents", "principals", "principal_tokens", "approvals", "budget_hits",
+                        "after_the_fact", "rulepack_matched"}
     c[9]["parent_seq"] = "7"
     code, res = verify_json(*c.write(tmp_path, validate=False))
     assert (code, res["ok"], res["seq"], res["code"]) == (1, False, 9, "parent_type")

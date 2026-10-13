@@ -23,6 +23,7 @@ from . import identity, integrity, mcp, rules, task, unicode
 from .canon import sha256_hex
 from .config import Config, Server, mcp_listen
 from .ledger import Ledger, Refused, Unreachable
+from . import pipeline
 from .pipeline import Call, Pipeline, Refusal
 from .rules import NOT_ALLOWLISTED
 
@@ -293,6 +294,7 @@ class GuardSession(mcp.Session):
         self.own = None      # (agent_session, task_seq) of the task this session started and ends at close
         self.session_id, self.last_blocked, self.closed = str(uuid.uuid4()), False, False
         self.loop = asyncio.get_running_loop()
+        self.held: dict = {}      # request id -> Call, while a tools/call waits in its check
 
     async def handle(self, method: str, params: dict) -> dict:
         if method == "initialize":
@@ -413,8 +415,10 @@ class GuardSession(mcp.Session):
         # does not declare, so a server cannot skip the check by answering for a tool it does not list
         listed = s.allowed(name) and any(t["name"] == name for t in self.guard.seen)
         forced = (s.allowed(name) and self.guard.removed.get(name)) or (None if listed else [NOT_ALLOWLISTED])
+        key = mcp.request_id.get()
+        self.held[key if key is not None else id(call)] = call
         try:
-            sealed = await asyncio.to_thread(p.check, call, self._confirm if self.elicit else None, forced)
+            sealed = await pipeline.check(p, call, self._confirm if self.elicit else None, forced)
         except Refusal as r:
             self.last_blocked = r.seq is not None
             sealed_filter = forced == [NOT_ALLOWLISTED] and r.seq is not None
@@ -422,6 +426,8 @@ class GuardSession(mcp.Session):
                                {"sijil": {"seq": r.seq, "rule_hits": r.hits}})
         except (Unreachable, Refused) as e:      # fail closed: a ledger that cannot seal the call stops it
             raise _ledger_error(e)
+        finally:
+            self.held.pop(key if key is not None else id(call), None)
         self.last_blocked, failed = False, None
         try:
             result = await self.guard.upstream.request("tools/call", {**params, "arguments": args})
@@ -580,7 +586,16 @@ class GuardSession(mcp.Session):
             out.append(c)
         return out, budget, cut
 
+    async def notified(self, method: str, params: dict) -> None:
+        if method == "notifications/cancelled" and (call := self.held.get(params.get("requestId"))):
+            call.cancel.set()      # MCP 2025-06-18: the client gave up on that request
+
+    def gone(self) -> None:
+        for call in list(self.held.values()):
+            call.cancel.set()
+
     async def close(self) -> None:
+        self.gone()
         if self.closed:
             return
         self.closed = True

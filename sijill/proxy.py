@@ -26,7 +26,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from . import agents, chat, keys, oidc, policy, record, rulepack
+from . import agents, approvals, budgets, chat, foundry, keys, oidc, policy, record, rulepack
 from .digest import DigestResolver
 from .store import Store
 
@@ -60,6 +60,7 @@ class Settings:
     halt_path: str = "sijill.halt"
     digest_cache: str = ".sijill_digests.json"
     jwks_dir: str = "jwks"             # JWKS snapshots by hash (spec §17.2.6); not evidence
+    public_url: str = ""               # this ledger's URL as approvers reach it, for approval links (spec §17.5.2)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -84,6 +85,7 @@ class Settings:
             halt_path=e("SIJILL_HALT_PATH", cls.halt_path),
             digest_cache=e("SIJILL_DIGEST_CACHE", cls.digest_cache),
             jwks_dir=e("SIJILL_JWKS_DIR", cls.jwks_dir),
+            public_url=e("SIJILL_PUBLIC_URL", ""),
         )
 
 
@@ -122,17 +124,27 @@ class Node:
             self.store.close()
             raise RuntimeError(f"chain in {settings.db_path} is under rule pack {self.rulepack_hash[:12]}; set "
                                f"SIJILL_RULEPACK_PATH (a record without rulepack_hash fails check E)")
+        try:
+            rulepack.check_policy(self.rulepack, self.policy)
+        except ValueError:
+            self.store.close()
+            raise
         # The writer trusts its own memory of the head, not the database: a record
         # deleted or edited at the tail while running still shows up as a break.
         self.head = self.store.head()
         self.agents = agents.Registry(self.store)
+        self.approvals = approvals.Approvals(self.store)
         self.lock = asyncio.Lock()
         self.halted = Path(settings.halt_path).exists()
         self.resolver = resolver or DigestResolver(cache_path=settings.digest_cache)
         headers = {"Authorization": f"Bearer {settings.upstream_token}"} if settings.upstream_token else {}
         self.client = httpx.AsyncClient(base_url=settings.upstream, headers=headers,
                                         timeout=settings.upstream_timeout, transport=transport)
-        self.idp = httpx.AsyncClient(timeout=10.0, transport=idp_transport)   # discovery and JWKS only
+        # discovery, JWKS and approval notifications (spec §17.5.1 notify); nothing the model sees
+        self.idp = httpx.AsyncClient(timeout=10.0, transport=idp_transport)
+        f = self.policy.foundry        # the Responses relay's upstream (spec §17.4.2); a change needs a restart
+        self.foundry = httpx.AsyncClient(base_url=f.endpoint, timeout=settings.upstream_timeout,
+                                         transport=transport) if f else None
         self.jwks = self.keys_for(self.policy)
 
     def keys_for(self, pol: policy.Policy) -> dict:
@@ -140,7 +152,7 @@ class Node:
         humans = pol.principals.issuers if pol.principals else ()
         return oidc.build_jwks([*pol.agents.oidc_issuers, *humans], self.settings.jwks_dir, self.idp)
 
-    async def human(self, request: Request, task: dict | None) -> dict | None:
+    async def human(self, request: Request, task: dict | None, margin: float = 0.0) -> dict | None:
         """The validated human principal of a call (spec §17.2), bound to its task (§17.2.8). None when no
         principals: block is configured, or a token is optional and absent. Raises oidc.OidcError."""
         pcfg = self.policy.principals
@@ -150,7 +162,7 @@ class Node:
         bound = task is not None and task["principal"].startswith("human:")
         if token is None and not pcfg.require and not bound:
             return None
-        h = await oidc.human(pcfg, self.jwks, token, agents.clock())
+        h = await oidc.human(pcfg, self.jwks, token, agents.clock(), margin)
         if task is not None and h["principal"] != task["principal"]:
             raise oidc.OidcError("task_principal", 409, h["principal"])
         if h["display"]:
@@ -184,7 +196,8 @@ class Node:
                     raise rulepack.Mismatch(self.rulepack_hash)
                 body = {**body, "rulepack_hash": self.rulepack_hash}
             seq, prev = self.head
-            rec = record.seal({**body, "ts": record.now_ts()}, seq + 1, prev, self.key)
+            # A builder may set ts itself, under this lock, when a check depends on it (an approval deadline).
+            rec = record.seal({**body, "ts": body.get("ts") or record.now_ts()}, seq + 1, prev, self.key)
             self.store.append(rec)
             self.head = (rec["seq"], rec["record_hash"])
             if rec["type"] == "rulepack_change":
@@ -221,6 +234,8 @@ class Node:
     async def aclose(self) -> None:
         await self.client.aclose()
         await self.idp.aclose()
+        if self.foundry:
+            await self.foundry.aclose()
         self.store.close()
         close = getattr(self.key, "close", None)  # HSM signer only; file keys have none
         if close:
@@ -241,8 +256,11 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         last = n.store.last()
         if last and last["policy_hash"] != n.policy.hash:
             await n.adopt_policy(n.policy, old_hash=last["policy_hash"], old=None)
+        await foundry.register(n)
         await agents.close_expired(n)
+        await approvals.start(n)
         yield
+        approvals.stop(n)
         await app.state.node.aclose()
 
     app = FastAPI(title="Sijill", lifespan=lifespan)
@@ -258,6 +276,9 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             raise HTTPException(401, "admin token required")
 
     app.include_router(agents.router(require_admin))
+    app.include_router(approvals.router())
+    app.include_router(budgets.router())
+    app.include_router(foundry.router())
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
@@ -269,6 +290,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             raise HTTPException(400, "request body must be JSON")
         if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
             raise HTTPException(400, "`messages` must be a list")
+        if not isinstance(payload.get("stream_options") or {}, dict):
+            raise HTTPException(400, "`stream_options` must be an object")
 
         # An agent's call is bound to its session and, when one is open, its task (spec §2.3, §17.2.8).
         sess = agents.session_of(n, request)
@@ -301,7 +324,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     "X-Sijill-Record-Hash": rec["record_hash"], "X-Sijill-Overhead-Ms": f"{overhead:.3f}"}
 
         try:
-            human = await n.human(request, task)
+            # The record is sealed when the answer is complete: a token must outlive the upstream timeout (U1).
+            human = await n.human(request, task, settings.upstream_timeout)
         except oidc.OidcError as e:
             # Sealed like the halt, outside any task so check I holds (spec §17.2.7); nothing is forwarded.
             refused = oidc.hit(e.code)
@@ -326,6 +350,10 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         decision, mode, hits = policy.evaluate(pol, region, digest, payload["messages"], skip=skip)
         if n.halted:
             decision, mode, hits = "block", "enforce", [policy.HALT_HIT]
+        elif task is not None:   # model spend is post-paid: admitted while the task is under budget (§17.6.2)
+            exceeded = budgets.evaluate(n.rulepack, n.store, task, "inference")[1]
+            if exceeded:
+                decision, mode, hits = "block", "enforce", hits + exceeded
         body = n.body(pol, "inference", model_id=model_id, model_digest=digest, mode=mode, decision=decision,
                       rule_hits=policy.rule_hits_json(hits), input_hash=input_hash, ext=ext(), **who)
 
@@ -345,8 +373,16 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     return {**b, "task_seq": "", "agent_id": sess["agent_id"],
                             "principal": human["principal"] if human is not None else sess["principal"],
                             "ext": record.canonical_json(x).decode() if x else ""}
+                if b["task_seq"] and policy.HALT_HIT not in json.loads(b["rule_hits"]):
+                    return budgets.inference(n, task, b)      # counted under the lock (check W)
                 return b
             return build
+
+        def usage(u) -> dict | None:
+            """Chat completions usage as {input_tokens, output_tokens} (§17.6.2)."""
+            if isinstance(u, dict) and all(type(u.get(k)) is int and u[k] >= 0 for k in ("prompt_tokens", "completion_tokens")):
+                return {"input_tokens": u["prompt_tokens"], "output_tokens": u["completion_tokens"]}
+            return None
 
         def answered(model) -> tuple[dict, list[str]] | None:
             """api mode: digest and post-call evaluation for the model the provider says answered."""
@@ -369,13 +405,17 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
         async def upstream_failed(status: int, content: dict, upstream_ms: float):
             """Seal the call marked with the reserved upstream-error hit and respond."""
-            rec = await n.seal(settled({**body, "rule_hits": policy.rule_hits_json(
-                hits + [policy.UPSTREAM_ERROR_HIT])}))
+            # Forwarded, so priced like any forwarded request: no usage reported means missing_usage_cost_micro.
+            rec = await n.seal(settled({**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]),
+                                        "ext": ext(**budgets.cost(n.rulepack, digest, None))}))
             return JSONResponse(status_code=status, headers=headers(rec, upstream_ms), content=content)
 
         t1 = perf_counter()
         if payload.get("stream"):
-            req = n.client.build_request("POST", "/chat/completions", json={**payload, "model": model_id})
+            forward = {**payload, "model": model_id}
+            if n.rulepack and n.rulepack.pricing:     # the cost needs the usage the last chunk carries
+                forward["stream_options"] = {**(payload.get("stream_options") or {}), "include_usage": True}
+            req = n.client.build_request("POST", "/chat/completions", json=forward)
             try:
                 resp = await n.client.send(req, stream=True)
             except httpx.HTTPError as e:
@@ -393,7 +433,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
             async def relay():
                 parts, calls, relayed = [], chat.StreamCalls(), hashlib.sha256()
-                done, errored, refused, post, finish, rec = False, False, False, None, "", None
+                done, errored, refused, post, finish, rec, spent = False, False, False, None, "", None, None
                 try:
                     async for line in resp.aiter_lines():
                         if n.halted:  # operator halt lands mid-stream: stop relaying now
@@ -408,6 +448,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                                 event = None
                             if isinstance(event, dict) and "error" in event:
                                 errored = True  # in-stream failure (vLLM), even if [DONE] follows
+                            if isinstance(event, dict) and event.get("usage"):
+                                spent = usage(event["usage"])
                             if api and post is None and isinstance(event, dict) and event.get("model"):
                                 # An empty or absent model (Azure's leading prompt-filter chunk) does not latch.
                                 post = answered(event["model"])
@@ -438,21 +480,29 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     # it has its `halted` record sealed or queued ahead of ours on the lock.
                     halted = n.halted
                     uses = calls.tool_uses()
+
+                    def delivered_cost() -> dict:
+                        """The stream was forwarded and ended badly: charged like any forwarded request."""
+                        by = post[0]["model_digest"] if post else digest
+                        return {"ext": ext(**budgets.cost(n.rulepack, by, spent))}
                     ok = done and not errored and not halted and not (api and post is None)
                     if ok:
+                        answered_by = post[0]["model_digest"] if post else digest
                         sealed = {**body, "output_hash": record.output_hash("".join(parts)), **(post[0] if post else {}),
                                   "ext": ext(response_hash=relayed.hexdigest(), stop_reason=str(finish),
-                                             tool_uses=uses)}
+                                             tool_uses=uses, **budgets.cost(n.rulepack, answered_by, spent))}
                     elif halted:
                         # The halt is checked before each line is relayed, so `parts` is exactly the content
                         # already delivered. Hash it like a completed stream; nothing delivered keeps "".
                         sealed = {**body, "decision": "block", "mode": "enforce", "rule_hits": policy.rule_hits_json(
                             hits + [policy.HALT_HIT, policy.UPSTREAM_ERROR_HIT]),
-                            "output_hash": record.output_hash("".join(parts)) if parts else ""}
-                    elif refused:
-                        sealed = {**body, **post[0]}
+                            "output_hash": record.output_hash("".join(parts)) if parts else "",
+                            **delivered_cost()}
+                    elif refused:     # the provider answered (and billed) with an unapproved model: withheld, priced
+                        sealed = {**body, **post[0], **delivered_cost()}
                     else:
-                        sealed = {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT])}
+                        sealed = {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]),
+                                  **delivered_cost()}
                     # Shielded: a client hang-up cancels this task (anyio, level-triggered), but the call
                     # must still be sealed. Seal first; closing the upstream may itself yield. The close
                     # runs even if the seal raises, so a signer outage does not leak the connection.
@@ -506,14 +556,18 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                                 "type": UPSTREAM_ERROR_TYPE}}, upstream_ms)
 
         uses = chat.tool_uses(message)
+        answered_by = post[0]["model_digest"] if post else digest
         sealed = {**body, "output_hash": record.output_hash(text), **(post[0] if post else {}),
                   "ext": ext(response_hash=record.sha256_hex(resp.content),
                              provider_request_id=resp.headers.get("x-request-id", ""),
-                             stop_reason=str(choice.get("finish_reason") or ""), tool_uses=uses)}
+                             stop_reason=str(choice.get("finish_reason") or ""), tool_uses=uses,
+                             **budgets.cost(n.rulepack, answered_by, usage(data.get("usage"))))}
         if post and post[0]["decision"] == "block":
             # The provider answered, but not with an approved model: the answer is withheld.
             return blocked(await n.seal(settled({**sealed, "output_hash": ""})), post[1], upstream_ms)
         rec = await n.seal(settled(sealed))
+        if rec["decision"] == "block":   # a concurrent call of the task spent the budget first: withheld
+            return blocked(rec, json.loads(rec["rule_hits"]), upstream_ms)
         n.store.index_tool_uses(rec["seq"], uses)
         return JSONResponse(content=data, headers=headers(rec, upstream_ms))
 
@@ -550,6 +604,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         try:
             new = policy.load(settings.policy_path)
             n.check_attestation(new)
+            rulepack.check_policy(n.rulepack, new)
             jwks = n.keys_for(new)
         except Exception as e:
             raise HTTPException(400, f"policy not loaded: {e}")
@@ -566,6 +621,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             raise HTTPException(400, "no rule pack configured: set SIJILL_RULEPACK_PATH")
         try:
             new = rulepack.load(settings.rulepack_path)
+            rulepack.check_policy(new, n.policy)
         except Exception as e:
             raise HTTPException(400, f"rule pack not loaded: {e}")
         old = n.rulepack

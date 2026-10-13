@@ -3,9 +3,14 @@ adapter: find the parent inference, read the context window, evaluate the rule p
 after the tool ran, scan its result and seal the tool_result. The adapters only translate their protocol.
 """
 
+import asyncio
 import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable
 
 from . import rules, unicode
@@ -18,6 +23,12 @@ EXEC_HINTS = ("npx", "npm exec", "pnpm dlx", "bunx", "curl", "wget", "pip instal
 _HINT_RE = {h: re.compile(r"(?<![\w-])" + re.escape(h).replace(r"\ ", r"\s+") + r"(?![\w-])", re.I) for h in EXEC_HINTS}
 UNICODE_HIT = "invisible-unicode-in-result"
 NO_PARENT = 2 ** 62               # before_seq for an orphan: every result in the task is context
+POLL_S = 3                        # one approval long-poll, inside the ledger client's 10 s timeout
+APPROVALS = 8                     # approvals one guard holds at once; past that a routed confirm is unavailable
+CHECKS = ThreadPoolExecutor(APPROVALS + 16, thread_name_prefix="sijil-check")   # a held approval never takes a default-pool thread
+_held = threading.BoundedSemaphore(APPROVALS)
+WATCH_S = 0.5                    # how often a held call asks whether its caller is still there
+GRACE_S = 60                      # past the deadline with no decision sealed: the ledger's timer is not running
 
 
 def exec_hints(text: str) -> list[str]:
@@ -64,6 +75,7 @@ class Call:
     path_template: str = ""
     task_seq: int | str | None = None      # None: the session's only open task
     qualified: str = ""           # ext.qualified when the adapter names it (http:<server>:<tool>); else the matched name
+    cancel: threading.Event = field(default_factory=threading.Event)   # set when the caller is gone: stop holding an approval
 
 
 @dataclass
@@ -103,6 +115,18 @@ class Pipeline:
             self.pack = rules.load(self.cfg.rulepack)
             return self.ledger.seal(self.session, build(), task_seq)
 
+    def admit(self, task_seq, params: dict, build: Callable[[dict], dict]) -> dict:
+        """Seal with the ledger's budget answer for this record (spec §17.6.2). The ledger counts again under its
+        seal lock; a 409 means another record of the task landed first, so ask again, once."""
+        answer = {}
+        for attempt in (1, 2):
+            answer.update(self.ledger.call("GET", "/api/agent/budget", self.session, task_seq, params=params))
+            try:
+                return self.seal(task_seq, lambda: build(answer))
+            except Refused as e:
+                if attempt == 2 or e.status != 409 or "budget changed" not in str(e.detail):
+                    raise
+
     def _parent(self, call: Call, h: str) -> tuple[str, str, str, str]:
         """(parent_seq, correlation, tool_use_id, matched name). A tool_use_id hit whose arguments differ
         from what is executed is no parent: B2 would fail it, so it is sealed as none (spec §5.4)."""
@@ -135,28 +159,40 @@ class Pipeline:
                                          context_exec_hints=bool(ctx["exec_hints"]), method=call.method,
                                          path_template=call.path_template)
         summary = call.summary or (parsed.summary() if parsed else {"arg_keys": sorted(call.args)})
+        qualified = call.qualified or name or call.rule_tool
         answer, body = {}, {}
 
-        def build() -> dict:
+        def build(budget: dict) -> dict:
             pack = self.pack
+            over = budget["exceeded"]                     # budget:<id>:<metric> hits; sealed whatever decides
+            if answer.get("over", over) != over:
+                answer.clear()                            # a new excess needs its own answer
+            answer["over"] = over
             if forced:
-                hits, action = forced, "block"
+                hits, action = [*forced, *over], "block"
             else:
                 v = rules.evaluate(pack, facts, self.pins)
-                hits, action = v.hits, v.action
+                by_budget = "block" if budget["on_exceed"] == "block" else "confirm"
+                hits = [*v.hits, *over]
+                action = max([v.action, *([by_budget] if over else [])], key=rules.ACTIONS.index)
                 if action == "confirm" and "c" not in answer:
-                    rule = next(r for r in v.fired if r.action == "confirm")
-                    answer["c"] = (confirm(rule) if confirm else None) or "unavailable"
+                    confirms = [r for r in v.fired if r.action == "confirm"]
+                    if pack.approval == "entra":     # a named approver answers through the ledger (§17.5)
+                        answer["c"], answer["seq"] = self.named(call, parent, correlation, qualified, h,
+                                                                [r.id for r in confirms] + over, summary)
+                    else:
+                        answer["c"] = (confirm(confirms[0]) if confirm and confirms else None) or "unavailable"
             decision, mode = rules.outcome(action, answer.get("c"))
             ext = {"harness": call.harness, "session_id": call.session_id, "tool": call.tool,
-                   "server": call.server, "qualified": call.qualified or name or call.rule_tool, "correlation": correlation,
+                   "server": call.server, "qualified": qualified, "correlation": correlation,
                    "observed_by": call.observed_by, "summary": summary, "context_labels": ctx["labels"],
                    "context_seqs": ctx["seqs"], **({"tool_use_id": tool_use_id} if tool_use_id else {}),
-                   **({"confirmation": answer["c"]} if action == "confirm" else {})}
+                   **({"confirmation": answer["c"]} if action == "confirm" else {}),
+                   **({"approval_seq": answer["seq"]} if action == "confirm" and answer.get("seq") else {})}
             body.update({"type": "tool_call", "parent_seq": parent, "mode": mode, "decision": decision,
                          "rule_hits": hits, "input_hash": h, "rulepack_hash": pack.hash, "ext": ext})
             return body
-        r = self.seal(call.task_seq, build)
+        r = self.admit(call.task_seq, {"type": "tool_call", "qualified": qualified}, build)
         if call.task_seq in (None, "") and r.get("task_seq"):      # the task resolved once: the egress and the
             call.task_seq = r["task_seq"]                         # result are sealed into it, whatever opens since
         sealed = Sealed(r["seq"], r["decision"], body["rule_hits"], parent, body["ext"]["qualified"])
@@ -164,6 +200,41 @@ class Pipeline:
             why = ", ".join(sealed.hits) or "halted"
             raise Refusal(f"Blocked by Sijil rule {why}; seq={r['seq']}", r["seq"], sealed.hits)
         return sealed
+
+    def named(self, call: Call, parent: str, correlation: str, qualified: str, args_hash: str, hits: list[str],
+              summary: dict) -> tuple[str, int | None]:
+        """Named approval (spec §17.5.2): the ledger seals the request, then this call waits, long-polling, until
+        the ledger seals the decision; the tool_call then cites it. No route for these rules: unavailable."""
+        if not _held.acquire(blocking=False):
+            return "unavailable", None
+        try:
+            return self._named(call, parent, correlation, qualified, args_hash, hits, summary)
+        finally:
+            _held.release()
+
+    def _named(self, call, parent, correlation, qualified, args_hash, hits, summary):
+        try:
+            a = self.ledger.call("POST", "/api/agent/approval/request", self.session, json={
+                "parent_seq": parent, "correlation": correlation, "tool": call.tool, "server": call.server,
+                "qualified": qualified, "input_hash": args_hash, "rule_hits": hits,
+                "arg_keys": summary.get("arg_keys", sorted(call.args)),
+                **({"task_seq": str(call.task_seq)} if call.task_seq not in (None, "") else {})})
+        except Refused:
+            return "unavailable", None
+        try:
+            approval_id = a["approval_id"]
+            give_up = datetime.fromisoformat(a["deadline"].replace("Z", "+00:00")).timestamp() + GRACE_S
+            while time.time() < give_up and not call.cancel.is_set():
+                st = self.ledger.call("GET", f"/api/agent/approval/{approval_id}", self.session,
+                                      params={"wait": POLL_S})
+                if st["status"] != "pending":
+                    seq = st["decision_seq"]
+                    if st["status"] == "granted" and type(seq) is int and st["approval_id"] == approval_id:
+                        return "granted", seq
+                    return "denied", seq if type(seq) is int else None
+        except (KeyError, TypeError, ValueError, AttributeError):   # a malformed body is never a grant
+            return "unavailable", None
+        return "unavailable", None
 
     def result(self, call: Call, sealed: Sealed, text: str, status: str, content_types: list[str],
                source_label: str, raw: bytes | None = None, http_status: int | None = None,
@@ -231,19 +302,44 @@ class Pipeline:
         facts = rules.Facts("egress", tool=call.rule_tool, hosts=[host])
         body = {}
 
-        def build() -> dict:
+        def build(budget: dict) -> dict:
             pack = self.pack
             v = rules.evaluate(pack, facts, pins)
-            decision, mode = rules.outcome(v.action)
+            over = budget["exceeded"]                     # an egress has no approval channel: an excess blocks
+            decision, mode = rules.outcome("block" if over else v.action)
             ext = {"host": host, "port": port, "proto": proto, "observed_by": call.observed_by,
                    "allowed_by": "none" if decision == "block" else "rulepack",
                    **({"method": method} if method else {}),
                    **({"pin_source": pins.path} if pins.pinned(host) and pins.path else {})}
             body.update({"type": "egress", "parent_seq": str(sealed.seq), "mode": mode, "decision": decision,
-                         "rule_hits": v.hits, "rulepack_hash": pack.hash, "ext": ext})
+                         "rule_hits": [*v.hits, *over], "rulepack_hash": pack.hash, "ext": ext})
             return body
-        r = self.seal(call.task_seq, build)
+        r = self.admit(call.task_seq, {"type": "egress", "host": host}, build)
         if r["decision"] == "block":
             raise Refusal(f"Blocked by Sijil rule {', '.join(body['rule_hits']) or 'halted'}; seq={r['seq']}",
                           r["seq"], body["rule_hits"])
         return r["seq"]
+
+
+async def check(p: Pipeline, call: Call, confirm=None, forced=None, gone=None) -> Sealed:
+    """Pipeline.check on the guard's own pool, so approvals held by named() cannot starve the default one.
+    The wait ends when this coroutine is cancelled, when call.cancel is set, or when `gone()` (an awaitable
+    asking whether the caller left, polled every WATCH_S) turns true; a call whose caller left is never run."""
+    fut = asyncio.get_running_loop().run_in_executor(CHECKS, p.check, call, confirm, forced)
+
+    async def watch() -> None:
+        while not await gone():
+            await asyncio.sleep(WATCH_S)
+        call.cancel.set()
+    watcher = asyncio.create_task(watch()) if gone else None
+    try:
+        sealed = await fut
+    except asyncio.CancelledError:
+        call.cancel.set()          # the polling thread notices within one POLL_S and frees its slot
+        raise
+    finally:
+        if watcher:
+            watcher.cancel()
+    if call.cancel.is_set():
+        raise Refusal("Sijil: the caller went away before the call was approved")
+    return sealed

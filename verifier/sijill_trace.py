@@ -118,7 +118,8 @@ def row(r, marked=False, depth=0):
         names = ",".join(u.get("name", "?") for u in x.get("tool_uses", []) if isinstance(u, dict))
         detail = f"{r['model_digest'] or r['model_id'] or '-'}  tool_uses=[{names}]"
     elif t == "tool_call":
-        name = f"mcp:{x.get('server')} {x.get('tool')}" if x.get("server") else str(x.get("tool", "-"))
+        door = "http" if x.get("observed_by") == "http_adapter" else "mcp"
+        name = f"{door}:{x.get('server')} {x.get('tool')}" if x.get("server") else str(x.get("tool", "-"))
         summary = x.get("summary") if isinstance(x.get("summary"), dict) else {}
         shown = [f"{k}={fmt(summary[k])}" for k in ("argv0", "packages", "env_refs", "hosts", "method",
                                                     "path_template") if k in summary]

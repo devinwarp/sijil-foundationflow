@@ -178,6 +178,128 @@ rules:
       command_regex: '(?i)(^|[;&|]\s*)(\S*/)?((npm|pnpm|yarn|bun|lerna|changeset)\b[^;&|]*?\spublish|twine\b[^;&|]*?\supload|cargo\b[^;&|]*?\spublish|gem\s+push|python3?\s+(-m\s+twine\s+upload|setup\.py\s+upload))(?=\s|$|[;&|])'
     action: block
 
+  # The next four are not in spec §8.2: the pilot plan carries them into M2d (idea from CUSTOS-CORE's
+  # action gate deny list; no code taken). They fill what the egress and credential rules above miss.
+  # Case-insensitive like the rules above; a flag whose case changes its meaning is matched with (?-i:).
+  # Each command_regex is verbose ((?x): the folded newlines are ignored), one alternative per line, with no
+  # comment inside it. The engine tests it against the whole command and against each parsed segment (sudo,
+  # env, nohup and bash -c already unwrapped), so an alternative is anchored at a segment start
+  # (^|[;&|]\s*). Anchored, with each wildcard being one [^;&|]* inside its own lookahead, a command costs
+  # time linear in its length however it is padded: there are no length bounds to pad past, and no two
+  # wildcards in sequence to backtrack over. The one place that looks across segments (the interpreter
+  # socket shell) takes its three keyword tests from the start of the text, so it runs once.
+  # Ceiling for all four: they key on literal words (sijil, a device path, /etc/sudoers), so a pid, a glob
+  # (pkill -f 'sij*') or variable indirection through a name not listed here ($X=sijill.db) gets past them,
+  # as do interpreter one-liners other than the socket ones listed; the guard's other layers cover those.
+
+  - id: no-destructive-fs
+    description: Recursive delete of the filesystem root, home, workspace root or cwd (any operand order, -r or --recursive), mkfs, wipefs, dd or a redirect onto a device, shred, find -delete or -exec rm from / or ~
+    incident: pilot plan M2d (destructive agent actions)
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:*:run_command", "mcp:*:execute_command", "mcp:*:shell"]
+      command_regex: '(?ix)
+
+        (^|[;&|]\s*) rm\b
+          (?= [^;&|]*\s (-[a-z]*r[a-z]*|--recursive) (\s|$) )
+          (?= [^;&|]*\s ["'']? ( /+\*? | /\. | ~\w*/?\*? | \$\{?(HOME|PWD)\}?/?\*? | \.{1,2}/?\*? | \*\.? ) ["'']? (\s|$|[;&|]) )
+
+        | (^|[;&|]\s*) (mkfs(\.\w+)?|wipefs|shred)\b
+
+        | (^|[;&|]\s*) dd\b [^;&|]* \bof=/dev/
+
+        | >\s*/dev/(sd|hd|vd|nvme|mmcblk|r?disk)
+
+        | (^|[;&|]\s*) find\s+(-[HLP]\s+)* ["'']? (/|~|\$\{?HOME\}?) /? ["'']? \s
+            (?= [^;&|]* ( -delete\b | -exec(dir)?\s+(\S*/)?rm\b ) )'
+    action: block
+
+  # no-perm-escalation: octal modes that are world-writable or setuid/setgid, symbolic o/a +w or =w, any +s;
+  # the sudo/doas options that take an argument are skipped, and the scan stops at the first non-option word
+  # (so sudo ls -i is quiet).
+  - id: no-perm-escalation
+    description: chmod 777/666 or o+w/a+w/setuid, chown root or 0, a root shell (sudo/doas -s or -i, sudo su/bash/sh, su, pkexec), sudoers edits
+    incident: pilot plan M2d (privilege escalation)
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:*:run_command", "mcp:*:execute_command", "mcp:*:shell"]
+      command_regex: '(?ix)
+
+        (^|[;&|]\s*) chmod\s+(-\S+\s+)*
+          ( [0-7]{0,2}[0-7]{2}[2367]
+          | [2467][0-7]{3}
+          | ([ugoa]*[-+=][rwxXst]*,)*
+            ( [ug]*[ao][ugoa]*[+=][rwxXst]*w | [ugoa]*[+=][rwxXst]*s ) \S* )
+          (\s|$)
+
+        | (^|[;&|]\s*) chown\s+(-\S+\s+)*["'']?(root|0)\b
+
+        | \b(sudo|doas)\s+
+            ( (?-i:-[a-zA-Z]*[ugphCDRTU])\s+[^-\s]\S*\s+
+            | -\S*\s+ )*
+            ( --shell | --login | (?-i:-[a-zA-Z]*[si][a-zA-Z]*) | su | (ba|z|da|k|fi)?sh )(\s|$)
+
+        | (^|[;&|]\s*) su(\s+(-l?|--login))?(\s+root)?\s*($|[;&|])
+        | (^|[;&|]\s*) pkexec\b
+        | \bvisudo\b
+        | >>?\s*["'']?/etc/sudoers
+        | (^|[;&|]\s*) tee\b [^;&|]* /etc/sudoers
+        | (^|[;&|]\s*) (cp|mv|install|ln)\b [^;&|]* /etc/sudoers \S* \s* ($|[;&|])
+        | (^|[;&|]\s*) sed\b (?= [^;&|]*\s-\S*i ) [^;&|]* /etc/sudoers
+        | (^|[;&|]\s*) dd\b [^;&|]* \bof=/etc/sudoers'
+    action: confirm
+
+  - id: no-reverse-shell
+    description: A shell or socket wired to a remote host (/dev/tcp, nc/ncat -e or --exec, socat exec, a fifo or shell piped through nc, a python/perl/ruby/php/node socket that execs a shell); sh -i over bare fds, telnet pipes and other interpreters are not covered
+    incident: pilot plan M2d (reverse shells; the command parser sees no host in /dev/tcp/)
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:*:run_command", "mcp:*:execute_command", "mcp:*:shell"]
+      command_regex: '(?ix)
+
+        /dev/(tcp|udp)/
+
+        | (^|[;&|]\s*) (\S*/)? (nc|ncat|netcat)(\.\w+)?\s+ ([^;&|]*\s)? (?-i:-[a-zA-Z]*[ec]\b | --(sh-|lua-)?exec\b)
+
+        | (^|[;&|]\s*) (\S*/)? socat\b [^;&|]* \b(exec|system):
+
+        | \A (?= (?s:.*) \bmkfifo\b ) (?= (?s:.*) \|\s*(nc|ncat|netcat)\b )
+        | (^|[;&|]\s*) (\S*/)? (nc|ncat|netcat)(\.\w+)?\b [^;&|]* \|\s*(ba|z|da|k)?sh\b
+        | \|\s*(ba|z|da|k)?sh\b [^;&|]* \|\s*(nc|ncat|netcat)\b
+
+        | \A (?= (?s:.*) (socket|fsockopen) ) (?= (?s:.*) (connect|fsockopen|\.(open|new)\() )
+            (?= (?s:.*) (exec|pty|subprocess|spawn|dup2|system|popen|/bin/(ba)?sh) )
+            (?= (?s:.*) (^|[;&|]\s*) (\S*/)? (python[\d.]*|perl|ruby|php|node(js)?)\b )'
+    action: block
+
+  - id: no-oversight-tamper
+    description: Stopping the Sijil guard or ledger (kill, systemctl, launchctl, service, docker), writing to, moving or deleting the ledger database (sijill.db, $DATABASE_PATH) or ~/.sijil, unsetting, blanking or reassigning SIJIL_* variables
+    incident: pilot plan M2d (an agent switching off its own oversight)
+    on: tool_call
+    match:
+      tool: ["Bash", "mcp:*:run_command", "mcp:*:execute_command", "mcp:*:shell"]
+      # The ledger's database defaults to sijill.db (sijill/proxy.py Settings.db_path, env DATABASE_PATH).
+      command_regex: '(?ix)
+
+        (^|[;&|]\s*) (kill|pkill|killall)\b [^;&|]* sijil
+
+        | (^|[;&|]\s*) (systemctl|launchctl|service|docker|podman|supervisorctl)\b
+            (?= [^;&|]* \b(stop|disable|kill|mask|unload|bootout|remove|rm)\b )
+            (?= [^;&|]* sijil )
+
+        | (^|[;&|]\s*) (rm|unlink|truncate|shred|sqlite3|mv|tee|chmod|chown|chattr|sed\b(?=[^;&|]*\s-\S*i))\b
+            [^;&|]* (sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
+        | (^|[;&|]\s*) (cp|install|ln)\b
+            [^;&|]* (sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*)) \S*["'']? \s* ($|[;&|])
+        | (^|[;&|]\s*) dd\b [^;&|]* \bof=\S*(sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
+        | >\s*["'']?[^\s;&|<>]*(sijill?\.db|\.sijil\b|\$\{?(DATABASE_PATH|SIJILL?_\w*))
+
+        | (^|[;&|]\s*) unset\s+([^;&|]*\s)?SIJILL?_\w*
+        | \benv\s+(-\S+\s+)*(-u\s*|--unset[=\s]\s*)SIJILL?_\w*
+        | \bexport\s+-n\s+SIJILL?_
+        | (^|[;&|]\s*) (export\s+)? (\w+=\S*\s+)* SIJILL?_\w*='
+    action: block
+
   - id: tool-not-allowlisted
     description: Reserved id written by the guard when a tools.allow/deny filter rejects a call; not matchable from YAML
     incident: rug-pull / scope creep
