@@ -1,6 +1,7 @@
 """Row 18g, ledger side: named human approval (spec §17.5). Requests and decisions are sealed by the ledger, the
 approver is a named Entra user holding the route's role, and the ledger owns the deadline."""
 
+import asyncio
 import json
 import time
 
@@ -311,3 +312,29 @@ hitl:"""))
         assert end(client, sess, task).status_code == 200
     assert verify(s.db_path, s.pubkey_path)[0] == 0
     assert verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))[0] == 0
+
+
+def test_the_timeout_timer_survives_a_failed_seal_and_retries(tmp_path, capsys):
+    client, s, _ = gov_node(tmp_path, pack=PACK.replace("timeout_seconds: 900", "timeout_seconds: 1"))
+    with client:
+        n = client.app.state.node
+        sess, task = open_task(client)
+        parent, call_id = think(client, sess, task)
+        a = ask(client, sess, parent).json()
+        real, failed = n.seal, []
+
+        async def flaky(build):
+            if not failed:                     # the first timeout seal meets a locked store
+                failed.append(1)
+                raise RuntimeError("database is locked")
+            return await real(build)
+        n.seal = flaky
+        st = status(client, sess, a["approval_id"], wait=5)
+        n.seal = real
+        assert failed and st["status"] == "timeout"
+        assert seal_call(client, sess, parent, call_id, st["decision_seq"], granted=False).status_code == 200
+        assert end(client, sess, task).status_code == 200
+    assert "approval timeout not sealed, retrying" in capsys.readouterr().err
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+    assert verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))[0] == 0
+

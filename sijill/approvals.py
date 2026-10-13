@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -111,6 +112,9 @@ async def seal_timeout(n, p: Pending) -> None:
             n.approvals.apply(await n.seal(build))
         except _NotYet:
             continue
+        except Exception as e:      # a locked store or a signer outage: the timer must outlive it, or the
+            print(f"sijill: approval timeout not sealed, retrying: {e!r}", file=sys.stderr)   # request never closes
+            await asyncio.sleep(1)
 
 
 class _NotYet(Exception):
