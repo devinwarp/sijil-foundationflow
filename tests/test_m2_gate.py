@@ -21,7 +21,7 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from conftest import MODEL, ROOT, rows, verify
-from govkit import CASE, CLOSE, NOTE, PACK, gov_node, officer, supervisor
+from govkit import CASE, CLOSE, NOTE, PACK, SUPERVISOR, gov_node, human, officer, supervisor
 from guard import config, http, identity, serve
 from guardkit import guard_yaml, ledger_of, live
 from sijill import record
@@ -44,7 +44,7 @@ GATE_RULES = """  - id: no-export-after-citizen-upload
 # The starter pack with the case rules appended, and the pilot's hitl route, budget and price table.
 GATE_PACK = ((ROOT / "rulepacks" / "starter.yaml").read_text().replace("rulepack_id: sijil-starter",
                                                                         "rulepack_id: moi-case-gate")
-             + GATE_RULES + PACK.split("hitl:", 1)[1].join(["hitl:", ""]) + """budgets:
+             + GATE_RULES + "hitl:" + PACK.split("hitl:", 1)[1] + """budgets:
   - id: case-agent
     match: {harness: [http-agent]}
     limits: {tool_calls: 40, tool_calls_by: {"http:case-api:addCaseNote": 1}, egress_hosts: 4,
@@ -148,23 +148,32 @@ http_tools:
             # 3. One case note is within budget; the second is blocked by it.
             assert case_api("POST", f"/cases/{CASE}/notes", think("add the note"), {"note": NOTE["note"]}).status_code == 201
             r = case_api("POST", f"/cases/{CASE}/notes", think("add the note again"), {"note": NOTE["note"]})
+            assert r.status_code == 403, f"second case note was not blocked by the budget: {r.status_code}"
             assert r.json()["error"]["rule_hits"] == ["budget:case-agent:tool_calls_by:http:case-api:addCaseNote"]
             # 4. Closing the case waits for a named supervisor, who grants it.
             out = []
             call_id = think("close the case")
-            worker = threading.Thread(target=lambda: out.append(case_api(
+            worker = threading.Thread(daemon=True, target=lambda: out.append(case_api(
                 "POST", f"/cases/{CASE}/close", call_id, {"resolution": CLOSE["resolution"]})))
             worker.start()
-            while not rows(s.db_path, "type = 'approval'"):
+            deadline = time.monotonic() + 5
+            while not rows(s.db_path, "type = 'approval'") and time.monotonic() < deadline:
                 time.sleep(0.02)
+            assert rows(s.db_path, "type = 'approval'"), "closeCase never raised an approval request (confirm rule missing?)"
             aid = json.loads(rows(s.db_path, "type = 'approval'")[0]["ext"])["approval_id"]
             assert client.post(f"/api/approval/{aid}/decide", json={"decision": "grant", "token": supervisor(),
                                                                    "reason": "Certificate checked."}).status_code == 200
             worker.join(10)
+            assert not worker.is_alive() and out, "closeCase did not return after the supervisor's grant"
             assert out[0].status_code == 200
             ended = tools.post("/_sijil/task/end", json={"task_seq": t["task_seq"]}).json()
     assert (ended["tool_calls"], ended["blocked"], ended["confirmed"]) == (5, 2, 1)
     assert [m for m, *_ in api.seen] == ["POST", "POST"]           # the note and the closure; never the export
+    # The closure cites the supervisor's decision, not just any approval.
+    decision = rows(s.db_path, "type = 'approval'")[1]
+    assert json.loads(decision["ext"])["approver"] == human(SUPERVISOR) 
+    close_call = next(r for r in rows(s.db_path, "type = 'tool_call'") if json.loads(r["ext"]).get("tool") == "closeCase")
+    assert json.loads(close_call["ext"])["approval_seq"] == decision["seq"], "closeCase does not cite the grant"
     # 5. Offline verification: the node key, the kept principal token, the JWKS snapshot and the rule pack.
     kept = tmp_path / "kept-tokens"
     kept.mkdir()
@@ -173,14 +182,18 @@ http_tools:
                         "--rulepack", s.rulepack_path, "--min-principal-assurance", "substantial")
     print("\n" + line)
     assert code == 0, line
+    counters = line.split(" principals=", 1)[1]
     for part in ("principals=human:1,", "principal_tokens=verified:1,", "approvals=granted:1,refused:0,timeout:0",
                  "budgets=hits:1"):
         assert part in line
     code, bare = verify(s.db_path, s.pubkey_path, "--token-dir", str(kept), "--jwks-dir", s.jwks_dir,
                         "--min-principal-assurance", "substantial")
-    assert code == 0 and bare.startswith("PASS"), bare
+    assert code == 0 and bare.split(" principals=", 1)[1].split(" rulepack_matched")[0] == \
+        counters.split(" rulepack_matched")[0], bare
     trace = subprocess.run([sys.executable, str(ROOT / "verifier" / "sijill_trace.py"), "--db", s.db_path,
                             "--pubkey", s.pubkey_path, str(export_seq)], capture_output=True, text=True)
     print(trace.stdout)
+    doc_read = rows(s.db_path, "type = 'tool_result'")[0]         # the document the injection arrived in
     assert trace.returncode == 0 and "BLOCK  http:case-api exportCases" in trace.stdout
+    assert f"context_seqs=[{doc_read['seq']}]" in trace.stdout
     assert "context_labels=[mcp:document-intake]" in trace.stdout and "no-export-after-citizen-upload" in trace.stdout
