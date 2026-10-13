@@ -9,6 +9,7 @@ import asyncio
 import ipaddress
 import json
 import os
+import re
 import uuid
 
 import uvicorn
@@ -22,6 +23,12 @@ from .rules import NOT_ALLOWLISTED
 ELICIT_SCHEMA = {"type": "object", "properties": {"allow": {"type": "boolean"}}, "required": ["allow"]}
 
 
+BASE64 = re.compile(r"[A-Za-z0-9+/=\s]*")
+# content item fields that reach the harness, per type: strings are sealed, stripped and truncated; `binary`
+# is base64 (it cannot carry invisible characters) and bounded by the result budget; nothing else is relayed
+ITEMS = {"text": (("text",), ()), "image": (("mimeType",), ("data",)), "audio": (("mimeType",), ("data",)),
+         "resource_link": (("uri", "name", "description", "mimeType"), ())}
+RESOURCE = (("uri", "mimeType", "text"), ("blob",))
 CODES = {-32700, -32600, -32601, -32602, -32603}
 
 
@@ -190,15 +197,15 @@ class GuardSession(mcp.Session):
             result = await self.guard.upstream.request("tools/call", {**params, "arguments": args})
         except mcp.RpcError as e:      # the call reached the wrapped server: its failure is still a result
             result, failed = {"content": [{"type": "text", "text": e.message}], "isError": True}, e
-        content = [c for c in result.get("content", []) if isinstance(c, dict)]
-        text = "".join(c.get("text", "") for c in content if c.get("type") == "text" and isinstance(c.get("text"), str))
+        content = self._items(result.get("content"))
+        text = "".join(d[k] for _, d, k in self._strings(content))
         structured = result.get("structuredContent")
         if structured is not None:      # part of the result: sealed, scanned and bounded like the text
             text += json.dumps(structured, ensure_ascii=False, sort_keys=True)
         status = "error" if result.get("isError") else "ok"
         try:
             r = await asyncio.to_thread(self.pipeline.result, call, sealed, text, status,
-                                        [str(c.get("type")) for c in content], s.label)
+                                        [c["type"] for c in content], s.label)
         except (Unreachable, Refused, Refusal) as e:      # fail closed: the result is withheld unsealed
             raise _ledger_error(e)
         if r.blocked:
@@ -207,8 +214,7 @@ class GuardSession(mcp.Session):
                                {"sijil": {"seq": r.seq, "rule_hits": r.hits}})
         if failed:      # message only, as sealed (stripped, truncated); the server's `data` is not relayed
             raise mcp.RpcError(_code(failed.code), r.text)
-        if r.text != text:
-            content = self._rewrite(content)
+        content = self._rewrite(content)
         out = {"content": content}      # only these keys reach the harness; upstream _meta and the rest are dropped
         if structured is not None and (clean := self._clean(structured)) is not None:
             out["structuredContent"] = clean
@@ -229,16 +235,50 @@ class GuardSession(mcp.Session):
         except ValueError:
             return None
 
-    def _rewrite(self, content: list) -> list:
-        """Strip and truncate each text item as the pipeline did the whole text; other items pass."""
-        cfg, budget, out = self.guard.cfg, self.guard.cfg.max_result_bytes, []
-        for c in content:
-            if c.get("type") == "text" and isinstance(c.get("text"), str):
-                t = unicode.strip(c["text"]) if cfg.invisible_unicode == "strip" else c["text"]
-                b = t.encode("utf-8", "surrogatepass")
-                c, budget = {**c, "text": b[:max(budget, 0)].decode("utf-8", "ignore")}, budget - len(b)
-            out.append(c)
+    def _items(self, raw) -> list:
+        """Each content item rebuilt from the allowlist for its type; _meta, annotations and unknown keys are
+        dropped, and an unknown or malformed item becomes a text item saying so."""
+        out = []
+        for c in raw if isinstance(raw, list) else []:
+            c = c if isinstance(c, dict) else {}
+            kind = c.get("type")
+            strs, binary = ITEMS.get(kind, ((), ()))
+            body = {"type": kind, **{k: c[k] for k in strs if isinstance(c.get(k), str)}}
+            if kind == "resource" and isinstance(c.get("resource"), dict):
+                strs, binary = RESOURCE
+                res = c["resource"]
+                body = {"type": kind, "resource": {k: res[k] for k in (*strs, *binary) if isinstance(res.get(k), str)}}
+                bins = [(body["resource"], k) for k in binary if k in body["resource"]]
+            else:
+                body.update({k: c[k] for k in binary if isinstance(c.get(k), str)})
+                bins = [(body, k) for k in binary if k in body]
+            ok = (kind in ITEMS or kind == "resource" and "resource" in body) and (kind != "text" or "text" in body)
+            if ok and all(BASE64.fullmatch(d[k]) and len(d[k]) <= self.guard.cfg.max_result_bytes for d, k in bins):
+                out.append(body)
+            else:
+                out.append({"type": "text", "text": f"sijil-guard: unsupported content type {str(kind)[:40]}"})
         return out
+
+    @staticmethod
+    def _strings(content: list) -> list:
+        """(item, container, key) for every string of the items that is sealed and cleaned."""
+        found = []
+        for c in content:
+            if c["type"] == "resource":
+                holder, keys = c["resource"], RESOURCE[0]
+            else:
+                holder, keys = c, ITEMS[c["type"]][0]
+            found += [(c, holder, k) for k in keys if k in holder]
+        return found
+
+    def _rewrite(self, content: list) -> list:
+        """Strip and truncate every sealed string, in order, as the pipeline did the whole text."""
+        cfg, budget = self.guard.cfg, self.guard.cfg.max_result_bytes
+        for _, d, k in self._strings(content):
+            t = unicode.strip(d[k]) if cfg.invisible_unicode == "strip" else d[k]
+            b = t.encode("utf-8", "surrogatepass")
+            d[k], budget = b[:max(budget, 0)].decode("utf-8", "ignore"), budget - len(b)
+        return content
 
     async def close(self) -> None:
         if self.closed:

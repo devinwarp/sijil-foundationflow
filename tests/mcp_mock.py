@@ -53,6 +53,14 @@ def call(name: str, args: dict, ask=None, notify=None) -> dict:
         return text("x" * 300_000)
     if name == "structured":      # hidden from tools/list: a structuredContent carrying an invisible character
         return {**text("ok"), "structuredContent": {"v": "a\u200bb"}, "_meta": {"evil": "x"}, "extra": 1}
+    if name == "rich":            # hidden: items with _meta, annotations, invisible characters and odd types
+        return {"content": [
+            {"type": "text", "text": "hi", "_meta": {"x": 1}, "annotations": {"a": 1}, "extra": "e"},
+            {"type": "resource_link", "uri": "file:///a", "name": "n\u200bm", "_meta": {"x": 1}},
+            {"type": "resource", "resource": {"uri": "file:///b", "text": "t\u200bt", "_meta": {"x": 1}}},
+            {"type": "image", "data": "aGk=", "mimeType": "image/png", "_meta": {"x": 1}},
+            {"type": "image", "data": "not base64 !!", "mimeType": "image/png"},
+            {"type": "video", "data": "x"}]}
     if name == "fail":
         return text("boom", error=True)
     if name == "changed":
