@@ -6,8 +6,10 @@ Licensor:             Shameer Thaha
 
 Licensed Work:        Sijil. The Licensed Work is (c) 2026 Shameer Thaha.
                       Excluded: the verifier in the verifier/ directory,
-                      which is licensed separately under the Apache License,
-                      Version 2.0 (see verifier/LICENSE).
+                      the agent guard in the guard/ directory and the rule
+                      packs in the rulepacks/ directory, which are licensed
+                      separately under the Apache License, Version 2.0 (see
+                      verifier/LICENSE and guard/LICENSE).
 
 Additional Use Grant: You may make production use of the Licensed Work,
                       free of charge:
