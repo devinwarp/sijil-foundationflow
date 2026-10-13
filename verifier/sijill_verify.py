@@ -75,6 +75,11 @@ APPROVAL_REQUEST = ("tool", "server", "qualified", "correlation", "route_id", "a
                     "timeout_ms", "on_timeout", "sod")
 METRIC_TYPE = {"tool_calls": "tool_call", "tool_calls_by": "tool_call", "egress_hosts": "egress",
                "model_spend_micro": "inference"}
+# FAIL codes M2d adds to the spec 17.7 list (spec-delta): approval_request_malformed, approval_decision_invalid,
+# approval_after_deadline, approver_is_principal, approval_mismatch, approval_reused, approval_undecided,
+# budget_counter_mismatch, budget_unenforced, budget_spurious_hit, budget_limit_not_in_pack, cost_mismatch,
+# http_tool_call_malformed, after_the_fact_enforced, rulepack_unreadable, rule_hits_malformed, task_already_ended
+APPROVAL_ID = re.compile(r"ap_[0-9A-Z]{26}")
 HTTP_QUALIFIED = re.compile(r"http:[a-z0-9_-]{1,32}:\S(.*\S)?")   # Ruling: section 17.3.3 names carry a space
 
 BANNER_FONT = {
@@ -166,7 +171,7 @@ class State:
         self.approvals = {}             # approval_id -> the request (V-V4)
         self.decisions = {}             # decision seq -> {request, outcome, used}
         self.approval_counts = dict.fromkeys(("granted", "refused", "timeout"), 0)
-        self.budget_hits = self.after_the_fact = 0
+        self.budget_hits = self.after_the_fact = self.rulepack_matched = 0
         self.pack = None                # --rulepack: {hash, budgets, pricing} (W2)
         self.seen = {}                  # seq -> Seen
         self.result_parents = set()     # B3: tool_call seqs that already have a tool_result
@@ -230,6 +235,8 @@ def check_record(st, rec):
         raise Fail("source_label_invalid", "source_label invalid")
     if t == "inference":
         st.attestation[attestation(rec["model_digest"], x)] += 1
+    rule_hits(rec)
+    pack_checks(st, rec, x)
     identity_checks(st, rec, x, parent)
     st.seen[seq] = Seen(t, x, rec["input_hash"], rec["task_seq"])
 
@@ -294,6 +301,8 @@ def identity_checks(st, rec, x, parent):
         raise Fail("task_end_without_task_start", "task_end without task_start")
     if task_seq and (t in ("task_start", "policy_change", "rulepack_change") or t.startswith("agent_")):
         raise Fail("task_seq_not_allowed", f"task_seq not allowed on {t}")
+    if task is not None and task["ended"] and t != "task_end":
+        raise Fail("task_already_ended", "record in an ended task")
     if parent is not None and t != "integrity_drift" and parent.task_seq != task_seq:  # H3
         raise Fail("parent_in_different_task", "parent in different task")
     if task is not None:                                                              # I
@@ -521,6 +530,32 @@ def token_check(st, principal, c):
     st.principal_tokens["verified"] += 1
 
 
+def rule_hits(rec):
+    """The record's rule_hits as a list of strings; anything else is a FAIL (sijill/record.py refuses it too)."""
+    try:
+        hits = json.loads(rec["rule_hits"])
+    except (ValueError, RecursionError):
+        hits = None
+    if not (isinstance(hits, list) and all(isinstance(h, str) for h in hits)):
+        raise Fail("rule_hits_malformed", "rule_hits malformed")
+    return hits
+
+
+def pack_checks(st, rec, x):
+    """W2 cost on any inference, in a task or not: under the pack's hash a priced, forwarded inference carries
+    the cost the pack's pricing gives, and a cost_micro that is present is an int that recomputes."""
+    if rec["type"] != "inference":
+        return
+    if "cost_micro" in x and type(x["cost_micro"]) is not int:
+        raise Fail("cost_mismatch", "cost mismatch")
+    if st.pack and rec["rulepack_hash"] == st.pack["hash"]:
+        st.rulepack_matched += 1
+        priced = any(fnmatch.fnmatchcase(rec["model_digest"], str(p.get("model"))) for p in st.pack["pricing"])
+        if ("cost_micro" in x or (priced and rec["decision"] != "block")) \
+                and x.get("cost_micro") != cost(st.pack, rec["model_digest"], x):
+            raise Fail("cost_mismatch", "cost mismatch")
+
+
 def approval_checks(st, rec, x, parent, task):
     """V-V4 (spec §17.7): named approval requests and decisions, the tool_call that cites one, none left open."""
     t, seq = rec["type"], rec["seq"]
@@ -530,7 +565,9 @@ def approval_checks(st, rec, x, parent, task):
         aid, at = x.get("approval_id"), ms_of(rec["ts"])
         ok = (task is not None and at is not None and x.get("phase") == "request"
               and all(k in x for k in APPROVAL_REQUEST) and isinstance(aid, str) and aid not in st.approvals
-              and type(x["timeout_ms"]) is int and x["min_assurance"] in ASSURANCE)
+              and APPROVAL_ID.fullmatch(aid) and (rec["mode"], rec["decision"]) == ("record", "flag")
+              and type(x["timeout_ms"]) is int and x["timeout_ms"] > 0 and x["on_timeout"] == "deny"
+              and x["min_assurance"] in ASSURANCE)
         if parent is None:
             ok = ok and x.get("correlation") == "none" and st.allow_orphans
         else:
@@ -585,13 +622,7 @@ def approval_decision(st, rec, x):
 def budget_checks(st, rec, x, task):
     """X, X1 and W-W2 (spec §17.6, §17.7) on a record inside a task; then this record's own contribution to the
     task's counters, which the next record's `used` must equal."""
-    t = rec["type"]
-    try:
-        hits = json.loads(rec["rule_hits"])
-    except (ValueError, RecursionError):
-        hits = None
-    if not (isinstance(hits, list) and all(isinstance(h, str) for h in hits)):
-        raise Fail("rule_hits_malformed", "rule_hits malformed")
+    t, hits = rec["type"], rule_hits(rec)
     if t == "tool_call" and x.get("observed_by") == "http_adapter":                  # X
         summary = x.get("summary")
         if not (HTTP_QUALIFIED.fullmatch(str(x.get("qualified"))) and isinstance(summary, dict)
@@ -627,9 +658,6 @@ def budget_checks(st, rec, x, task):
     if any(h.startswith("budget:") and h not in failed for h in hits):
         raise Fail("budget_spurious_hit", "budget hit without excess")
     st.budget_hits += bool(failed)
-    if t == "inference" and "cost_micro" in x and st.pack and rec["rulepack_hash"] == st.pack["hash"]:
-        if x["cost_micro"] != cost(st.pack, rec["model_digest"], x):                 # W2
-            raise Fail("cost_mismatch", "cost mismatch")
     if t == "tool_call" and rec["decision"] != "block":
         task["calls"].append(str(x.get("qualified", "")))
     elif t == "egress" and rec["decision"] != "block" and isinstance(x.get("host"), str):
@@ -640,6 +668,7 @@ def budget_checks(st, rec, x, task):
 
 def own_count(task, metric):
     """The verifier's own value of a budget metric over the task's earlier records (§17.6.2)."""
+    # ponytail: recounts the task's calls per record, O(n^2) per task; keep running counters per glob if tasks grow
     if metric == "tool_calls":
         return len(task["calls"])
     if metric.startswith("tool_calls_by:"):
@@ -736,16 +765,17 @@ def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated
     res = {"ok": False, "line": "", "seq": None, "code": None, "records": 0, "attestation": st.attestation,
            "agent_auth": st.agent_auth, "orphans": 0, "unauthenticated": 0, "agents": {},
            "principals": st.principals, "principal_tokens": st.principal_tokens, "approvals": st.approval_counts,
-           "budget_hits": 0, "after_the_fact": 0}
+           "budget_hits": 0, "after_the_fact": 0, "rulepack_matched": 0}
 
     def fail(seq, code, reason):
         res.update(seq=seq, code=code, line=f"FAIL seq={seq} {reason}" if seq is not None else f"FAIL {reason}",
-                   orphans=st.orphans, unauthenticated=st.unauthenticated)
+                   orphans=st.orphans, unauthenticated=st.unauthenticated, budget_hits=st.budget_hits,
+                   after_the_fact=st.after_the_fact, rulepack_matched=st.rulepack_matched)
         return res
 
     if not os.path.exists(db_path):
         return fail(None, "database_not_found", f"database not found: {db_path}")
-    if rulepack:
+    if rulepack is not None:
         try:
             st.pack = load_pack(rulepack)
         except (OSError, ValueError, ImportError) as e:
@@ -794,12 +824,15 @@ def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated
             f"attestation={counts(st.attestation)} agent_auth={counts(st.agent_auth)} "
             f"principals={counts(st.principals)} principal_tokens={counts(st.principal_tokens)} "
             f"approvals={counts(st.approval_counts)} budgets=hits:{st.budget_hits} after_the_fact={st.after_the_fact}")
+    if rulepack is not None:
+        line += f" rulepack_matched={st.rulepack_matched}"
     if allow_orphans and st.orphans:
         line += f" orphans={st.orphans}"
     if allow_unauthenticated and st.unauthenticated:
         line += f" unauthenticated={st.unauthenticated}"
     res.update(ok=True, line=line, orphans=st.orphans, unauthenticated=st.unauthenticated,
                budget_hits=st.budget_hits, after_the_fact=st.after_the_fact,
+               rulepack_matched=st.rulepack_matched,
                agents={k: {f: a[f] for f in ("registered_seq", "current_pubkey", "revoked")}
                        for k, a in st.agents.items()})
     return res
@@ -833,6 +866,8 @@ def main(argv=None):
                         help="every task with a human principal has at least this assurance (check U3)")
     parser.add_argument("--rulepack", help="rule pack file: sealed budget limits and costs recompute (check W2)")
     args = parser.parse_args(argv)
+    if args.rulepack == "":
+        parser.error("--rulepack needs a file path")
 
     res = verify_full(args.db, args.pubkey, allow_orphans=args.allow_orphan_tool_calls,
                       allow_unauthenticated=args.allow_unauthenticated_agents, token_dir=args.token_dir,

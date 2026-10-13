@@ -436,3 +436,67 @@ def test_an_unreadable_rule_pack_is_a_fail_line(tmp_path):
     p.write_text("budgets: [1, {id: [a]}, {id: b, limits: 3}]\npricing: [x]\n")
     assert run(v2chain.gov(), tmp_path, "--rulepack", str(p))[0] == 0
     assert run(v2chain.gov(), tmp_path, "--rulepack", str(tmp_path / "nope.yaml"))[1].startswith("FAIL rule pack unreadable")
+
+
+def test_53b_a_priced_inference_must_carry_its_cost(tmp_path):
+    c, pack = packed(tmp_path)
+    x = json.loads(c[71]["ext"])
+    del x["cost_micro"]
+    c[71]["ext"] = record_json(x)
+    assert run(c, tmp_path, "--rulepack", pack) == (1, "FAIL seq=71 cost mismatch")
+    c[71]["ext"] = record_json(x | {"cost_micro": None})
+    assert run(c, tmp_path, "--rulepack", pack) == (1, "FAIL seq=71 cost mismatch")
+    assert run(c, tmp_path) == (1, "FAIL seq=71 cost mismatch")          # a non-int cost is wrong with or without a pack
+
+
+def test_53c_cost_is_recomputed_outside_a_task_too(tmp_path):
+    c, pack = packed(tmp_path)
+    c[71].update(task_seq="", parent_seq="")
+    c.ext(71, usage={"input_tokens": 1840, "output_tokens": 98})
+    code, line = run(c, tmp_path, "--rulepack", pack)
+    assert (code, line) == (1, "FAIL seq=71 cost mismatch")
+
+
+def test_v_request_fields_are_checked(tmp_path):
+    for change in ({"approval_id": "x"}, {"on_timeout": "allow"}, {"timeout_ms": 0}, {"timeout_ms": -5}):
+        c = v2chain.gov()
+        c.ext(75, **change)
+        assert run(c, tmp_path) == (1, "FAIL seq=75 approval request malformed"), change
+    c = v2chain.gov()
+    c[75].update(mode="enforce", decision="block")
+    assert run(c, tmp_path) == (1, "FAIL seq=75 approval request malformed")
+
+
+def test_rule_hits_are_checked_on_every_record(tmp_path):
+    c = v2chain.gov()
+    c[10]["rule_hits"] = "{}"
+    assert run(c, tmp_path) == (1, "FAIL seq=10 rule_hits malformed")
+
+
+def test_a_record_in_an_ended_task_fails(tmp_path):
+    c = v2chain.gov()
+    c.bodies.insert(79, {**c[78], "ts": "2026-10-01T10:03:14.000Z"})        # a tool_result-free copy after task_end
+    code, line = run(c, tmp_path)
+    assert code == 1 and line in ("FAIL seq=80 record in an ended task",), line
+
+
+def test_the_pass_line_and_json_report_how_many_records_the_pack_covered(tmp_path):
+    c, pack = packed(tmp_path)
+    code, line = run(c, tmp_path, "--rulepack", pack)
+    assert code == 0 and line.endswith(" rulepack_matched=1"), line
+    assert "rulepack_matched" not in run(c, tmp_path)[1]
+    code, line = run(v2chain.gov(), tmp_path, "--rulepack", pack)
+    assert code == 0 and line.endswith(" rulepack_matched=0"), line
+    code, res = verify_json(*c.write(tmp_path, validate=False), "--rulepack", pack)
+    assert res["rulepack_matched"] == 1
+
+
+def test_an_empty_rulepack_path_is_a_usage_error(tmp_path):
+    assert run(v2chain.gov(), tmp_path, "--rulepack", "") == (2, "")
+
+
+def test_json_counters_on_a_fail_are_the_ones_seen_so_far(tmp_path):
+    c = v2chain.gov()
+    c.ext(79, blocked=99)
+    code, res = verify_json(*c.write(tmp_path, validate=False))
+    assert (code, res["ok"]) == (1, False) and res["budget_hits"] == 1 and res["approvals"]["granted"] == 1
