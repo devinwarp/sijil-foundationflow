@@ -4,8 +4,10 @@ after the tool ran, scan its result and seal the tool_result. The adapters only 
 """
 
 import re
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable
 
 from . import rules, unicode
@@ -18,6 +20,8 @@ EXEC_HINTS = ("npx", "npm exec", "pnpm dlx", "bunx", "curl", "wget", "pip instal
 _HINT_RE = {h: re.compile(r"(?<![\w-])" + re.escape(h).replace(r"\ ", r"\s+") + r"(?![\w-])", re.I) for h in EXEC_HINTS}
 UNICODE_HIT = "invisible-unicode-in-result"
 NO_PARENT = 2 ** 62               # before_seq for an orphan: every result in the task is context
+POLL_S = 8                        # one approval long-poll, inside the ledger client's 10 s timeout
+GRACE_S = 60                      # past the deadline with no decision sealed: the ledger's timer is not running
 
 
 def exec_hints(text: str) -> list[str]:
@@ -135,6 +139,7 @@ class Pipeline:
                                          context_exec_hints=bool(ctx["exec_hints"]), method=call.method,
                                          path_template=call.path_template)
         summary = call.summary or (parsed.summary() if parsed else {"arg_keys": sorted(call.args)})
+        qualified = call.qualified or name or call.rule_tool
         answer, body = {}, {}
 
         def build() -> dict:
@@ -145,14 +150,19 @@ class Pipeline:
                 v = rules.evaluate(pack, facts, self.pins)
                 hits, action = v.hits, v.action
                 if action == "confirm" and "c" not in answer:
-                    rule = next(r for r in v.fired if r.action == "confirm")
-                    answer["c"] = (confirm(rule) if confirm else None) or "unavailable"
+                    confirms = [r for r in v.fired if r.action == "confirm"]
+                    if pack.approval == "entra":     # a named approver answers through the ledger (§17.5)
+                        answer["c"], answer["seq"] = self.named(call, parent, correlation, qualified, h,
+                                                                [r.id for r in confirms], summary)
+                    else:
+                        answer["c"] = (confirm(confirms[0]) if confirm else None) or "unavailable"
             decision, mode = rules.outcome(action, answer.get("c"))
             ext = {"harness": call.harness, "session_id": call.session_id, "tool": call.tool,
-                   "server": call.server, "qualified": call.qualified or name or call.rule_tool, "correlation": correlation,
+                   "server": call.server, "qualified": qualified, "correlation": correlation,
                    "observed_by": call.observed_by, "summary": summary, "context_labels": ctx["labels"],
                    "context_seqs": ctx["seqs"], **({"tool_use_id": tool_use_id} if tool_use_id else {}),
-                   **({"confirmation": answer["c"]} if action == "confirm" else {})}
+                   **({"confirmation": answer["c"]} if action == "confirm" else {}),
+                   **({"approval_seq": answer["seq"]} if action == "confirm" and answer.get("seq") else {})}
             body.update({"type": "tool_call", "parent_seq": parent, "mode": mode, "decision": decision,
                          "rule_hits": hits, "input_hash": h, "rulepack_hash": pack.hash, "ext": ext})
             return body
@@ -164,6 +174,26 @@ class Pipeline:
             why = ", ".join(sealed.hits) or "halted"
             raise Refusal(f"Blocked by Sijil rule {why}; seq={r['seq']}", r["seq"], sealed.hits)
         return sealed
+
+    def named(self, call: Call, parent: str, correlation: str, qualified: str, args_hash: str, hits: list[str],
+              summary: dict) -> tuple[str, int | None]:
+        """Named approval (spec §17.5.2): the ledger seals the request, then this call waits, long-polling, until
+        the ledger seals the decision; the tool_call then cites it. No route for these rules: unavailable."""
+        try:
+            a = self.ledger.call("POST", "/api/agent/approval/request", self.session, json={
+                "parent_seq": parent, "correlation": correlation, "tool": call.tool, "server": call.server,
+                "qualified": qualified, "input_hash": args_hash, "rule_hits": hits,
+                "arg_keys": summary.get("arg_keys", sorted(call.args)),
+                **({"task_seq": str(call.task_seq)} if call.task_seq not in (None, "") else {})})
+        except Refused:
+            return "unavailable", None
+        give_up = datetime.fromisoformat(a["deadline"].replace("Z", "+00:00")).timestamp() + GRACE_S
+        while time.time() < give_up:
+            st = self.ledger.call("GET", f"/api/agent/approval/{a['approval_id']}", self.session,
+                                  params={"wait": POLL_S})
+            if st["status"] != "pending":
+                return ("granted" if st["status"] == "granted" else "denied"), st["decision_seq"]
+        return "unavailable", None
 
     def result(self, call: Call, sealed: Sealed, text: str, status: str, content_types: list[str],
                source_label: str, raw: bytes | None = None, http_status: int | None = None,
