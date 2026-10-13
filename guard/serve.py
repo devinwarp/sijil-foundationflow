@@ -6,6 +6,7 @@ they would be a content channel the ledger never sees.
 """
 
 import asyncio
+import json
 import os
 import uuid
 
@@ -18,6 +19,12 @@ from .pipeline import Call, Pipeline, Refusal
 from .rules import NOT_ALLOWLISTED
 
 ELICIT_SCHEMA = {"type": "object", "properties": {"allow": {"type": "boolean"}}, "required": ["allow"]}
+
+
+def _ledger_error(e: Exception) -> "mcp.RpcError":
+    if isinstance(e, Unreachable):
+        return mcp.RpcError(mcp.SIJIL, "Sijil ledger unreachable")
+    return mcp.RpcError(mcp.SIJIL, f"Sijil ledger refused the record: {getattr(e, 'detail', e)}")
 
 
 class Guard:
@@ -43,7 +50,10 @@ class Guard:
     async def upstream_note(self, method: str, params: dict) -> None:
         if method == "notifications/tools/list_changed":
             for s in list(self.sessions):
-                await s.client.notify(method, params)
+                try:
+                    await s.client.notify(method, params)
+                except mcp.RpcError:      # one harness that went away must not silence the others
+                    pass
 
     def state(self) -> task.State:
         return task.shared(task.state_path(self.cfg), self.cfg.agent_id, self.open_session)
@@ -125,13 +135,15 @@ class GuardSession(mcp.Session):
         try:
             answer = fut.result(timeout=300)
         except Exception:
+            fut.cancel()                  # a timed-out ask must not stay pending on the harness
             return "denied"
         ok = answer.get("action") == "accept" and (answer.get("content") or {}).get("allow") is True
         return "granted" if ok else "denied"
 
     async def tools_call(self, params: dict) -> dict:
         s, cfg = self.guard.server, self.guard.cfg
-        name, args = params.get("name"), params.get("arguments") or {}
+        name, args = params.get("name"), params.get("arguments")
+        args = {} if args is None else args
         if not isinstance(name, str) or not isinstance(args, dict):
             raise mcp.RpcError(mcp.INVALID_PARAMS, "tools/call needs a name and an arguments object")
         call = Call(rule_tool=f"mcp:{s.name}:{name}", tool=name, server=s.name, args=args, harness=cfg.harness,
@@ -144,31 +156,52 @@ class GuardSession(mcp.Session):
             self.last_blocked = r.seq is not None
             code = mcp.METHOD_NOT_FOUND if forced else mcp.SIJIL
             raise mcp.RpcError(code, str(r), {"sijil": {"seq": r.seq, "rule_hits": r.hits}})
-        except (Unreachable, Refused) as e:
-            raise mcp.RpcError(mcp.SIJIL, f"Sijil ledger unreachable or refused the record: {e}")
+        except (Unreachable, Refused) as e:      # fail closed: a ledger that cannot seal the call stops it
+            raise _ledger_error(e)
         self.last_blocked, failed = False, None
         try:
-            result = await self.guard.upstream.request("tools/call", params)
+            result = await self.guard.upstream.request("tools/call", {**params, "arguments": args})
         except mcp.RpcError as e:      # the call reached the wrapped server: its failure is still a result
             result, failed = {"content": [{"type": "text", "text": e.message}], "isError": True}, e
         content = [c for c in result.get("content", []) if isinstance(c, dict)]
         text = "".join(c.get("text", "") for c in content if c.get("type") == "text" and isinstance(c.get("text"), str))
+        structured = result.get("structuredContent")
+        if structured is not None:      # part of the result: sealed, scanned and bounded like the text
+            text += json.dumps(structured, ensure_ascii=False, sort_keys=True)
         status = "error" if result.get("isError") else "ok"
         try:
             r = await asyncio.to_thread(self.pipeline.result, call, sealed, text, status,
                                         [str(c.get("type")) for c in content], s.label)
-        except (Unreachable, Refused) as e:
-            raise mcp.RpcError(mcp.SIJIL, f"Sijil ledger unreachable or refused the record: {e}")
+        except (Unreachable, Refused, Refusal) as e:      # fail closed: the result is withheld unsealed
+            raise _ledger_error(e)
         if r.blocked:
             self.last_blocked = True
             raise mcp.RpcError(mcp.SIJIL, f"Result withheld by Sijil rule {', '.join(r.hits) or 'halted'}; seq={r.seq}",
                                {"sijil": {"seq": r.seq, "rule_hits": r.hits}})
-        if failed:
-            raise failed
+        if failed:      # message only, as sealed (stripped, truncated); the server's `data` is not relayed
+            raise mcp.RpcError(failed.code, r.text)
         if r.text != text:
             content = self._rewrite(content)
+        result = {k: v for k, v in result.items() if k != "structuredContent"}
+        if structured is not None:
+            clean = self._clean(structured)
+            if clean is not None:
+                result["structuredContent"] = clean
         return {**result, "content": content,
                 "_meta": {**(result.get("_meta") or {}), "sijil": {"seq": r.seq, "parent_seq": sealed.seq}}}
+
+    def _clean(self, value):
+        """structuredContent after the same treatment as the text: stripped, or dropped when over the budget."""
+        cfg = self.guard.cfg
+        raw = json.dumps(value, ensure_ascii=False)
+        if cfg.invisible_unicode == "strip":
+            raw = unicode.strip(raw)
+        if len(raw.encode("utf-8", "surrogatepass")) > cfg.max_result_bytes:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return None
 
     def _rewrite(self, content: list) -> list:
         """Strip and truncate each text item as the pipeline did the whole text; other items pass."""
@@ -193,27 +226,41 @@ class GuardSession(mcp.Session):
             except (Unreachable, Refused):
                 pass                  # the ledger closes the task as timeout when the session expires
             if self.stdio:
-                def clear(st: task.State) -> None:
-                    if st.task_seq == self.task_seq:
-                        st.tasks = []
-                cfg = self.guard.cfg
-                try:
-                    await asyncio.to_thread(task.update, task.state_path(cfg), cfg.agent_id, self.guard.open_session, clear)
-                except (Unreachable, Refused, ValueError, OSError):
-                    pass
+                await asyncio.to_thread(self._clear)
+
+    def _clear(self) -> None:
+        """Drop the ended task from the state file. Load-only: shutdown never opens a session. The sibling
+        guards of a stdio owner that closes first fail closed at the ledger (the task is ended)."""
+        cfg = self.guard.cfg
+        path = task.state_path(cfg)
+        try:
+            with task.locked(path):
+                st = task.load(path, cfg.agent_id)
+                if st and st.task_seq == self.task_seq:
+                    st.tasks = []
+                    task.save(st, path)
+        except OSError:
+            pass
 
 
 async def run(cfg: Config, server_name: str, ledger: Ledger, http_listen: str = "") -> None:
     server = next((s for s in cfg.servers if s.name == server_name), None)
     if server is None:
         raise ValueError(f"no server named {server_name!r} in {cfg.path}")
+    host, port = http_listen.rsplit(":", 1) if http_listen else ("", "")
+    tls = {}
+    if host.strip("[]") not in ("", "127.0.0.1", "::1", "localhost"):
+        if not (cfg.tls_cert and cfg.tls_key and cfg.tools_token):
+            raise ValueError(f"--http {http_listen} is off loopback: mcp.tls_cert, mcp.tls_key and "
+                             "mcp.tools_token_env are required")
+        tls = {"ssl_certfile": cfg.tls_cert, "ssl_keyfile": cfg.tls_key}
     guard = Guard(cfg, server, ledger)
     await guard.start()
     try:
         if http_listen:
-            host, port = http_listen.rsplit(":", 1)
-            await uvicorn.Server(uvicorn.Config(mcp.http_app(guard.new_session, cfg.allowed_origins), host=host, port=int(port),
-                                                log_level="warning")).serve()
+            app = mcp.http_app(guard.new_session, cfg.allowed_origins, cfg.tools_token)
+            await uvicorn.Server(uvicorn.Config(app, host=host.strip("[]"), port=int(port), log_level="warning",
+                                                **tls)).serve()
         else:
             reader, write = await mcp.stdio_streams()
             await mcp.serve_stdio(guard.new_session, reader, write)

@@ -16,7 +16,8 @@ SECTIONS = {"version", "sijil", "identity", "task", "state_path", "repo", "rulep
 KEYS = {"sijil": {"url", "token_env", "on_unreachable"},
         "identity": {"agent_id", "auth", "key_path", "registered_by", "display_name", "oidc_token_env"},
         "task": {"intent", "harness", "principal_header"},
-        "egress": {"pins"}, "correlation": {"require_parent"}, "results": {"max_result_bytes", "invisible_unicode"}, "mcp": {"allowed_origins"}}
+        "egress": {"pins"}, "correlation": {"require_parent"}, "results": {"max_result_bytes", "invisible_unicode"}, "mcp": {"allowed_origins", "tools_token_env", "tls_cert", "tls_key"}}
+TOOLS_KEYS = {"allow", "deny"}
 SERVER_KEYS = {"name", "transport", "command", "args", "env", "url", "headers", "label", "tools", "command_arg"}
 SERVER_NAME = re.compile(r"[a-z0-9_-]{1,32}")                      # source_label mcp:<name> (spec §17.1)
 LABELS = ("telemetry", "web", "memory", "repo")                    # `user` cannot be assigned (spec §5.2)
@@ -63,13 +64,13 @@ def _command_ok(command: str, repo: str, dirs) -> str:
     real = os.path.realpath(found)
     roots = [repo, *(os.path.expanduser(d) if d.startswith(("/", "~")) else os.path.join(repo, d) for d in dirs)]
     if any(fnmatch.fnmatchcase(os.path.dirname(real), r) or real.startswith(r.rstrip("/") + "/") for r in roots):
-        return found
+        return real
     raise ValueError(f"server command {real} is outside the repo and allowed_command_dirs")
 
 
 def _server(d: dict, repo: str, dirs) -> Server:
     name = d.get("name", "")
-    if not SERVER_NAME.fullmatch(name):
+    if not isinstance(name, str) or not SERVER_NAME.fullmatch(name):
         raise ValueError(f"server name {name!r} must match [a-z0-9_-]{{1,32}}")
     if set(d) - SERVER_KEYS:
         raise ValueError(f"server {name}: {sorted(set(d) - SERVER_KEYS)[0]} is not supported by this guard")
@@ -77,6 +78,14 @@ def _server(d: dict, repo: str, dirs) -> Server:
     if transport not in ("stdio", "http") or (label and label not in LABELS):
         raise ValueError(f"server {name}: transport stdio|http; label one of {LABELS}")
     tools = d.get("tools") or {}
+    if not isinstance(tools, dict) or set(tools) - TOOLS_KEYS or not all(
+            isinstance(tools.get(k) or [], list) and all(isinstance(g, str) for g in tools.get(k) or []) for k in TOOLS_KEYS):
+        raise ValueError(f"server {name}: tools takes allow and deny, each a list of globs")
+    for key in ("env", "headers"):
+        if not isinstance(d.get(key) or {}, dict):
+            raise ValueError(f"server {name}: {key} must be a mapping")
+    if not isinstance(d.get("args") or [], list):
+        raise ValueError(f"server {name}: args must be a list")
     if transport == "stdio" and not d.get("command") or transport == "http" and not d.get("url"):
         raise ValueError(f"server {name}: stdio needs command, http needs url")
     return Server(name=name, transport=transport,
@@ -93,7 +102,10 @@ def _servers(doc: dict, path: str, repo: str) -> tuple:
     items = doc.get("servers") or ()
     if not isinstance(dirs, (list, tuple)) or not isinstance(items, (list, tuple)):
         raise ValueError(f"{path}: servers and allowed_command_dirs must be lists")
-    servers = tuple(_server(d if isinstance(d, dict) else {}, repo, dirs) for d in items)
+    try:
+        servers = tuple(_server(d if isinstance(d, dict) else {}, repo, dirs) for d in items)
+    except (TypeError, AttributeError) as e:
+        raise ValueError(f"{path}: servers: malformed entry ({e})") from None
     if len({s.name for s in servers}) != len(servers):
         raise ValueError(f"{path}: server names must be unique")
     return servers
@@ -123,6 +135,9 @@ class Config:
     invisible_unicode: str        # strip | block | record (spec §7.3)
     servers: tuple
     allowed_origins: tuple        # Origins besides loopback that the HTTP door accepts (MCP 2025-06-18)
+    tools_token: str              # X-Sijil-Tools-Token the HTTP door requires (mcp.tools_token_env); "" is none
+    tls_cert: str                 # serve --http off loopback needs both, and the token
+    tls_key: str
 
 
 def _path(p: str, name: str, base: Path) -> str:
@@ -178,6 +193,12 @@ def load(path: str) -> Config:
         raise ValueError(f"{path}: sijil.token_env names {token_env}, which is unset or empty")
     base = Path(path).resolve().parent
     repo = os.path.realpath(_path(doc.get("repo", ""), "repo", base) or os.getcwd())
+    if doc.get("servers") and not doc.get("repo") and repo in (os.path.realpath(os.path.expanduser("~")), "/"):
+        raise ValueError(f"{path}: repo is unset and the working directory is {repo}: set repo, or the Kiro "
+                         "check would trust every command under it")
+    tools_env = mcp.get("tools_token_env")
+    if tools_env and not os.environ.get(tools_env):
+        raise ValueError(f"{path}: mcp.tools_token_env names {tools_env}, which is unset or empty")
     return Config(path=str(path), url=sijil["url"], token=os.environ.get(token_env or "SIJIL_TOKEN", ""),
                   agent_id=ident["agent_id"], auth=auth, key_path=_path(ident.get("key_path", ""), "identity.key_path", base),
                   registered_by=registered_by, display_name=ident.get("display_name", ""),
@@ -192,4 +213,7 @@ def load(path: str) -> Config:
                   require_parent=corr.get("require_parent", True),
                   max_result_bytes=res.get("max_result_bytes", 262144),
                   invisible_unicode=res.get("invisible_unicode", "strip"), servers=_servers(doc, path, repo),
-                  allowed_origins=tuple(str(o) for o in mcp.get("allowed_origins") or ()))
+                  allowed_origins=tuple(str(o) for o in mcp.get("allowed_origins") or ()),
+                  tools_token=os.environ.get(tools_env, "") if tools_env else "",
+                  tls_cert=_path(mcp.get("tls_cert", ""), "mcp.tls_cert", base),
+                  tls_key=_path(mcp.get("tls_key", ""), "mcp.tls_key", base))

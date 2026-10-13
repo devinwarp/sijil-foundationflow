@@ -11,6 +11,7 @@ the server sends is buffered past MAX_LINE bytes (a line, an HTTP body, or one S
 """
 
 import asyncio
+import hmac
 import itertools
 import json
 import logging
@@ -503,10 +504,11 @@ def origin_ok(origin: str, allowed: tuple = ()) -> bool:
         return False
 
 
-def http_app(new_session: NewSession, allowed_origins: tuple = ()) -> FastAPI:
+def http_app(new_session: NewSession, allowed_origins: tuple = (), token: str = "") -> FastAPI:
     """Streamable HTTP, JSON answers only. initialize opens a session (Mcp-Session-Id); DELETE closes it.
     At most MAX_SESSIONS sessions are open, and one idle for SESSION_TTL seconds is closed. A request whose
-    Origin header is present and neither loopback nor in allowed_origins gets 403."""
+    Origin header is present and neither loopback nor in allowed_origins gets 403. With a token, every request
+    must carry it in X-Sijil-Tools-Token (compared in constant time) or gets 401."""
     sessions: dict[str, Session] = {}
     touched: dict[str, float] = {}
     opening = [0]                                   # initializes in flight, counted against MAX_SESSIONS
@@ -540,6 +542,8 @@ def http_app(new_session: NewSession, allowed_origins: tuple = ()) -> FastAPI:
         origin = request.headers.get("origin")
         if origin is not None and not origin_ok(origin, allowed_origins):
             return _error(403, INVALID_REQUEST, "Origin not allowed")
+        if token and not hmac.compare_digest(request.headers.get("x-sijil-tools-token", "").encode(), token.encode()):
+            return _error(401, INVALID_REQUEST, "missing or wrong X-Sijil-Tools-Token")
         return await call_next(request)
 
     async def body_of(request: Request) -> bytes | None:
