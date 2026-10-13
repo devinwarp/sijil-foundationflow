@@ -45,10 +45,28 @@ def create_key(path: str, repo: str) -> Ed25519PrivateKey:
     return key
 
 
+def ensure_key(path: str, repo: str) -> Ed25519PrivateKey:
+    """`identity init` is safe to repeat: an existing key is loaded (never overwritten or deleted), else created."""
+    if not os.path.lexists(path):
+        return create_key(path, repo)
+    if _inside(path, repo):
+        raise ValueError(f"{path}: the agent key must live outside the repository ({repo})")
+    return load_key(path)
+
+
 def load_key(path: str) -> Ed25519PrivateKey:
-    if os.stat(path).st_mode & 0o077:
-        raise ValueError(f"{path}: the agent key is readable by other users; chmod 600 it")
-    key = serialization.load_pem_private_key(Path(path).read_bytes(), password=None)
+    fd = os.open(path, os.O_RDONLY)
+    with os.fdopen(fd, "rb") as f:                   # check the file we read, not the name (no TOCTOU)
+        st = os.fstat(f.fileno())
+        if st.st_uid != os.geteuid():
+            raise ValueError(f"{path}: the agent key is not owned by you")
+        if st.st_mode & 0o077:
+            raise ValueError(f"{path}: the agent key is readable by other users; chmod 600 it")
+        try:
+            key = serialization.load_pem_private_key(f.read(), password=None)
+        except ValueError as e:
+            raise ValueError(f"{path}: not a usable key file (empty or corrupt); remove it and run "
+                             f"identity init again") from e
     if not isinstance(key, Ed25519PrivateKey):
         raise ValueError(f"{path}: not an Ed25519 key")
     return key

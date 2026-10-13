@@ -1,5 +1,6 @@
 """The guard's side of the tests: a ledger on tmp_path with the starter pack, and a guard.yaml for it."""
 
+import os
 import shutil
 from pathlib import Path
 
@@ -16,6 +17,7 @@ def ledger_node(tmp_path, handler=stub_model, policy_text=OPEN_POLICY, **overrid
 
 def guard_yaml(tmp_path, extra: str = "") -> Path:
     """repo/.sijil/guard.yaml; the agent key under home/, outside the repo; the state file under run/."""
+    os.environ.setdefault("GUARD_TEST_TOKEN", TOKEN)      # an explicit token_env must name a set variable
     repo = tmp_path / "repo"
     (repo / ".sijil").mkdir(parents=True, exist_ok=True)
     path = repo / ".sijil" / "guard.yaml"

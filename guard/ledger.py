@@ -1,7 +1,8 @@
 """The ledger's /api/agent/* endpoints as the guard sees them (spec §5.6). Every record is sealed by the ledger;
 the guard holds no chain state.
 
-Fail closed: a transport error or a 5xx is `Unreachable`, and callers refuse the tool call (spec §5.3).
+Fail closed: a transport error, a 5xx, a redirect or any other non-2xx/4xx answer, and a 2xx that is not JSON are
+`Unreachable`; a 4xx is `Refused`. Callers refuse the tool call (spec §5.3). Redirects are never followed.
 """
 
 import httpx
@@ -20,7 +21,7 @@ class Refused(Exception):
 class Ledger:
     def __init__(self, url: str, token: str = "", http: httpx.Client | None = None):
         self.token = token
-        self.http = http or httpx.Client(base_url=url, timeout=10.0)
+        self.http = http or httpx.Client(base_url=url, timeout=10.0, follow_redirects=False)
 
     def call(self, method: str, path: str, session: str | None = None, task_seq: int | str | None = None,
              headers: dict | None = None, **kw) -> dict:
@@ -29,17 +30,20 @@ class Ledger:
              **({"X-Sijil-Task-Seq": str(task_seq)} if task_seq not in (None, "") else {}), **(headers or {})}
         try:
             r = self.http.request(method, path, headers=h, **kw)
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, httpx.InvalidURL) as e:
             raise Unreachable(f"Sijil ledger unreachable: {e}") from e
-        if r.status_code >= 500:
+        if 400 <= r.status_code < 500:
+            try:
+                body = r.json()
+            except ValueError:
+                body = {"detail": r.text[:200]}
+            raise Refused(r.status_code, body.get("detail", body) if isinstance(body, dict) else body)
+        if not 200 <= r.status_code < 300:
             raise Unreachable(f"Sijil ledger unreachable: {r.status_code} {r.text[:200]}")
         try:
-            body = r.json()
-        except ValueError:
-            body = {"detail": r.text[:200]}
-        if r.status_code >= 400:
-            raise Refused(r.status_code, body.get("detail", body) if isinstance(body, dict) else body)
-        return body
+            return r.json()
+        except ValueError as e:
+            raise Unreachable(f"Sijil ledger unreachable: {r.status_code} reply is not JSON") from e
 
     def node_id(self) -> str:
         return self.call("GET", "/api/policy")["node_id"]

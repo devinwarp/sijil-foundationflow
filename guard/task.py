@@ -5,15 +5,20 @@ last; a delegated task sits above the task it was delegated from. It is written 
 """
 
 import fcntl
+import hashlib
 import json
 import os
+import re
+import tempfile
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .canon import sha256_hex
-from .ledger import Ledger
+from .ledger import Ledger, Refused
+
+EXPIRY_MARGIN = timedelta(seconds=30)    # a session about to lapse is not handed out
 
 
 @dataclass
@@ -35,30 +40,36 @@ class State:
 
 
 def state_path(cfg) -> Path:
+    """One file per agent_id: the last segment for the eye, a hash of the whole id so same-suffix agents differ."""
     if cfg.state_path:
         return Path(cfg.state_path)
     base = os.environ.get("XDG_RUNTIME_DIR")
     root = Path(base) / "sijil" if base else Path.home() / ".sijil" / "run"
-    return root / (cfg.agent_id.rstrip("/").rsplit("/", 1)[-1] + ".json")
+    last = re.sub(r"[^A-Za-z0-9._-]", "_", cfg.agent_id.rstrip("/").rsplit("/", 1)[-1])
+    return root / f"{hashlib.sha256(cfg.agent_id.encode()).hexdigest()[:12]}-{last}.json"
 
 
 def save(state: State, path: Path) -> None:
+    """Atomic: a private temp file in the same directory (mkstemp is 0600, unique, never a followed link)."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(asdict(state), f)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(asdict(state), f)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def load(path: Path, agent_id: str) -> State | None:
-    """The saved session, or None when there is none, it is another agent's, or it has expired."""
+    """The saved session, or None when there is none, it is another agent's, or it has (nearly) expired."""
     try:
         s = State(**json.loads(path.read_text()))
     except (OSError, ValueError, TypeError):
         return None
-    now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    return s if s.agent_id == agent_id and s.expires_at > now else None
+    cutoff = (datetime.now(timezone.utc) + EXPIRY_MARGIN).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return s if s.agent_id == agent_id and s.expires_at > cutoff else None
 
 
 def from_session(sess: dict, agent_id: str) -> State:
@@ -69,7 +80,8 @@ def from_session(sess: dict, agent_id: str) -> State:
 def locked(path: Path):
     """An exclusive lock beside the state file, so every guard of one agent shares one agent session."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with open(path.with_suffix(".lock"), "w") as f:
+    fd = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
             yield
@@ -77,14 +89,30 @@ def locked(path: Path):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def shared(path: Path, agent_id: str, open_session) -> State:
-    """The saved session if it is still valid, else a new one from open_session() (saved for the others)."""
+def update(path: Path, agent_id: str, open_session, fn):
+    """Run fn(state) on the shared state, holding the lock from load to save, so concurrent guards of one agent
+    never lose each other's task updates. A new session is saved for the others at once. A 401 from fn means
+    the ledger no longer knows the stored session: discard it and retry once on a fresh one; a second 401 is final."""
     with locked(path):
         state = load(path, agent_id)
-        if state is None:
-            state = from_session(open_session(), agent_id)
-            save(state, path)
-        return state
+        for attempt in (1, 2):
+            if state is None:
+                state = from_session(open_session(), agent_id)
+                save(state, path)
+            try:
+                result = fn(state)
+                break
+            except Refused as e:
+                if e.status != 401 or attempt == 2:
+                    raise
+                state = None
+        save(state, path)
+        return result
+
+
+def shared(path: Path, agent_id: str, open_session) -> State:
+    """The saved session if it is still valid, else a new one from open_session() (saved for the others)."""
+    return update(path, agent_id, open_session, lambda state: state)
 
 
 def start_task(ledger: Ledger, agent_session: str, intent: str, harness: str, session_id: str = "",
@@ -105,10 +133,17 @@ def end_task(ledger: Ledger, agent_session: str, task_seq: int, outcome: str) ->
 
 def start(ledger: Ledger, state: State, intent: str, harness: str, session_id: str = "", delegate: bool = False,
           principal_token: str | None = None, principal_header: str = "X-Sijil-Principal-Token") -> int:
-    """Start a task in the state file's session; with `delegate`, delegated from the current one (spec §5.9)."""
+    """Start a task in the state file's session; with `delegate`, delegated from the current one (spec §5.9).
+    Refused while a task is open unless delegating, and when delegating with none open: never drop a task."""
+    if not intent.strip():
+        raise ValueError("a task needs an intent (--intent or task.intent in guard.yaml)")
+    if state.tasks and not delegate:
+        raise ValueError(f"task {state.task_seq} is still open: end it, or pass --delegate to start a child task")
+    if delegate and not state.tasks:
+        raise ValueError("--delegate needs an open task to delegate from")
     seq = start_task(ledger, state.agent_session, intent, harness, session_id,
-                     str(state.task_seq) if delegate and state.task_seq else "", principal_token, principal_header)
-    state.tasks = [*(state.tasks if delegate else []), seq]
+                     str(state.task_seq) if delegate else "", principal_token, principal_header)
+    state.tasks = [*state.tasks, seq]
     return seq
 
 

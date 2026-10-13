@@ -18,8 +18,9 @@ def ledger_for(cfg) -> Ledger:
     return Ledger(cfg.url, cfg.token)
 
 
-def session(cfg, ledger: Ledger) -> task.State:
-    return task.shared(task.state_path(cfg), cfg.agent_id, lambda: identity.open_session(ledger, cfg))
+def update(cfg, ledger: Ledger, fn):
+    """fn(state) on the shared state file under its lock (task.update)."""
+    return task.update(task.state_path(cfg), cfg.agent_id, lambda: identity.open_session(ledger, cfg), fn)
 
 
 def main(argv: list[str] | None = None, ledger: Ledger | None = None) -> int:
@@ -39,31 +40,30 @@ def main(argv: list[str] | None = None, ledger: Ledger | None = None) -> int:
     cmd = " ".join(a.command)
     try:
         if cmd == "identity init":
-            key = identity.create_key(cfg.key_path, a.repo)
+            key = identity.ensure_key(cfg.key_path, a.repo)
             seq = identity.register(ledger, cfg.agent_id, key, cfg.registered_by or identity.local_principal(),
                                     cfg.display_name, os.environ.get(a.admin_token_env, ""))
             print(f"registered {cfg.agent_id} pubkey={identity.pubkey(key)} seq={seq}")
         elif cmd == "session open":
-            state = session(cfg, ledger)
+            state = update(cfg, ledger, lambda st: st)
             print(f"agent_session={state.agent_session} expires_at={state.expires_at}")
         elif cmd == "task start":
-            state = session(cfg, ledger)
-            seq = task.start(ledger, state, a.intent if a.intent is not None else cfg.intent, cfg.harness,
-                             a.session_id, delegate=a.delegate,
-                             principal_token=os.environ.get(a.principal_token_env) or None,
-                             principal_header=cfg.principal_header)
-            task.save(state, task.state_path(cfg))
+            seq = update(cfg, ledger, lambda st: task.start(
+                ledger, st, a.intent if a.intent is not None else cfg.intent, cfg.harness, a.session_id,
+                delegate=a.delegate, principal_token=os.environ.get(a.principal_token_env) or None,
+                principal_header=cfg.principal_header))
             print(seq)
         elif cmd == "task end":
-            state = session(cfg, ledger)
-            r = task.end(ledger, state, a.outcome)
-            task.save(state, task.state_path(cfg))
+            r = update(cfg, ledger, lambda st: task.end(ledger, st, a.outcome))
             print(f"task_end seq={r['seq']} tool_calls={r['tool_calls']} blocked={r['blocked']}")
         else:
             ap.error(f"unknown command: {cmd}")
     except (Refused, Unreachable, ValueError, OSError) as e:
         print(f"sijil-guard: {e}", file=sys.stderr)
         return 3 if isinstance(e, Unreachable) else 1
+    except (KeyError, TypeError) as e:                      # a 2xx body that is not what the ledger sends
+        print(f"sijil-guard: unexpected reply from the Sijil ledger: {e!r}", file=sys.stderr)
+        return 3
     return 0
 
 
