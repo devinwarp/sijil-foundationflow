@@ -1,7 +1,9 @@
 """Row 18g, guard side: a confirm rule routed to a named approver holds the HTTP tool call until the ledger seals
 the decision; the tool_call cites it (spec §17.5.2 step 6, §17.3.4 confirm)."""
 
+import asyncio
 import json
+import socket
 import threading
 import time
 
@@ -221,7 +223,120 @@ def test_a_cancelled_call_frees_its_approval_slot_promptly():
             await asyncio.sleep(0.5)
             assert not nine.done()               # it holds a slot rather than being refused at once
             calls[-1].cancel.set()
-            assert (await nine)[0] == "unavailable" and time.time() - t0 < 3
+            with pytest.raises(pipeline.Refusal):     # the caller went away: the call is never approved
+                await nine
+            assert time.time() - t0 < 3
         asyncio.run(go())
     finally:
         Pipeline.check = saved
+
+
+def serve_real(app):
+    """The tool adapter on a real socket (uvicorn in a thread); returns (server, port)."""
+    import uvicorn
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
+    threading.Thread(target=server.run, daemon=True).start()
+    end = time.time() + 5
+    while not server.started and time.time() < end:
+        time.sleep(0.02)
+    return server, server.servers[0].sockets[0].getsockname()[1]
+
+
+def raw_close_case(client, tools, port, n=0) -> socket.socket:
+    r = httpx.post(f"http://127.0.0.1:{port}/_sijil/task/start", json={"intent": f"Close {CASE}", "session_id": "conv-1"},
+                   headers={"X-Sijil-Principal-Token": officer(), "X-Sijil-Tools-Token": "tools-secret"})
+    t = r.json()
+    reply = client.post("/v1/chat/completions", headers={"X-Sijil-Agent-Session": t["agent_session"],
+                        "X-Sijil-Task-Seq": str(t["task_seq"]), "X-Sijil-Principal-Token": officer()},
+                        json={"model": "llama-3.2-3b-instruct", "messages": [{"role": "user", "content": f"close it {n}"}]})
+    call_id = reply.json()["choices"][0]["message"]["tool_calls"][0]["id"]
+    body = json.dumps({"resolution": CLOSE["resolution"]})
+    sock = socket.create_connection(("127.0.0.1", port))
+    sock.sendall((f"POST /case-api/cases/{CASE}/close HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  f"Content-Length: {len(body)}\r\nX-Sijil-Tools-Token: tools-secret\r\n"
+                  f"X-Sijil-Tool-Use-Id: {call_id}\r\nX-Sijil-Task-Seq: {t['task_seq']}\r\n\r\n{body}").encode())
+    return sock
+
+
+def test_clients_that_disconnect_free_their_approval_slots_on_a_real_server(env):
+    from guard import pipeline
+    client, s, tools, api = env(PACK.replace("timeout_seconds: 900", "timeout_seconds: 60"))
+    server, port = serve_real(tools.app)
+    try:
+        socks = [raw_close_case(client, tools, port, n) for n in range(pipeline.APPROVALS)]
+        end = time.time() + 10
+        while len(rows(s.db_path, "type = 'approval'")) < pipeline.APPROVALS and time.time() < end:
+            time.sleep(0.05)
+        assert pipeline._held._value == 0
+        for sock in socks:
+            sock.close()
+        end = time.time() + 6
+        while pipeline._held._value < pipeline.APPROVALS and time.time() < end:
+            time.sleep(0.1)
+        assert pipeline._held._value == pipeline.APPROVALS         # every slot came back
+        nine = raw_close_case(client, tools, port, 99)                  # a 9th approval is held, not refused
+        end = time.time() + 5
+        while len(rows(s.db_path, "type = 'approval'")) <= pipeline.APPROVALS and time.time() < end:
+            time.sleep(0.05)
+        assert len(rows(s.db_path, "type = 'approval' AND ext LIKE '%\"request\"%'")) == pipeline.APPROVALS + 1
+        assert api.seen == []
+        nine.close()
+    finally:
+        server.should_exit = True
+
+
+def held_session():
+    """A GuardSession with two tools/call requests waiting in their check, as the MCP door tracks them."""
+    from types import SimpleNamespace
+    from guard import serve
+    from guard.pipeline import Call
+    s = object.__new__(serve.GuardSession)
+    s.held, s.closed, s.own, s.stdio = {}, False, None, False
+    s.guard = SimpleNamespace(sessions=set())
+    s.held[7], s.held[8] = (Call("r", "t", "s", {}, "h", "x", "y") for _ in range(2))
+    return s
+
+
+def test_mcp_notifications_cancelled_cancels_only_that_request():
+    s = held_session()
+    asyncio.run(s.notified("notifications/cancelled", {"requestId": 7}))
+    assert s.held[7].cancel.is_set() and not s.held[8].cancel.is_set()
+
+
+def test_mcp_session_close_cancels_every_held_call():
+    s = held_session()
+    asyncio.run(s.close())
+    assert all(c.cancel.is_set() for c in s.held.values())
+
+
+def test_mcp_stdio_eof_releases_held_calls_before_waiting_for_them():
+    from guard import mcp
+
+    class Waiting(mcp.Session):
+        def __init__(self):
+            self.ev, self.seen = threading.Event(), None
+
+        async def handle(self, method, params):
+            self.seen = mcp.request_id.get()
+            await asyncio.to_thread(self.ev.wait, 10)      # a call held on an approval
+            return {}
+
+        def gone(self):
+            self.ev.set()
+
+    session = Waiting()
+
+    async def go():
+        reader = asyncio.StreamReader()
+        reader.feed_data(b'{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{}}\n')
+        reader.feed_eof()
+
+        async def write(data):
+            return None
+
+        async def new_session(client, headers):
+            return session
+        t0 = time.time()
+        await mcp.serve_stdio(new_session, reader, write)
+        return time.time() - t0
+    assert asyncio.run(go()) < 3 and session.seen == 5

@@ -27,6 +27,7 @@ POLL_S = 3                        # one approval long-poll, inside the ledger cl
 APPROVALS = 8                     # approvals one guard holds at once; past that a routed confirm is unavailable
 CHECKS = ThreadPoolExecutor(APPROVALS + 16, thread_name_prefix="sijil-check")   # a held approval never takes a default-pool thread
 _held = threading.BoundedSemaphore(APPROVALS)
+WATCH_S = 0.5                    # how often a held call asks whether its caller is still there
 GRACE_S = 60                      # past the deadline with no decision sealed: the ledger's timer is not running
 
 
@@ -74,7 +75,7 @@ class Call:
     path_template: str = ""
     task_seq: int | str | None = None      # None: the session's only open task
     qualified: str = ""           # ext.qualified when the adapter names it (http:<server>:<tool>); else the matched name
-    cancel: threading.Event | None = None   # set when the awaiting adapter is cancelled: stop holding an approval
+    cancel: threading.Event = field(default_factory=threading.Event)   # set when the caller is gone: stop holding an approval
 
 
 @dataclass
@@ -205,7 +206,7 @@ class Pipeline:
         try:
             approval_id = a["approval_id"]
             give_up = datetime.fromisoformat(a["deadline"].replace("Z", "+00:00")).timestamp() + GRACE_S
-            while time.time() < give_up and not (call.cancel and call.cancel.is_set()):
+            while time.time() < give_up and not call.cancel.is_set():
                 st = self.ledger.call("GET", f"/api/agent/approval/{approval_id}", self.session,
                                       params={"wait": POLL_S})
                 if st["status"] != "pending":
@@ -301,12 +302,25 @@ class Pipeline:
         return r["seq"]
 
 
-async def check(p: Pipeline, *args):
-    """Pipeline.check on the guard's own pool, so approvals held by named() cannot starve the default one."""
-    call = args[0]
-    call.cancel = threading.Event()
+async def check(p: Pipeline, call: Call, confirm=None, forced=None, gone=None) -> Sealed:
+    """Pipeline.check on the guard's own pool, so approvals held by named() cannot starve the default one.
+    The wait ends when this coroutine is cancelled, when call.cancel is set, or when `gone()` (an awaitable
+    asking whether the caller left, polled every WATCH_S) turns true; a call whose caller left is never run."""
+    fut = asyncio.get_running_loop().run_in_executor(CHECKS, p.check, call, confirm, forced)
+
+    async def watch() -> None:
+        while not await gone():
+            await asyncio.sleep(WATCH_S)
+        call.cancel.set()
+    watcher = asyncio.create_task(watch()) if gone else None
     try:
-        return await asyncio.get_running_loop().run_in_executor(CHECKS, p.check, *args)
+        sealed = await fut
     except asyncio.CancelledError:
         call.cancel.set()          # the polling thread notices within one POLL_S and frees its slot
         raise
+    finally:
+        if watcher:
+            watcher.cancel()
+    if call.cancel.is_set():
+        raise Refusal("Sijil: the caller went away before the call was approved")
+    return sealed

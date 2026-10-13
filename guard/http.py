@@ -331,7 +331,7 @@ class Adapter:
         except (Unreachable, OSError, ValueError) as e:
             return unavailable(e)
         try:
-            sealed = await pipeline.check(p, call, None, forced)
+            sealed = await pipeline.check(p, call, None, forced, request.is_disconnected)
             u = urlsplit(server.upstream)
             port = u.port or (443 if u.scheme == "https" else 80)
             await asyncio.to_thread(p.egress, call, sealed, upstream_host, port, u.scheme, request.method, self.pins)
@@ -388,14 +388,27 @@ class Adapter:
 def app(adapter: Adapter) -> FastAPI:
     api = FastAPI()
 
-    @api.middleware("http")
-    async def inbound(request: Request, call_next):
-        origin = request.headers.get("origin")
-        if origin is not None and not origin_ok(origin, adapter.cfg.allowed_origins):      # a browser page cannot drive the adapter
-            return JSONResponse({"error": "Origin not allowed"}, 403)
-        if not adapter.authorised(request):        # before anything is sealed (spec §17.3.2)
-            return JSONResponse({"error": "X-Sijil-Tools-Token required"}, 401)
-        return await call_next(request)
+    class Inbound:
+        """Plain ASGI, not BaseHTTPMiddleware: that wraps the receive channel, and a handler waiting on an approval
+        must see the client leave (request.is_disconnected) to free its slot."""
+
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                request = Request(scope)
+                origin = request.headers.get("origin")
+                bad = None
+                if origin is not None and not origin_ok(origin, adapter.cfg.allowed_origins):      # a browser page cannot drive the adapter
+                    bad = JSONResponse({"error": "Origin not allowed"}, 403)
+                elif not adapter.authorised(request):        # before anything is sealed (spec §17.3.2)
+                    bad = JSONResponse({"error": "X-Sijil-Tools-Token required"}, 401)
+                if bad:
+                    return await bad(scope, receive, send)
+            await self.app(scope, receive, send)
+
+    api.add_middleware(Inbound)
 
     api.post("/_sijil/task/start")(adapter.task_start)
     api.post("/_sijil/task/end")(adapter.task_end)
