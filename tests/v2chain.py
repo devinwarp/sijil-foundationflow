@@ -211,3 +211,18 @@ def demo() -> Chain:
                "denied": 0, "flagged": 2, "egress": 1, "last_seq": 13})
     rotate(c)
     return c
+
+
+def gov() -> Chain:
+    """Golden vectors 70-79 (spec §17.8), byte for byte but for prev_hash, after a prefix that registers their
+    agent under their rule pack; policy_change filler keeps the vectors at their own seq numbers."""
+    import vectors_v2
+    c = Chain()
+    rulepack_change(c, after=vectors_v2.GOV_RP)
+    register(c)
+    while len(c.bodies) < 69:
+        c.add("policy_change")
+    for body in c.bodies:
+        body["rulepack_hash"] = vectors_v2.GOV_RP
+    c.bodies += [{f: vectors_v2.out[seq][f] for f in record.BODY_FIELDS} for seq in range(70, 80)]
+    return c
