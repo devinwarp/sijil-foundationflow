@@ -372,3 +372,36 @@ def test_egress_hosts_are_counted_lowercased(env):
     n = client.app.state.node
     assert budgets.evaluate(n.rulepack, n.store, task, "egress", host=x["host"].upper())[1] == []
     assert verify(s.db_path, s.pubkey_path, "--rulepack", str(s.rulepack_path))[0] == 0
+
+
+def _failed_forward_is_charged_the_fallback(tmp_path, handler, stream=False, status=None):
+    client, s, _ = gov_node(tmp_path, pack=pack(), handler=handler)
+    with client:
+        r = client.post("/v1/chat/completions", headers={"X-Sijil-Principal-Token": officer()},
+                        json={"model": MODEL, "stream": stream, "messages": [{"role": "user", "content": "hi"}]})
+        if status:
+            assert r.status_code == status
+    rec = rows(s.db_path, "type = 'inference'")[0]
+    x = json.loads(rec["ext"])
+    assert "upstream-error" in rec["rule_hits"] or "upstream" in rec["rule_hits"]
+    assert (x["price_rule"], x["cost_micro"]) == ("local-metered", 50000) and "usage" not in x
+    code, line = verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))
+    assert code == 0, line
+
+
+def test_an_upstream_500_is_charged_the_missing_usage_cost(tmp_path):
+    _failed_forward_is_charged_the_fallback(
+        tmp_path, lambda request: httpx.Response(500, json={"error": {"message": "down"}}), status=500)
+
+
+def test_an_error_as_the_first_stream_event_is_charged_the_missing_usage_cost(tmp_path):
+    body = f"data: {json.dumps({'error': {'message': 'boom'}})}\n\n".encode()
+    _failed_forward_is_charged_the_fallback(
+        tmp_path, lambda request: httpx.Response(200, content=body, headers={"content-type": "text/event-stream"}),
+        stream=True)
+
+
+def test_an_upstream_timeout_is_charged_the_missing_usage_cost(tmp_path):
+    def timeout(request):
+        raise httpx.ReadTimeout("slow", request=request)
+    _failed_forward_is_charged_the_fallback(tmp_path, timeout, status=502)

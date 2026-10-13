@@ -398,8 +398,9 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
         async def upstream_failed(status: int, content: dict, upstream_ms: float):
             """Seal the call marked with the reserved upstream-error hit and respond."""
-            rec = await n.seal(settled({**body, "rule_hits": policy.rule_hits_json(
-                hits + [policy.UPSTREAM_ERROR_HIT])}))
+            # Forwarded, so priced like any forwarded request: no usage reported means missing_usage_cost_micro.
+            rec = await n.seal(settled({**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]),
+                                        "ext": ext(**budgets.cost(n.rulepack, digest, None))}))
             return JSONResponse(status_code=status, headers=headers(rec, upstream_ms), content=content)
 
         t1 = perf_counter()
@@ -474,9 +475,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     uses = calls.tool_uses()
 
                     def delivered_cost() -> dict:
-                        """Tokens reached the client before the stream ended badly: what was delivered was billed."""
-                        if not parts:
-                            return {}
+                        """The stream was forwarded and ended badly: charged like any forwarded request."""
                         by = post[0]["model_digest"] if post else digest
                         return {"ext": ext(**budgets.cost(n.rulepack, by, spent))}
                     ok = done and not errored and not halted and not (api and post is None)
