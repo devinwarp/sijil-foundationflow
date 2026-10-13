@@ -238,6 +238,14 @@ def test_a_refused_approval_at_the_gate_is_denied_and_the_chain_verifies(relay):
     {"agent": {"name": "other-agent", "type": "agent_reference"}},
     {"model": "gpt-5"},
     {"input": [{"type": "mcp_approval_response", "approve": True, "approval_request_id": "mcpr_02"}]},
+    {"input": {"type": "mcp_approval_response", "approve": True, "approval_request_id": "mcpr_02"}},
+    {"input": [{"type": "MCP_Approval_Response", "approve": True, "approval_request_id": "mcpr_02"}]},
+    {"input": [{"type": " mcp_approval_response", "approve": True, "approval_request_id": "mcpr_02"}]},
+    {"input": [{"type": "Message", "role": "user", "content": "hi"}]},
+    {"input": [{"role": "user", "content": "hi"}]},
+    {"input": [[{"type": "message", "role": "user", "content": "hi"}]]},
+    {"input": [{"type": "unknown_item"}]},
+    {"input": 5}, {"input": None}, {"input": [5]}, {"input": [None]},
     {"previous_response_id": "resp_01", "input": [{"type": "mcp_approval_response", "approve": True,
                                                    "approval_request_id": "mcpr_02"}]}])
 def test_the_client_cannot_add_tools_pick_an_agent_or_answer_approvals(relay, extra):
@@ -319,3 +327,10 @@ def test_concurrent_first_requests_make_one_session_and_one_task(relay, monkeypa
     assert sorted(r.status_code for r in out) == [200] * 6
     assert len(rows(s.db_path, "type = 'task_start'")) == 1
     assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_a_list_of_supported_items_is_forwarded(relay):
+    client, s, foundry = relay
+    given = [{"type": "message", "role": "user", "content": "hi"}]
+    assert portal(client, given).status_code == 200
+    assert foundry.seen[0][1]["input"] == given

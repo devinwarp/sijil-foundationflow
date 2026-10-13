@@ -26,6 +26,7 @@ from . import agents, approvals, budgets, chat, oidc, policy, record
 
 API = "foundry_responses"
 ALLOWED = ("agent", "conversation", "input", "previous_response_id", "metadata")   # the client fields forwarded
+ITEMS = ("message", "function_call_output")   # the input item types a client may send, spelled exactly
 ROUNDS = 8                                   # approval round trips per user turn
 ROOTS = Roots("/", "/", "/")                 # a relay has no workspace: path rules see absolute paths only
 
@@ -286,9 +287,9 @@ def router() -> APIRouter:
         if agent is not None and (agent.get("name") if isinstance(agent, dict) else agent) != cfg.agent_name:
             refused.append("agent")
         given = payload["input"]
-        if any(isinstance(i, dict) and str(i.get("type", "")).startswith("mcp_approval") for i in
-               (given if isinstance(given, list) else [])):
-            refused.append("input: mcp_approval items")
+        if not (isinstance(given, str) or (isinstance(given, list) and all(
+                isinstance(i, dict) and i.get("type") in ITEMS and isinstance(i["type"], str) for i in given))):
+            refused.append(f"input: a string or a list of items of type {list(ITEMS)}")
         if refused:
             raise HTTPException(400, f"not accepted by the relay (only the ledger's gate answers approvals): {refused}")
         conv_hash = record.sha256_hex(conv.encode())
