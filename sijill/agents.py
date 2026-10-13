@@ -17,7 +17,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import oidc, policy, record, rulepack
+from . import budgets, oidc, policy, record, rulepack
 from .oidc import ts_at
 
 SPIFFE = re.compile(r"spiffe://[a-z0-9.-]+/agent/[a-z0-9._-]+")      # verifier check I2
@@ -421,16 +421,18 @@ def router(require_admin) -> APIRouter:
             raise HTTPException(400, "rulepack_hash must be a string")
         guard_ok = t == "tool_call" and b.get("decision") == "block" and b.get("mode") == "enforce"
         if any((h in policy.RESERVED_IDS or h.startswith(policy.RESERVED_PREFIXES))
-               and not (guard_ok and h in GUARD_HITS) for h in hits):
+               and not (guard_ok and h in GUARD_HITS) and not (t in ("tool_call", "egress") and h.startswith("budget:"))
+               for h in hits):
             raise HTTPException(400, "rule_hits may not carry reserved ids; the node adds those itself")
         task = task_for(n, sess, b.get("task_seq"))
         if task is None and t in record.TASK_REQUIRED:
             raise HTTPException(409, "no open task in this agent session")
         fields = {k: b.get(k, d) for k, d in (("parent_seq", ""), ("source_label", ""), ("mode", "record"),
                                               ("decision", "allow"), ("input_hash", ""), ("output_hash", ""))}
-        if n.halted and t in ("tool_call", "tool_result", "egress"):   # the operator halt stops agents too
+        halted = n.halted and t in ("tool_call", "tool_result", "egress")
+        if halted:                                    # the operator halt stops agents too
             fields.update(mode="enforce", decision="block")
-            hits = [*hits, policy.HALT_HIT]
+            hits = [*(h for h in hits if not h.startswith("budget:")), policy.HALT_HIT]   # no budget evaluated
             if "approval_seq" in x:          # a blocked call consumes no grant (V2)
                 x = {**{k: v for k, v in x.items() if k != "approval_seq"}, "confirmation": "denied"}
         if not all(isinstance(v, str) for v in fields.values()):
@@ -452,6 +454,8 @@ def router(require_admin) -> APIRouter:
             check_parent(n.store, body, x)
             if t == "tool_call" and "approval_seq" in x:
                 check_approval(n.store, body, x)
+            if task is not None and t in ("tool_call", "egress") and not halted:
+                return budgets.stamp(n, task, body, x, hits, x.get("confirmation") == "granted")
             return body
         try:
             rec = await n.seal(build)
