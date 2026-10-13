@@ -463,7 +463,9 @@ def router(require_admin) -> APIRouter:
             since = max((r["seq"] for r in rows if r["type"] == "inference"
                          and not (json.loads(r["ext"]).get("tool_uses") if r["ext"] else None)), default=0)
         results = [r for r in rows if r["type"] == "tool_result" and r["seq"] > since]
-        return {"labels": sorted({r["source_label"] for r in results}), "seqs": [r["seq"] for r in results]}
+        hints = {h for r in results for h in (json.loads(r["ext"]).get("exec_hints", []) if r["ext"] else [])}
+        return {"labels": sorted({r["source_label"] for r in results}), "seqs": [r["seq"] for r in results],
+                "exec_hints": sorted(hints)}      # for the rules' context_exec_hints (spec §8.1)
 
     @r.post("/api/agent/task/start")
     async def task_start(request: Request, sess: dict = Depends(require_session)):

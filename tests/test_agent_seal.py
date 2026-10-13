@@ -90,7 +90,7 @@ def test_full_tool_round_trip_passes_the_verifier(flow):
     assert chat(client, sess, "add another").status_code == 200
     nxt = rows(s.db_path)[-1]["seq"]
     ctx = client.get("/api/agent/context", params={"before_seq": nxt}, headers=h).json()
-    assert ctx == {"labels": ["http:case-api"], "seqs": [result.json()["seq"]]}
+    assert ctx == {"labels": ["http:case-api"], "seqs": [result.json()["seq"]], "exec_hints": []}
     end = client.post("/api/agent/task/end", json={"task_seq": str(task), "outcome": "completed"}, headers=h).json()
     assert (end["inference"], end["tool_calls"], end["egress"]) == (2, 1, 1)
     for rec in rows(s.db_path, f"seq > {task}"):
@@ -109,7 +109,7 @@ def test_turn_window_starts_after_the_last_plain_answer(flow):
     chat(client, sess, "add the note again")
     nxt = rows(s.db_path)[-1]["seq"]
     assert client.get("/api/agent/context", params={"before_seq": nxt, "window": "turn"},
-                      headers=h).json() == {"labels": [], "seqs": []}
+                      headers=h).json() == {"labels": [], "seqs": [], "exec_hints": []}
     assert client.get("/api/agent/context", params={"before_seq": nxt},
                       headers=h).json()["labels"] == ["http:case-api"]
 

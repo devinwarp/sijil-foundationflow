@@ -9,10 +9,13 @@ from pathlib import Path
 import yaml
 
 PRINCIPAL = re.compile(r"oidc:[a-z0-9.-]+:\S+|email:[0-9a-f]{64}|local:[0-9a-f]{64}|human:[a-z0-9-]{1,32}:[0-9a-f]{64}")
-SECTIONS = {"version", "sijil", "identity", "task", "state_path"}
+SECTIONS = {"version", "sijil", "identity", "task", "state_path", "repo", "rulepack", "egress", "context_window",
+            "correlation", "results"}
 KEYS = {"sijil": {"url", "token_env", "on_unreachable"},
         "identity": {"agent_id", "auth", "key_path", "registered_by", "display_name", "oidc_token_env"},
-        "task": {"intent", "harness", "principal_header"}}
+        "task": {"intent", "harness", "principal_header"},
+        "egress": {"pins"}, "correlation": {"require_parent"}, "results": {"max_result_bytes", "invisible_unicode"}}
+UNICODE_ACTIONS = ("strip", "block", "record")
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,13 @@ class Config:
     intent: str
     harness: str
     principal_header: str
+    repo: str                     # paths in commands are shown relative to this (spec §7.2)
+    rulepack: str
+    egress_pins: str
+    context_window: str           # session | turn (spec §5.5)
+    require_parent: bool          # spec §5.4: false seals orphans with correlation none
+    max_result_bytes: int
+    invisible_unicode: str        # strip | block | record (spec §7.3)
 
 
 def _path(p: str, name: str, base: Path) -> str:
@@ -59,7 +69,8 @@ def load(path: str) -> Config:
     unknown = set(doc) - SECTIONS
     if unknown:
         raise ValueError(f"{path}: sections {sorted(unknown)} are not supported by this guard")
-    sijil, ident, task = (_section(doc, n, path) for n in ("sijil", "identity", "task"))
+    sijil, ident, task, egress, corr, res = (_section(doc, n, path) for n in
+                                             ("sijil", "identity", "task", "egress", "correlation", "results"))
     if sijil.get("on_unreachable", "closed") != "closed":
         raise ValueError(f"{path}: sijil.on_unreachable must be closed (the open mode is not built)")
     if not sijil.get("url") or not ident.get("agent_id"):
@@ -69,6 +80,13 @@ def load(path: str) -> Config:
         raise ValueError(f"{path}: identity.auth must be key or oidc (mtls is not built)")
     if auth == "key" and not ident.get("key_path"):
         raise ValueError(f"{path}: identity.key_path is required for auth: key")
+    if doc.get("context_window", "session") not in ("session", "turn"):
+        raise ValueError(f"{path}: context_window must be session or turn")
+    if res.get("invisible_unicode", "strip") not in UNICODE_ACTIONS or type(corr.get("require_parent", True)) is not bool:
+        raise ValueError(f"{path}: results.invisible_unicode must be strip, block or record; "
+                         "correlation.require_parent a boolean")
+    if type(res.get("max_result_bytes", 262144)) is not int or res.get("max_result_bytes", 262144) < 1024:
+        raise ValueError(f"{path}: results.max_result_bytes must be an integer of at least 1024")
     registered_by = ident.get("registered_by", "")
     if registered_by and not PRINCIPAL.fullmatch(registered_by):
         raise ValueError(f"{path}: identity.registered_by must be a principal (oidc:, email:, local:, human:)")
@@ -82,4 +100,11 @@ def load(path: str) -> Config:
                   oidc_token_env=ident.get("oidc_token_env", "SIJIL_OIDC_TOKEN"),
                   state_path=_path(doc.get("state_path", ""), "state_path", base), intent=task.get("intent", ""),
                   harness=task.get("harness", "other"),
-                  principal_header=task.get("principal_header", "X-Sijil-Principal-Token"))
+                  principal_header=task.get("principal_header", "X-Sijil-Principal-Token"),
+                  repo=os.path.realpath(_path(doc.get("repo", ""), "repo", base) or os.getcwd()),
+                  rulepack=_path(doc.get("rulepack", ""), "rulepack", base),
+                  egress_pins=_path(egress.get("pins", ""), "egress.pins", base),
+                  context_window=doc.get("context_window", "session"),
+                  require_parent=corr.get("require_parent", True),
+                  max_result_bytes=res.get("max_result_bytes", 262144),
+                  invisible_unicode=res.get("invisible_unicode", "strip"))
