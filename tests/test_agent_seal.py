@@ -239,7 +239,7 @@ def test_reserved_rule_hits_in_the_body_are_refused(flow, hit):
     client, s, sess, task, h = flow
     before = len(rows(s.db_path))
     r = seal(client, h, **TOOL_CALL, parent_seq=str(task + 1), rule_hits=["ok-rule", hit])
-    assert r.status_code == 400
+    assert r.status_code == (409 if hit.startswith("budget:") else 400)    # a budget hit the ledger did not count
     assert len(rows(s.db_path)) == before
 
 

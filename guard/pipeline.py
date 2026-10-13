@@ -115,6 +115,18 @@ class Pipeline:
             self.pack = rules.load(self.cfg.rulepack)
             return self.ledger.seal(self.session, build(), task_seq)
 
+    def admit(self, task_seq, params: dict, build: Callable[[dict], dict]) -> dict:
+        """Seal with the ledger's budget answer for this record (spec §17.6.2). The ledger counts again under its
+        seal lock; a 409 means another record of the task landed first, so ask again, once."""
+        answer = {}
+        for attempt in (1, 2):
+            answer.update(self.ledger.call("GET", "/api/agent/budget", self.session, task_seq, params=params))
+            try:
+                return self.seal(task_seq, lambda: build(answer))
+            except Refused as e:
+                if attempt == 2 or e.status != 409 or "budget changed" not in str(e.detail):
+                    raise
+
     def _parent(self, call: Call, h: str) -> tuple[str, str, str, str]:
         """(parent_seq, correlation, tool_use_id, matched name). A tool_use_id hit whose arguments differ
         from what is executed is no parent: B2 would fail it, so it is sealed as none (spec §5.4)."""
@@ -150,20 +162,26 @@ class Pipeline:
         qualified = call.qualified or name or call.rule_tool
         answer, body = {}, {}
 
-        def build() -> dict:
+        def build(budget: dict) -> dict:
             pack = self.pack
+            over = budget["exceeded"]                     # budget:<id>:<metric> hits; sealed whatever decides
+            if answer.get("over", over) != over:
+                answer.clear()                            # a new excess needs its own answer
+            answer["over"] = over
             if forced:
-                hits, action = forced, "block"
+                hits, action = [*forced, *over], "block"
             else:
                 v = rules.evaluate(pack, facts, self.pins)
-                hits, action = v.hits, v.action
+                by_budget = "block" if budget["on_exceed"] == "block" else "confirm"
+                hits = [*v.hits, *over]
+                action = max([v.action, *([by_budget] if over else [])], key=rules.ACTIONS.index)
                 if action == "confirm" and "c" not in answer:
                     confirms = [r for r in v.fired if r.action == "confirm"]
                     if pack.approval == "entra":     # a named approver answers through the ledger (§17.5)
                         answer["c"], answer["seq"] = self.named(call, parent, correlation, qualified, h,
-                                                                [r.id for r in confirms], summary)
+                                                                [r.id for r in confirms] + over, summary)
                     else:
-                        answer["c"] = (confirm(confirms[0]) if confirm else None) or "unavailable"
+                        answer["c"] = (confirm(confirms[0]) if confirm and confirms else None) or "unavailable"
             decision, mode = rules.outcome(action, answer.get("c"))
             ext = {"harness": call.harness, "session_id": call.session_id, "tool": call.tool,
                    "server": call.server, "qualified": qualified, "correlation": correlation,
@@ -174,7 +192,7 @@ class Pipeline:
             body.update({"type": "tool_call", "parent_seq": parent, "mode": mode, "decision": decision,
                          "rule_hits": hits, "input_hash": h, "rulepack_hash": pack.hash, "ext": ext})
             return body
-        r = self.seal(call.task_seq, build)
+        r = self.admit(call.task_seq, {"type": "tool_call", "qualified": qualified}, build)
         if call.task_seq in (None, "") and r.get("task_seq"):      # the task resolved once: the egress and the
             call.task_seq = r["task_seq"]                         # result are sealed into it, whatever opens since
         sealed = Sealed(r["seq"], r["decision"], body["rule_hits"], parent, body["ext"]["qualified"])
@@ -284,18 +302,19 @@ class Pipeline:
         facts = rules.Facts("egress", tool=call.rule_tool, hosts=[host])
         body = {}
 
-        def build() -> dict:
+        def build(budget: dict) -> dict:
             pack = self.pack
             v = rules.evaluate(pack, facts, pins)
-            decision, mode = rules.outcome(v.action)
+            over = budget["exceeded"]                     # an egress has no approval channel: an excess blocks
+            decision, mode = rules.outcome("block" if over else v.action)
             ext = {"host": host, "port": port, "proto": proto, "observed_by": call.observed_by,
                    "allowed_by": "none" if decision == "block" else "rulepack",
                    **({"method": method} if method else {}),
                    **({"pin_source": pins.path} if pins.pinned(host) and pins.path else {})}
             body.update({"type": "egress", "parent_seq": str(sealed.seq), "mode": mode, "decision": decision,
-                         "rule_hits": v.hits, "rulepack_hash": pack.hash, "ext": ext})
+                         "rule_hits": [*v.hits, *over], "rulepack_hash": pack.hash, "ext": ext})
             return body
-        r = self.seal(call.task_seq, build)
+        r = self.admit(call.task_seq, {"type": "egress", "host": host}, build)
         if r["decision"] == "block":
             raise Refusal(f"Blocked by Sijil rule {', '.join(body['rule_hits']) or 'halted'}; seq={r['seq']}",
                           r["seq"], body["rule_hits"])

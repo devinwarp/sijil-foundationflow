@@ -664,8 +664,8 @@ def budget_checks(st, rec, x, task):
                 failed.add(hit)
             if st.pack and rec["rulepack_hash"] == st.pack["hash"] and pack_limit(st.pack, bid, metric) != limit:
                 raise Fail("budget_limit_not_in_pack", "budget limit not in rule pack")      # W2
-    if any(h.startswith("budget:") and h not in failed for h in hits):
-        raise Fail("budget_spurious_hit", "budget hit without excess")
+    if t in METRIC_TYPE.values() and any(h.startswith("budget:") and h not in failed for h in hits):
+        raise Fail("budget_spurious_hit", "budget hit without excess")    # an approval request names its hits
     st.budget_hits += bool(failed)
     if t == "tool_call" and rec["decision"] != "block":
         task["calls"].append(str(x.get("qualified", "")))
