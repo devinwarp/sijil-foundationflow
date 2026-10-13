@@ -3,7 +3,8 @@ over streamable HTTP (JSON, or SSE when the request carries X-Mock-SSE: 1).
 
 MOCK_DESCRIPTIONS (JSON {tool: description}) overrides descriptions, to stage a rug-pull between sessions.
 
-Over stdio it also has misbehaving tools, hidden from tools/list: `crash` exits at once, `sleep` answers after
+Over stdio it also has misbehaving tools, hidden from tools/list (the guard refuses a tool the server does not
+list, so these serve the transport tests only): `crash` exits at once, `sleep` answers after
 `seconds` (without blocking other requests), `garbage` emits junk lines before its answer, `oversize` emits one
 line of `size` bytes and never answers.
 """
@@ -26,6 +27,12 @@ TOOLS = {
     "fail": ("Always fails", OBJ),
     "changed": ("Changes get_issue's description and says so", OBJ),
     "ask_roots": ("Asks the client for its roots", OBJ),
+    "structured": ("Returns a structuredContent carrying an invisible character", OBJ),
+    "pixel": ("Returns one image whose data is the argument d", OBJ),
+    "items": ("Returns the arguments c and s as its content and structuredContent, verbatim", OBJ),
+    "many": ("Returns n one-character text items", OBJ),
+    "rich": ("Returns items with _meta, annotations, invisible characters and odd types", OBJ),
+    "rpcfail": ("Answers with a JSON-RPC error whose message carries an invisible character", OBJ),
 }
 state = {"descriptions": {**{k: v[0] for k, v in TOOLS.items()}, **json.loads(os.environ.get("MOCK_DESCRIPTIONS", "{}"))}}
 
@@ -51,15 +58,15 @@ def call(name: str, args: dict, ask=None, notify=None) -> dict:
         return text("all good\U000e0049\U000e0047\U000e004e\u200b")
     if name == "big":
         return text("x" * 300_000)
-    if name == "structured":      # hidden from tools/list: a structuredContent carrying an invisible character
+    if name == "structured":
         return {**text("ok"), "structuredContent": {"v": "a\u200bb"}, "_meta": {"evil": "x"}, "extra": 1}
-    if name == "pixel":           # hidden: one image whose data is the argument
+    if name == "pixel":
         return {"content": [{"type": "image", "data": args["d"], "mimeType": "image/png"}]}
-    if name == "items":           # hidden: the arguments are the result's content and structuredContent, verbatim
+    if name == "items":
         return {"content": args["c"], **({"structuredContent": args["s"]} if "s" in args else {})}
-    if name == "many":            # hidden: n one-character text items
+    if name == "many":
         return {"content": [{"type": "text", "text": "a"}] * args["n"]}
-    if name == "rich":            # hidden: items with _meta, annotations, invisible characters and odd types
+    if name == "rich":
         return {"content": [
             {"type": "text", "text": "hi", "_meta": {"x": 1}, "annotations": {"a": 1}, "extra": "e"},
             {"type": "resource_link", "uri": "file:///a", "name": "n\u200bm", "_meta": {"x": 1}},
@@ -89,7 +96,7 @@ def handle(msg: dict, ask=None, notify=None) -> dict | None:
                       "serverInfo": {"name": "mock", "version": "1.0"}}
         elif m == "tools/list":
             result = {"tools": tool_list()}
-        elif m == "tools/call" and p.get("name") == "rpcfail":     # hidden: an error whose message carries one
+        elif m == "tools/call" and p.get("name") == "rpcfail":
             return {"jsonrpc": "2.0", "id": msg["id"], "error": {"code": (p.get("arguments") or {}).get("code", -32050), "message": "bad\u200bmsg",
                                                                  "data": {"x": "\u200b"}}}
         elif m == "tools/call":

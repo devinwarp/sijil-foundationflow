@@ -188,19 +188,26 @@ def test_results_are_stripped_truncated_and_errors_sealed(env):
         for word, tool in (("poison", "poisoned"), ("big", "big"), ("fail", "fail"), ("rug", "changed")):
             await asyncio.to_thread(ask, client, cfg, f"{word} it")
             out[tool] = await call(a, tool, {})
+        with pytest.raises(mcp.RpcError) as orphan:      # no parent: refused unsealed, so not -32601
+            await call(a, "nope", {})
         await asyncio.to_thread(ask, client, cfg, "nope, unknown")
         with pytest.raises(mcp.RpcError) as e:
             await call(a, "nope", {})
         await g.aclose()
-        return out, e.value, h.notes
-    out, err, notes = asyncio.run(go())
+        return out, e.value, orphan.value, h.notes
+    out, err, orphan, notes = asyncio.run(go())
     assert out["poisoned"]["content"][0]["text"] == "all good"
     assert serve._wire(out["big"]["content"]) == 262144 and out["fail"]["isError"] is True      # the budget, as JSON
-    assert err.code == -32602 and notes == ["notifications/tools/list_changed"]
+    # a tool the server never listed is refused and sealed, never forwarded (final review Important 1)
+    assert err.code == mcp.METHOD_NOT_FOUND and err.data["sijil"]["rule_hits"] == ["tool-not-allowlisted"]
+    assert orphan.code == mcp.SIJIL and orphan.data["sijil"]["seq"] is None
+    assert notes == ["notifications/tools/list_changed"]
     results = {json.loads(r["ext"])["tool"]: json.loads(r["ext"]) for r in rows(s.db_path, "type = 'tool_result'")}
     assert results["poisoned"]["invisible_unicode"]["action"] == "stripped"
     assert results["big"]["truncated"] is True and results["big"]["bytes"] == 300_000
-    assert results["fail"]["status"] == "error" and results["nope"]["status"] == "error"
+    assert results["fail"]["status"] == "error" and "nope" not in results
+    nope = rows(s.db_path, "type = 'tool_call'")[-1]
+    assert json.loads(nope["ext"])["tool"] == "nope" and nope["decision"] == "block"
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
 

@@ -384,13 +384,18 @@ class GuardSession(mcp.Session):
             raise _ledger_error(e)
         except mcp.RpcError as e:
             raise mcp.RpcError(mcp.SIJIL, f"Sijil: tool integrity could not be checked: {e.message}")
-        forced = [NOT_ALLOWLISTED] if not s.allowed(name) else self.guard.removed.get(name)
+        # a tool the integrity check took away is refused with its rule; one outside the set that check read
+        # (filtered, or never listed by the wrapped server) is refused as the adapter refuses an operation its spec
+        # does not declare, so a server cannot skip the check by answering for a tool it does not list
+        listed = s.allowed(name) and any(t["name"] == name for t in self.guard.seen)
+        forced = (s.allowed(name) and self.guard.removed.get(name)) or (None if listed else [NOT_ALLOWLISTED])
         try:
             sealed = await asyncio.to_thread(self.pipeline.check, call, self._confirm if self.elicit else None, forced)
         except Refusal as r:
             self.last_blocked = r.seq is not None
-            code = mcp.METHOD_NOT_FOUND if forced == [NOT_ALLOWLISTED] else mcp.SIJIL
-            raise mcp.RpcError(code, str(r), {"sijil": {"seq": r.seq, "rule_hits": r.hits}})
+            sealed_filter = forced == [NOT_ALLOWLISTED] and r.seq is not None
+            raise mcp.RpcError(mcp.METHOD_NOT_FOUND if sealed_filter else mcp.SIJIL, str(r),
+                               {"sijil": {"seq": r.seq, "rule_hits": r.hits}})
         except (Unreachable, Refused) as e:      # fail closed: a ledger that cannot seal the call stops it
             raise _ledger_error(e)
         self.last_blocked, failed = False, None

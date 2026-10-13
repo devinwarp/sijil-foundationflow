@@ -536,3 +536,21 @@ def test_revert_then_redrift_is_sealed_again(env, monkeypatch):
         await g.aclose()
     asyncio.run(go())
     assert len(rows(s.db_path, "type = 'integrity_drift'")) == 2        # the repeat without a revert seals nothing
+
+
+def test_a_tool_the_server_never_lists_is_refused_with_a_lockfile(env):
+    """Final review Important 1: answering for an unlisted name does not skip the pinned set."""
+    client, s, cfg = env
+    asyncio.run(serve.pin(cfg, "open", ledger_of(client)))
+
+    async def go():
+        g, a, h = await session(cfg, client, "open")
+        await asyncio.to_thread(ask, client, cfg, "nope, unknown")
+        with pytest.raises(mcp.RpcError) as e:
+            await call(a, "nope", {})
+        await g.aclose()
+        return e.value
+    err = asyncio.run(go())
+    assert err.code == mcp.METHOD_NOT_FOUND and err.data["sijil"]["rule_hits"] == ["tool-not-allowlisted"]
+    assert rows(s.db_path, "type = 'tool_result'") == [] and rows(s.db_path, "type = 'tool_call'")[0]["decision"] == "block"
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
