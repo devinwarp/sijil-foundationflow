@@ -283,7 +283,8 @@ def token_of(pcfg, headers) -> str | None:
 
 
 async def human(pcfg, jwks: dict, token, now: float, margin: float = 0.0) -> dict:
-    """§17.2.3 steps 1-8 for validation: jwt. Returns {principal, claims, display}; raises OidcError."""
+    """§17.2.3 steps 1-8 for validation: jwt. Returns {principal, claims, display, raw}; raises OidcError. `raw` is
+    the token's own claims (an approver's roles and oid, §17.5.2); it is never sealed."""
     if token is None:
         raise OidcError("missing")
     v = await validate(token, {i["issuer"]: i for i in pcfg.issuers}, jwks, now, margin)
@@ -310,7 +311,8 @@ async def human(pcfg, jwks: dict, token, now: float, margin: float = 0.0) -> dic
     if LEVELS.index(level) < LEVELS.index(pcfg.min_assurance):
         raise OidcError("assurance", 403, principal)
     display = c.get(i["display_claim"]) if i.get("display_claim") else None
-    return {"principal": principal, "claims": claims, "display": display if isinstance(display, str) else None}
+    return {"principal": principal, "claims": claims, "display": display if isinstance(display, str) else None,
+            "raw": c}
 
 
 def build_jwks(cfgs, snapshot_dir: str, http: httpx.AsyncClient) -> dict:
