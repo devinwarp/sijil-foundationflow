@@ -84,6 +84,14 @@ class _Tasks:
         await asyncio.gather(*others, return_exceptions=True)
 
 
+def _loads(raw):
+    """json.loads for untrusted input: nesting too deep is malformed JSON like any other (ValueError)."""
+    try:
+        return json.loads(raw)
+    except RecursionError:
+        raise ValueError("JSON nested too deeply") from None
+
+
 def _params(msg: dict) -> dict:
     p = msg.get("params")
     return p if isinstance(p, dict) else {}
@@ -153,7 +161,7 @@ class StdioUpstream:
         try:
             while line := await self.proc.stdout.readline():
                 try:
-                    msg = json.loads(line)
+                    msg = _loads(line)
                 except ValueError:
                     log.warning("skipped a line from the wrapped server that is not JSON")
                     continue
@@ -278,7 +286,7 @@ class HttpUpstream:
                 return await self._sse(r, rid)
             raw = b"".join([c async for c in _capped(r)])
         try:
-            msg = json.loads(raw)
+            msg = _loads(raw)
         except ValueError:
             raise RpcError(INTERNAL, "wrapped server answered with a body that is not JSON") from None
         if not isinstance(msg, dict):
@@ -293,7 +301,7 @@ class HttpUpstream:
             elif line == "" and data:
                 raw, data = "\n".join(data), []
                 try:
-                    msg = json.loads(raw)
+                    msg = _loads(raw)
                 except ValueError:
                     log.warning("skipped an SSE event that is not JSON")
                     continue
@@ -445,7 +453,7 @@ async def serve_stdio(new_session: NewSession, reader: asyncio.StreamReader,
             if not line.strip():
                 continue
             try:
-                msg = json.loads(line)
+                msg = _loads(line)
             except ValueError:
                 await client.send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
                 continue
@@ -488,6 +496,7 @@ def http_app(new_session: NewSession) -> FastAPI:
     At most MAX_SESSIONS sessions are open, and one idle for SESSION_TTL seconds is closed."""
     sessions: dict[str, Session] = {}
     touched: dict[str, float] = {}
+    opening = [0]                                   # initializes in flight, counted against MAX_SESSIONS
 
     async def drop(sid: str) -> None:
         session = sessions.pop(sid, None)
@@ -527,7 +536,7 @@ def http_app(new_session: NewSession) -> FastAPI:
         if raw is None:
             return _error(413, INVALID_REQUEST, "request body too large")
         try:
-            msg = json.loads(raw)
+            msg = _loads(raw)
         except ValueError:
             return _error(400, -32700, "parse error")
         if isinstance(msg, list):
@@ -537,15 +546,19 @@ def http_app(new_session: NewSession) -> FastAPI:
         await expire()
         sid = request.headers.get("mcp-session-id")
         if msg["method"] == "initialize" and "id" in msg:
-            if len(sessions) >= MAX_SESSIONS:
+            if len(sessions) + opening[0] >= MAX_SESSIONS:      # a slot is held from here, across the awaits
                 return _error(503, SIJIL, "too many open sessions", msg["id"])
-            sid = "ms_" + secrets.token_hex(16)
-            session = await new_session(Client(), dict(request.headers))
-            out = await _answer(session, msg)
-            if "error" in out or len(sessions) >= MAX_SESSIONS:     # a failed initialize opens nothing
-                await session.close()
-                return JSONResponse(out) if "error" in out else _error(503, SIJIL, "too many open sessions", msg["id"])
-            sessions[sid], touched[sid] = session, time.monotonic()
+            opening[0] += 1
+            try:
+                sid = "ms_" + secrets.token_hex(16)
+                session = await new_session(Client(), dict(request.headers))
+                out = await _answer(session, msg)
+                if "error" in out:                              # a failed initialize opens nothing
+                    await session.close()
+                    return JSONResponse(out)
+                sessions[sid], touched[sid] = session, time.monotonic()
+            finally:
+                opening[0] -= 1
             return JSONResponse(out, headers={"Mcp-Session-Id": sid})
         if sid not in sessions:
             return _error(404, INVALID_REQUEST, "unknown or missing Mcp-Session-Id", msg.get("id"))

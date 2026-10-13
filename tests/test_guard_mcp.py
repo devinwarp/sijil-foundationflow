@@ -458,3 +458,48 @@ def test_stdio_downstream_notification_handler_may_ask_the_client():
         await asyncio.wait_for(mcp.serve_stdio(new, reader, write), 5)
         return log
     assert ("asked", {"action": "accept"}) in asyncio.run(go())
+
+
+DEEP = b"[" * 50_000
+
+
+def test_deeply_nested_json_is_malformed_not_a_crash():
+    with pytest.raises(mcp.RpcError):
+        run_http(lambda request: httpx.Response(200, content=DEEP))
+    with pytest.raises(mcp.RpcError, match="without an answer"):   # the event is skipped, not fatal
+        run_http(lambda request: httpx.Response(200, content=b"data: " + DEEP + b"\n\n",
+                                                headers={"content-type": "text/event-stream"}))
+    out = []
+
+    async def write(data):
+        out.append(json.loads(data))
+    stdio_session([DEEP], write)
+    assert out[0]["error"]["code"] == -32700
+    with TestClient(mcp.http_app(lambda client, headers: None)) as c:
+        assert c.post("/mcp", content=DEEP).status_code == 400
+
+    async def go(up):
+        return await up.request("tools/call", call("garbage"))
+    assert stdio(go)
+
+
+def test_concurrent_initializes_cannot_exceed_the_session_cap(monkeypatch):
+    monkeypatch.setattr(mcp, "MAX_SESSIONS", 3)
+    log = []
+
+    async def new(client, headers):
+        await asyncio.sleep(0.05)                         # every initialize is in flight together
+        return Echo(client, headers, log)
+
+    async def go():
+        app = mcp.http_app(new)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+            rs = await asyncio.gather(*[c.post("/mcp", json={"jsonrpc": "2.0", "id": i, "method": "initialize"})
+                                        for i in range(10)])
+            codes = sorted(r.status_code for r in rs)
+            kept = len(app.state.sessions)
+            for sid in list(app.state.sessions):
+                await c.delete("/mcp", headers={"Mcp-Session-Id": sid})
+            again = await c.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+        return codes, kept, again.status_code
+    assert asyncio.run(go()) == ([200] * 3 + [503] * 7, 3, 200)
