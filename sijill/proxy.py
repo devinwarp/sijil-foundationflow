@@ -498,8 +498,8 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                             hits + [policy.HALT_HIT, policy.UPSTREAM_ERROR_HIT]),
                             "output_hash": record.output_hash("".join(parts)) if parts else "",
                             **delivered_cost()}
-                    elif refused:
-                        sealed = {**body, **post[0]}
+                    elif refused:     # the provider answered (and billed) with an unapproved model: withheld, priced
+                        sealed = {**body, **post[0], **delivered_cost()}
                     else:
                         sealed = {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]),
                                   **delivered_cost()}

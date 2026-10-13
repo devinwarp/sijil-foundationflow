@@ -405,3 +405,24 @@ def test_an_upstream_timeout_is_charged_the_missing_usage_cost(tmp_path):
     def timeout(request):
         raise httpx.ReadTimeout("slow", request=request)
     _failed_forward_is_charged_the_fallback(tmp_path, timeout, status=502)
+
+
+def test_a_streamed_answer_withheld_in_api_mode_carries_its_cost(tmp_path):
+    from test_chat_tool_uses import chunk, streamed
+    (tmp_path / "pack.yaml").write_text("""rulepack_id: api-pack
+version: 0.1.0
+rules: []
+pricing:
+  - {id: metered, model: "api:*", input_per_mtok_micro: 1000000000, output_per_mtok_micro: 1000000000,
+     missing_usage_cost_micro: 700}
+""")
+    client, s = make_node(tmp_path, streamed(chunk(model="gpt-5", content="hidden")), API_POLICY,
+                          rulepack_path=str(tmp_path / "pack.yaml"), **API)
+    with client, client.stream("POST", "/v1/chat/completions", json={
+            "model": "gpt-4.1", "stream": True, "messages": [{"role": "user", "content": "hi"}]}) as r:
+        assert "decision=block" in "".join(r.iter_text())
+    [rec] = rows(s.db_path, "type = 'inference'")
+    x = json.loads(rec["ext"])
+    assert (rec["decision"], x["price_rule"], x["cost_micro"]) == ("block", "metered", 700)
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+    assert verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "pack.yaml"))[0] == 0
