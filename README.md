@@ -50,6 +50,10 @@ The first run creates `node.key` (Ed25519 private key, mode 0600), `node.pub` an
 | `SIJILL_ENTITY` | `Ministry of Citizen Services` (report) |
 | `SIJILL_ADMIN_TOKEN` | *(none)*. Bearer token for `/api/admin/*`. Unset disables those endpoints (503) |
 | `SIJILL_HALT_PATH` | `sijill.halt`. Flag file; while it exists every call is blocked and sealed |
+| `SIJILL_TOKEN` | *(none)*. Secret; never commit it. Shared token agents send as `X-Sijil-Token` to `/api/agent/*` (except `/api/agent/revoke`, which uses the admin token). Unset disables those endpoints (503); a wrong token gets 401 |
+| `SIJILL_RULEPACK_PATH` | *(none)*. Path to the rule pack file. Unset means no rule pack and `POST /api/admin/rulepack/reload` returns 400 |
+| `SIJILL_UPSTREAM_PROVIDER` | *(none)*. Provider name of the upstream route, lowercase `[a-z0-9-]+`. Required when the policy sets `attestation: api`; sealed as `api:<provider>:<model>` |
+| `SIJILL_JWKS_DIR` | `jwks`. `/data/jwks` in the container. Directory for JWKS snapshots by hash (OIDC issuers in the policy). Must be writable; a snapshot is written before its hash is sealed |
 | `SIJILL_PKCS11_MODULE` | *(none)*. Path to the vendor PKCS#11 library. Setting it selects HSM signing |
 | `SIJILL_PKCS11_TOKEN` | Token label on the HSM |
 | `SIJILL_PKCS11_KEY` | Label of the Ed25519 key object on the token |
