@@ -551,8 +551,9 @@ def test_content_items_are_rebuilt_from_an_allowlist_and_sealed(env):
         {"type": "text", "text": "sijil-guard: unsupported content type image"},
         {"type": "text", "text": "sijil-guard: unsupported content type video"}]
     rec = json.loads(rows(s.db_path, "type = 'tool_result'")[0]["ext"])
-    sealed = ("hifile:///an\u200bmfile:///bt\u200btimage/png"       # every string the harness gets, before cleaning
-              "sijil-guard: unsupported content type imagesijil-guard: unsupported content type video")
+    # output_hash commits to what arrived: every string of the well-formed items before cleaning, never the
+    # guard's notes; the scan saw every string the harness gets
+    sealed = "hifile:///an\u200bmfile:///bt\u200btimage/png"
     assert rec["bytes"] == len(sealed.encode()) + 2 and rec["invisible_unicode"]["action"] == "stripped"
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
@@ -646,13 +647,13 @@ def test_fuzzed_result_shapes_never_crash_and_stay_within_the_budget(env):
         if n == 1500:      # record mode relays what strip mode would remove
             a = session_of(cfg.__class__(**{**cfg.__dict__, "invisible_unicode": "record"}))
         raw = rng.choice([[item() for _ in range(rng.randint(0, 6))], item(), rng.choice(atoms)])
-        content, _ = a._items(raw)
+        content, _, arrived = a._items(raw)
         for c in content:
             fields = c.get("resource", c) if c["type"] == "resource" else c
             assert c["type"] in serve.ITEMS or c["type"] == "resource"
             assert all(isinstance(v, str) for v in fields.values())
         text = "".join(d[k] for _, _, d, k, b in a._parts(content) if not b)
-        a._raw(content, text)
+        a._raw(arrived, "")
         relay = a._rewrite(content)[0]
         assert relayed({"content": relay}) <= cfg.max_result_bytes + MARKER
         json.dumps(relay, ensure_ascii=False).encode()      # what mcp.py writes: never a lone surrogate
@@ -676,9 +677,9 @@ def test_hash_framing_separates_text_from_payloads(env):
     hashes sha256(utf8(text)) (§2.4.2); bytes count text and payload bytes without framing."""
     client, s, cfg = env
     a = session_of(cfg)
-    img, _ = a._items([{"type": "text", "text": "a"}, {"type": "image", "data": ""}])
-    assert a._raw(img, "a")[0] != b"a" + bytes(8)
-    assert a._raw(a._items([{"type": "text", "text": "a"}])[0], "a") == (None, None)
+    _, _, img = a._items([{"type": "text", "text": "a"}, {"type": "image", "data": ""}])
+    assert a._raw(img, "")[0] != b"a" + bytes(8)
+    assert a._raw(a._items([{"type": "text", "text": "a"}])[2], "") == (b"a", 1)      # sha256(utf8(text))
     run_calls(cfg, client, ["emptyimg", "nultext"])
     ri, rt = rows(s.db_path, "type = 'tool_result'")
     u64 = lambda v: v.to_bytes(8, "big")
@@ -693,13 +694,13 @@ def test_binary_payloads_share_one_result_budget(env):
     client, s, cfg = env
     cfg = cfg.__class__(**{**cfg.__dict__, "max_result_bytes": 1024})
     a = session_of(cfg)
-    over, replaced = a._items([{"type": "text", "text": "x" * 1024}, IMG600])
+    over, replaced, _ = a._items([{"type": "text", "text": "x" * 1024}, IMG600])
     assert over[1] == {"type": "text", "text": "sijil-guard: image over the result budget"} and replaced
     (got,) = run_calls(cfg, client, ["flood"])
     note = {"type": "text", "text": "sijil-guard: image over the result budget"}
     assert got["content"] == [IMG600, note, note] and relayed(got) <= 1024
     rec = json.loads(rows(s.db_path, "type = 'tool_result'")[0]["ext"])
-    assert rec["bytes"] == len("image/png") + 600 + 2 * len(note["text"]) and rec["truncated"] is True
+    assert rec["bytes"] == 3 * (len("image/png") + 600) and rec["truncated"] is True      # all three arrived
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
 
@@ -734,10 +735,27 @@ def test_item_count_and_item_overhead_are_within_the_budget(env):
     client, s, cfg = env
     cfg = cfg.__class__(**{**cfg.__dict__, "max_result_bytes": 1024})
     a = session_of(cfg)
-    capped, replaced = a._items([{"type": "text", "text": ""}] * (serve.MAX_ITEMS + 5))
+    capped, replaced, _ = a._items([{"type": "text", "text": ""}] * (serve.MAX_ITEMS + 5))
     assert len(capped) == serve.MAX_ITEMS + 1 and replaced
     assert capped[-1] == {"type": "text", "text": "sijil-guard: 5 more items over the item limit"}
     (got,) = run_calls(cfg, client, ["many"])
     assert relayed(got) < 2048 and got["content"][-1]["text"].endswith("more items over the result budget")
     assert json.loads(rows(s.db_path, "type = 'tool_result'")[0]["ext"])["truncated"] is True
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_a_result_the_guard_cannot_process_is_sealed_as_an_error(env, monkeypatch):
+    """Final review Minor 1: the tool ran, so a failure in the guard's own result handling still leaves a
+    tool_result (status error, over a guard note), and the harness gets an error."""
+    client, s, cfg = env
+
+    def broken(self, content):
+        raise RecursionError("nested too deeply")
+    monkeypatch.setattr(serve.GuardSession, "_rewrite", broken)
+    (got,) = run_calls(cfg, client, ["poison"])
+    note = "sijil-guard: the result could not be processed"
+    assert got["isError"] is True and got["content"] == [{"type": "text", "text": note}]
+    rec = rows(s.db_path, "type = 'tool_result'")[0]
+    x = json.loads(rec["ext"])
+    assert (x["status"], x["truncated"], rec["output_hash"]) == ("error", True, record.sha256_hex(note.encode()))
     assert verify(s.db_path, s.pubkey_path)[0] == 0

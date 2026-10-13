@@ -281,6 +281,21 @@ def test_oversized_json_is_withheld_with_the_upstream_status(env):
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
 
+def test_an_undecodable_body_is_hashed_as_it_arrived_not_as_the_notice(env):
+    """Final review Minor 2: the guard's notice is relayed, the upstream bytes are what output_hash commits to."""
+    client, s, cfg, tools, api = env
+    deep = b"[" * 100000 + b"]" * 100000
+    api.big = (deep, "application/json", 200)
+    t = start(tools)
+    think(client, t, "list the open cases")
+    r = tools.get("/case-api/cases?limit=10&open=true", headers={"X-Sijil-Task-Seq": str(t["task_seq"])})
+    assert r.status_code == 502 and r.json() == {"error": "upstream response is not decodable"}
+    result = rows(s.db_path, "type = 'tool_result'")[0]
+    x = json.loads(result["ext"])
+    assert result["output_hash"] == record.sha256_hex(deep) and x["bytes"] == len(deep) and x["status"] == "error"
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
 def test_ledger_unreachable_is_503_with_a_generic_message(env):
     client, s, cfg, tools, api = env
     t = start(tools)

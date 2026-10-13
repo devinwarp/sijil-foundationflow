@@ -49,9 +49,9 @@ def _code(code) -> int:
     return code if ok else mcp.INTERNAL
 
 
-def _decode(data: str, limit: int) -> bytes | None:
-    """The bytes of a base64 payload, or None when it is not base64 or is over the result budget."""
-    if len(data) > limit or not BASE64.fullmatch(data):
+def _decode(data: str) -> bytes | None:
+    """The bytes of a base64 payload, or None when it is not base64. Its size is bounded by mcp.MAX_LINE."""
+    if not BASE64.fullmatch(data):
         return None
     try:
         return base64.b64decode("".join(data.split()), validate=True)
@@ -403,20 +403,27 @@ class GuardSession(mcp.Session):
             result = await self.guard.upstream.request("tools/call", {**params, "arguments": args})
         except mcp.RpcError as e:      # the call reached the wrapped server: its failure is still a result
             result, failed = {"content": [{"type": "text", "text": e.message}], "isError": True}, e
-        content, replaced = self._items(result.get("content"))
-        text = "".join(d[k] for _, _, d, k, binary in self._parts(content) if not binary)
-        structured = result.get("structuredContent")
-        if structured is not None:      # part of the result: sealed, scanned and bounded like the text
-            text += json.dumps(structured, ensure_ascii=False, sort_keys=True)
-        is_error = result.get("isError") is True
-        raw, size = self._raw(content, text)
-        types = [c["type"] for c in content]
-        # what the harness gets, cleaned before the seal so the record says whether the budget cut anything
-        content, left, cut = self._rewrite(content)
-        clean, dropped = self._clean(structured, left) if structured is not None else (None, False)
+        try:      # the call ran: whatever fails from here on, its result is sealed (an error over a guard note)
+            content, replaced, arrived = self._items(result.get("content"))
+            text = "".join(d[k] for _, _, d, k, binary in self._parts(content) if not binary)      # scanned
+            structured = result.get("structuredContent")
+            # part of the result: hashed, scanned and bounded like the text
+            extra = "" if structured is None else json.dumps(structured, ensure_ascii=False, sort_keys=True)
+            text += extra
+            raw, size = self._raw(arrived, extra)
+            is_error = result.get("isError") is True
+            types = [c["type"] for c in content]
+            # what the harness gets, cleaned before the seal so the record says whether the budget cut anything
+            content, left, cut = self._rewrite(content)
+            clean, dropped = self._clean(structured, left) if structured is not None else (None, False)
+            cut = replaced or cut or dropped
+        except Exception as e:      # a structuredContent nested past the recursion limit, or a guard bug
+            print(f"sijil-guard: result of {name} could not be processed: {type(e).__name__}", file=sys.stderr)
+            content = [_note("the result could not be processed")]
+            clean, text, raw, size, is_error, types, cut = None, content[0]["text"], None, None, True, ["text"], True
         try:
             r = await asyncio.to_thread(self.pipeline.result, call, sealed, text, "error" if is_error else "ok",
-                                        types, s.label, raw, size=size, cut=replaced or cut or dropped)
+                                        types, s.label, raw, size=size, cut=cut)
         except (Unreachable, Refused, Refusal) as e:      # fail closed: the result is withheld unsealed
             raise _ledger_error(e)
         if r.blocked:
@@ -446,17 +453,19 @@ class GuardSession(mcp.Session):
         except ValueError:
             return None, False
 
-    def _items(self, raw) -> tuple[list, bool]:
+    def _items(self, raw) -> tuple[list, bool, list]:
         """Each content item rebuilt from the allowlist for its type; _meta, annotations and unknown keys are
         dropped. Every upstream value is shape-checked: a `content` that is not a list, an item that is not an
         object, a type that is not a known string, an allowlisted field that is not a string, a text item
         without text, an image or audio item without data, or a payload that is not base64 becomes a text item
         saying so. Items past MAX_ITEMS collapse into one note. A binary item that would take the relayed items
         (as JSON, before stripping) past the result budget becomes a note. A payload is relayed re-encoded, so
-        the harness gets exactly the bytes that are hashed. (items, whether a limit replaced any)."""
-        limit, used, out, replaced = self.guard.cfg.max_result_bytes, 0, [], False
+        the harness gets exactly the bytes that are hashed. (items, whether a limit replaced any, what arrived:
+        (index, type, string fields, payloads) of every well-formed item, all of them, before any note).
+        Items past MAX_ITEMS are hashed (bounded by mcp.MAX_LINE), not relayed."""
+        limit, used, out, replaced, arrived = self.guard.cfg.max_result_bytes, 0, [], False, []
         raw = raw if isinstance(raw, list) else [] if raw is None else [None]
-        for c in raw[:MAX_ITEMS]:
+        for n, c in enumerate(raw):
             c = c if isinstance(c, dict) else {}
             kind = c.get("type") if isinstance(c.get("type"), str) else None
             holder = c.get("resource") if kind == "resource" else c
@@ -465,9 +474,14 @@ class GuardSession(mcp.Session):
             known = kind in ITEMS or kind == "resource" and isinstance(c.get("resource"), dict)
             typed = all(isinstance(holder[k], str) for k in (*strs, *binary) if k in holder)
             fields = {k: holder[k] for k in strs if k in holder} if typed else {}
-            blobs = {k: _decode(holder[k], limit) for k in binary if k in holder} if typed else {}
+            blobs = {k: _decode(holder[k]) for k in binary if k in holder} if typed else {}
             missing = kind in REQUIRED and REQUIRED[kind] not in holder
-            if not known or not typed or missing or None in blobs.values():
+            ok = known and typed and not missing and None not in blobs.values()
+            if ok:
+                arrived.append((n, kind, list(fields.values()), list(blobs.values())))
+            if n >= MAX_ITEMS:
+                continue
+            if not ok:
                 item = _note(f"unsupported content type {str(kind)[:40]}")
             else:
                 fields.update({k: base64.b64encode(b).decode("ascii") for k, b in blobs.items()})
@@ -479,23 +493,25 @@ class GuardSession(mcp.Session):
         if len(raw) > MAX_ITEMS:
             out.append(_note(f"{len(raw) - MAX_ITEMS} more items over the item limit"))
             replaced = True
-        return out, replaced
+        return out, replaced, arrived
 
-    def _raw(self, content: list, text: str) -> tuple[bytes | None, int | None]:
-        """The pipeline's hash input and byte count. A text-only result is left to the pipeline: output_hash is
-        sha256(utf8(text)) and bytes its length (§2.4.2). With an image, audio or blob payload, where T is
-        utf8(sealed text), P the decoded payload of a binary part, n the index of its content item, t that
+    @staticmethod
+    def _raw(arrived: list, structured: str) -> tuple[bytes, int]:
+        """The MCP door's hash input and byte count (the definition both doors follow is Pipeline.result's).
+        T is utf8 of the result text as it arrived: every string field of the well-formed items, in item order
+        (for a text item, its text), then `structured`, the structuredContent as sorted-key JSON. A text-only
+        result therefore hashes sha256(utf8(concatenated text)) and counts its length (§2.4.2). With an image,
+        audio or blob payload, P the decoded payload of a binary part, n the index of its content item, t that
         item's type, and u64 an 8-byte big-endian length or index:
             output_hash = sha256(0xFF || u64(len T) || T || for each binary part, in item order:
                                  u64(n) || u64(len t) || t || u64(len P) || P)
             bytes = len T + the sum of len P (no framing)
         Every part is length-prefixed, and 0xFF never occurs in UTF-8, so no other result hashes the same."""
-        parts = [(n, c["type"].encode("ascii"), base64.b64decode(d[k])) for n, c, d, k, binary in self._parts(content)
-                 if binary]
+        t = ("".join(x for _, _, strs, _ in arrived for x in strs) + structured).encode("utf-8", "surrogatepass")
+        parts = [(n, kind.encode("ascii"), p) for n, kind, _, payloads in arrived for p in payloads]
         if not parts:
-            return None, None
+            return t, len(t)
         u64 = lambda v: v.to_bytes(8, "big")
-        t = text.encode("utf-8", "surrogatepass")
         framed = [b"\xff", u64(len(t)), t]
         for n, kind, p in parts:
             framed += [u64(n), u64(len(kind)), kind, u64(len(p)), p]

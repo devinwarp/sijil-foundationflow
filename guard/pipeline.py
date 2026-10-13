@@ -166,9 +166,18 @@ class Pipeline:
     def result(self, call: Call, sealed: Sealed, text: str, status: str, content_types: list[str],
                source_label: str, raw: bytes | None = None, http_status: int | None = None,
                truncate: bool = True, size: int | None = None, cut: bool = False) -> Result:
-        """Seal the tool_result. output_hash and bytes commit to what arrived, before any stripping (§2.4.2).
-        `raw` replaces the text as the hash input and `size` its byte count, when the caller frames more; `cut`
-        says the caller cut or replaced part of the result for the budget, so it is recorded as truncated."""
+        """Seal the tool_result. `text` is what is scanned (invisible Unicode, exec hints); `cut` says the caller
+        cut or replaced part of the result for the budget, so it is recorded as truncated.
+
+        output_hash, one definition for both doors: sha256 of the result as it arrived from the tool, before the
+        guard strips, cuts or replaces anything (§2.4.2, §17.3.3); ext.bytes is the length of that input (`size`
+        when the caller frames it). The caller passes it as `raw`; without `raw` it is utf8(text).
+          - HTTP adapter: the response body bytes as the upstream sent them.
+          - MCP guard: utf8 of the concatenated text of the items as they arrived, so a text-only result is
+            sha256(utf8(text)) and an auditor holding the result can recompute it; with a binary payload, the
+            framing in GuardSession._raw.
+          - Nothing usable arrived (no answer, an answer over the transport cap, a result the guard cannot
+            process): the guard's own note, sealed with status error. It is the only case a note is hashed."""
         with _refusals():
             return self._result(call, sealed, text, status, content_types, source_label, raw, http_status, truncate,
                                 size, cut)

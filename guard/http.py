@@ -5,7 +5,8 @@ tool_result, and forwarded only if the rules allow it. Without the base-URL chan
 `POST /_sijil/task/start` and `/_sijil/task/end` open and close the agent's tasks under the adapter's agent
 session, so the agent can bind its model calls to the same task (the ledger's H3).
 
-The result's output_hash and bytes commit to the upstream's bytes as they arrived. The relayed body is those
+The result's output_hash and bytes commit to the upstream's bytes as they arrived (Pipeline.result has the
+definition both doors share). The relayed body is those
 bytes with invisible Unicode stripped (re-serialised JSON, or text) and never exceeds results.max_result_bytes:
 over the budget a text body is cut at a UTF-8 boundary (sealed truncated); a JSON or binary body is replaced by
 a short notice (nothing in the record marks it, ext has no key for it). The upstream status is always relayed.
@@ -341,10 +342,10 @@ class Adapter:
         media = ctype.split(";")[0].strip()
         try:
             text, parsed = scannable(data, media)
-        except RecursionError:          # nested past what can be scanned: not relayed
-            status, data, media, ctype = None, b"upstream response is not decodable", "text/plain", "text/plain"
-            text, parsed = unicode.decode(data), None
-        out, out_type = data, ctype
+            out, out_type = data, ctype
+        except RecursionError:          # nested past what can be scanned: not relayed, but hashed as it arrived
+            status, out, out_type = None, b"upstream response is not decodable", "text/plain"
+            text, parsed = unicode.decode(out), None
         if self.cfg.invisible_unicode == "strip" and unicode.flagged(text):
             if parsed is not None:
                 out = json.dumps(_strip_json(parsed)).encode()          # ASCII: nothing left to hide
@@ -359,7 +360,8 @@ class Adapter:
             out, out_type = b'{"sijil":"result withheld: over max_result_bytes"}', "application/json"
         try:
             r = await asyncio.to_thread(p.result, call, sealed, text, "ok" if status and 200 <= status < 300 else "error",
-                                        [media] if media else [], server.label, data, status, False, None, cut)
+                                        [media] if media else [], server.label, raw=data, http_status=status,
+                                        truncate=False, cut=cut)
         except (Refusal, Refused, Unreachable) as e:
             return JSONResponse({"error": "Sijil ledger unreachable or refused the result"
                                  if isinstance(e, Unreachable) else f"Sijil ledger refused the record: {getattr(e, 'detail', e)}"},
@@ -368,7 +370,7 @@ class Adapter:
         if r.blocked:
             return blocked(r.seq, r.hits)
         if status is None:
-            return JSONResponse({"error": data.decode()}, 502, headers=seq)
+            return JSONResponse({"error": out.decode()}, 502, headers=seq)
         return Response(out, status, media_type=out_type or None, headers=seq)
 
 
