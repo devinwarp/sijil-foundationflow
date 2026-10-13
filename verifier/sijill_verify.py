@@ -602,11 +602,18 @@ def approval_checks(st, rec, x, parent, task):
             raise Fail("approval_reused", "approval reused")
         d["used"] = True
     elif (t == "tool_call" and st.pack and rec["rulepack_hash"] == st.pack["hash"] and st.pack["entra"]   # V2
-          and rec["decision"] != "block" and x.get("after_the_fact") is not True
+          and rec["decision"] != "block" and not relayed_after_the_fact(st, rec, x)
           and (x.get("confirmation") == "granted" or any(confirm_hit(st.pack, h) for h in rule_hits(rec)))):
         raise Fail("approval_mismatch", "tool_call approval mismatch")      # a confirm hit let through uncited
     elif t == "task_end" and task is not None and task["pending"]:                    # V4
         raise Fail("approval_undecided", "approval undecided at task_end")
+
+
+def relayed_after_the_fact(st, rec, x):
+    """A call the Foundry relay recorded after Foundry ran it: flagged, never gated, so it cites no grant. The
+    claim counts only from the relay itself (its observer, and an agent registered with auth relay)."""
+    agent = st.agents.get(rec["agent_id"]) or {}
+    return x.get("after_the_fact") is True and x.get("observed_by") == "foundry_relay" and agent.get("auth") == "relay"
 
 
 def confirm_hit(pack, h):

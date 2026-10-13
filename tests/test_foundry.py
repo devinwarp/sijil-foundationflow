@@ -384,3 +384,20 @@ def test_the_relay_verdict_blocks_64_kb_of_letters_before_any_scan(tmp_path):
         start = time.perf_counter()
         v = foundry.verdict(n, {"seq": 1}, tool, {key: "a" * 65536}, 9)
         assert time.perf_counter() - start < 0.05 and (v.hits, v.action) == (["command-too-long"], "block")
+
+
+def test_a_confirm_rule_call_foundry_ran_unasked_is_flagged_and_verifies_with_the_rulepack(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    reply = {"id": "resp_g", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
+             "output": [{"type": "mcp_call", "id": "mcp_x", "approval_request_id": "mcpr_foreign", "server_label": "case-mcp",
+                         "name": "close_case", "arguments": CASE_ARGS, "output": "closed"}]}
+    client, s, _ = gov_node(tmp_path, pack=PACK, handler=lambda r: httpx.Response(200, json=reply), policy=FOUNDRY_POLICY)
+    with client:
+        assert portal(client, "hi").status_code == 200
+    call = rows(s.db_path, "type = 'tool_call'")[0]
+    x = json.loads(call["ext"])
+    assert (call["decision"], json.loads(call["rule_hits"]), x["after_the_fact"], x["observed_by"]) == \
+        ("flag", ["case-closure-needs-approval"], True, "foundry_relay")
+    for flags in ((), ("--rulepack", str(s.rulepack_path))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line

@@ -567,3 +567,16 @@ def test_a_grant_covers_only_the_hits_its_request_listed(tmp_path):
         return c
     assert run(chain(["case-closure-needs-approval", "budget:case-agent:tool_calls"]), tmp_path)[0] == 0
     assert run(chain(["case-closure-needs-approval"]), tmp_path) == (1, "FAIL seq=77 tool_call approval mismatch")
+
+
+def test_after_the_fact_exempts_a_confirm_hit_only_from_the_foundry_relay(tmp_path):
+    p = tmp_path / "entra-pack.yaml"
+    p.write_text(ENTRA_PACK.replace("LIMIT", "1"))
+    rp = hashlib.sha256(p.read_bytes()).hexdigest()
+    for observed_by in ("http_adapter", "foundry_relay"):          # the agent is auth key either way: not the relay
+        c = v2chain.gov(rp)
+        x = json.loads(c[77]["ext"])
+        x = {k: v for k, v in x.items() if k not in ("approval_seq", "confirmation")}
+        c[77]["ext"] = record_json({**x, "after_the_fact": True, "observed_by": observed_by})
+        c.ext(79, confirmed=0)
+        assert run(c, tmp_path, "--rulepack", str(p)) == (1, "FAIL seq=77 tool_call approval mismatch"), observed_by
