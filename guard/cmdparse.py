@@ -49,6 +49,33 @@ INSTALLERS = {"npx", "bunx", "uvx", "npm", "pnpm", "yarn", "bun", "pip", "pip3",
 ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
 ENV_REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
 URL = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"<>|;&]+")
+SCHEME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-")
+URL_STOP = frozenset(" \t\n\r\f\v'\"<>|;&")
+
+
+def urls(text: str) -> list[str]:
+    """URL.findall(text), in linear time: the regex, unanchored, rescans a run of letters from every start
+    (quadratic, holding the GIL). Each `://` is found first; its scheme is the run of scheme characters before
+    it, from its first letter, and its body runs to the next stop character."""
+    out, i = [], 0
+    while (j := text.find("://", i)) != -1:
+        s = j
+        while s > i and text[s - 1] in SCHEME_CHARS:
+            s -= 1
+        while s < j and not ("a" <= text[s].lower() <= "z"):
+            s += 1
+        if s == j:                       # no scheme: the body is not walked, so `://` repeated stays linear
+            i = j + 1
+            continue
+        k = j + 3
+        while k < len(text) and text[k] not in URL_STOP and not text[k].isspace():
+            k += 1
+        if k == j + 3:
+            i = j + 1
+            continue
+        out.append(text[s:k])
+        i = k
+    return out
 SCP_HOST = re.compile(r"[A-Za-z0-9._-]+@([A-Za-z0-9.-]+):")
 REMOTE = re.compile(r"(?:[\w.+-]+@)?(\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+):(?!//)")    # [user@]host:path of scp/rsync
 NAME_EXT = re.compile(r"[\w-]+\.[A-Za-z0-9]{1,8}")
@@ -504,7 +531,7 @@ def _operand_hosts(argv0: str, args: list[str]) -> list[str]:
 
 
 def _hosts(argv0: str, args: list[str]) -> list[str]:
-    hosts = [host_of(m) for a in args for m in URL.findall(a)]
+    hosts = [host_of(m) for a in args for m in urls(a)]
     hosts += [m.group(1).lower() for a in args for m in [SCP_HOST.match(a)] if m]
     hosts += [host_of("http://" + h) for h in _operand_hosts(argv0, args)]
     return sorted({h for h in hosts if h})

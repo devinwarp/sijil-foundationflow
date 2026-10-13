@@ -15,7 +15,7 @@ from urllib.parse import unquote
 import yaml
 
 from .canon import sha256_hex
-from .cmdparse import URL, Parsed, Roots, Segment, host_of, normalise, parse, path_like
+from .cmdparse import Parsed, Roots, Segment, host_of, normalise, parse, path_like, urls
 
 ON = ("tool_call", "tool_result", "egress", "integrity")
 ACTIONS = ("allow", "record", "confirm", "block")
@@ -50,6 +50,9 @@ PATH_SUFFIXES = ("path", "paths", "file", "files", "dir", "directory", "folder",
 # the starter pack's command_regex rules, evaluated together on benign filler at the cap, take about 40 ms; past it
 # their backtracking grows quadratically and, holding the GIL, would stall the whole guard and the ledger's relay.
 MAX_COMMAND = 2048
+# Every argument the engine looks at, serialised, is capped the same way and checked before any scan: resolving a
+# long path argument costs a stat per segment. At this size the worst benign filler takes about 40 ms in all.
+MAX_ARGS = 32768
 COMMAND_TOO_LONG = "command-too-long"
 CONTENT_ARGS = {"content", "contents", "text", "body", "data", "message", "old_string", "new_string", "new_source"}
 
@@ -271,16 +274,22 @@ def call_facts(tool: str, bare: str, args: dict, roots: Roots, harness: str, com
     """Facts for a tool_call. A shell tool carries its command in `command_arg` (or cmd, script, commandLine);
     every tool's path-like arguments are paths too, written when the tool is a write tool. Over-seeing a path
     is acceptable, missing one is not."""
+    try:                                       # first, before any parse or scan of what the call carries
+        size = len(json.dumps(args, ensure_ascii=False, default=str))
+    except (ValueError, TypeError, RecursionError):
+        size = MAX_ARGS + 1
+    if size > MAX_ARGS:
+        return Facts("tool_call", tool, harness, args=args, too_long=True, **context), None
     names = ([command_arg] if command_arg else []) + (list(COMMAND_ARGS) if bare in SHELL_TOOLS else [])
     command = _as_text(next((args[n] for n in names if args.get(n) is not None), None))
+    if command is not None and len(command) > MAX_COMMAND:
+        return Facts("tool_call", tool, harness, command, args=args, too_long=True, **context), None
     paths = [n for p in _path_args(args) for n in normalise(p, roots)]
     write = bare in WRITE_TOOLS
-    hosts = sorted({h for v in args.values() if isinstance(v, str) for m in URL.findall(v) if (h := host_of(m))})
+    hosts = sorted({h for v in args.values() if isinstance(v, str) for m in urls(v) if (h := host_of(m))})
     seg = Segment(argv0="", args=[], reads=[] if write else paths, writes=paths if write else [], hosts=hosts)
     if command is None:
         return Facts("tool_call", tool, harness, None, [seg], [], args, hosts, **context), None
-    if len(command) > MAX_COMMAND:
-        return Facts("tool_call", tool, harness, command, [seg], [], args, hosts, too_long=True, **context), None
     parsed = parse(command, roots)
     hosts = sorted(set(hosts) | {h for s in parsed.segments for h in s.hosts})
     segments = parsed.segments + ([seg] if paths else [])

@@ -368,3 +368,19 @@ def test_the_gate_stops_waiting_when_no_decision_comes(tmp_path, monkeypatch):
     assert (call["decision"], x["confirmation"], "approval_seq" in x) == ("block", "unavailable", False)
     for flags in ((), ("--rulepack", str(s.rulepack_path))):
         assert verify(s.db_path, s.pubkey_path, *flags)[0] == 0
+
+
+def test_the_relay_verdict_blocks_64_kb_of_letters_before_any_scan(tmp_path):
+    from types import SimpleNamespace
+
+    from conftest import ROOT
+    from guard import rules
+    from sijill import foundry
+    path = str(ROOT / "rulepacks" / "starter.yaml")
+    n = SimpleNamespace(rulepack=SimpleNamespace(path=path, hash=rules.load(path).hash),
+                        store=SimpleNamespace(in_task=lambda seq: []))
+    foundry.verdict(n, {"seq": 1}, "mcp:srv:any_tool", {}, 9)           # loads the pack outside the timing
+    for tool, key in (("mcp:shell:run_command", "command"), ("mcp:srv:any_tool", "note")):
+        start = time.perf_counter()
+        v = foundry.verdict(n, {"seq": 1}, tool, {key: "a" * 65536}, 9)
+        assert time.perf_counter() - start < 0.05 and (v.hits, v.action) == (["command-too-long"], "block")

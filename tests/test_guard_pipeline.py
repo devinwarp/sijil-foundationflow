@@ -304,3 +304,16 @@ def test_a_command_over_the_cap_is_sealed_blocked_and_the_chain_passes(g, monkey
     assert (rec["decision"], rec["mode"], json.loads(rec["rule_hits"])) == ("block", "enforce", ["command-too-long"])
     assert verify(s.db_path, s.pubkey_path)[0] == 0
     assert verify(s.db_path, s.pubkey_path, "--rulepack", f"{tmp_path}/starter.yaml")[0] == 0
+
+
+def test_64_kb_of_letters_in_any_argument_is_sealed_blocked_and_the_chain_passes(g, monkeypatch, tmp_path):
+    client, s, cfg, state, p = g
+    big = {"note": "a" * 65536}
+    monkeypatch.setitem(REQUESTS, "note", ("add_note", big))
+    ask(client, state, "add the note")
+    with pytest.raises(Refusal, match="Blocked by Sijil rule command-too-long") as e:
+        p.check(call("notes", "add_note", big))
+    rec = rows(s.db_path, f"seq = {e.value.seq}")[0]
+    assert (rec["decision"], rec["mode"], json.loads(rec["rule_hits"])) == ("block", "enforce", ["command-too-long"])
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+    assert verify(s.db_path, s.pubkey_path, "--rulepack", f"{tmp_path}/starter.yaml")[0] == 0

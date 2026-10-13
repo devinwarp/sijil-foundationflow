@@ -471,3 +471,48 @@ def test_the_whole_pack_evaluates_a_command_at_the_cap_in_well_under_100_ms(env,
     start = time.perf_counter()
     rules.evaluate(pack, facts, pins)
     assert time.perf_counter() - start < 0.1      # measured about 40 ms worst; the margin absorbs slow CI
+
+
+ARG_FILLER = ("a", " ", ";", "&", "|", "/", ":", "a/", "a b")          # benign filler only
+
+
+@pytest.mark.parametrize("tool,key", [("Bash", "command"), ("mcp:srv:any_tool", "note"), ("mcp:srv:any_tool", "path")])
+def test_64_kb_of_letters_in_any_argument_is_blocked_before_any_scan(env, tool, key):
+    import time
+    pack, pins, roots = env
+    start = time.perf_counter()
+    facts, parsed = rules.call_facts(tool, tool.rsplit(":", 1)[-1], {key: "a" * 65536}, roots, "x")
+    v = rules.evaluate(pack, facts, pins)
+    assert time.perf_counter() - start < 0.05 and parsed is None
+    assert (v.hits, v.action) == ([rules.COMMAND_TOO_LONG], "block")
+    nested = call(env, "mcp:srv:any_tool", {"a": {"b": ["a" * 40000]}})              # nested values count too
+    assert (nested.hits, nested.action) == ([rules.COMMAND_TOO_LONG], "block")
+
+
+@pytest.mark.parametrize("unit", ARG_FILLER)
+def test_arguments_just_under_the_cap_are_evaluated_in_under_100_ms(env, unit):
+    import json
+    import time
+    pack, pins, roots = env
+    for key in ("note", "path"):
+        args = {key: _fill(unit, rules.MAX_ARGS - 20)}
+        assert len(json.dumps(args)) <= rules.MAX_ARGS
+        start = time.perf_counter()
+        facts, _ = rules.call_facts("mcp:srv:any_tool", "any_tool", args, roots, "x")
+        v = rules.evaluate(pack, facts, pins)
+        assert time.perf_counter() - start < 0.1 and rules.COMMAND_TOO_LONG not in v.hits
+
+
+def test_the_url_scan_is_the_regex_in_linear_time():
+    import random
+    import time
+    from guard.cmdparse import URL, urls
+    rnd = random.Random(7)
+    alphabet = "ab1+.-:/ \t;&|'\"<>xhttps_=@"
+    for _ in range(20000):
+        t = "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 30)))
+        assert urls(t) == URL.findall(t), t
+    for unit in ("a", "://", "a://", "a/", ":"):
+        start = time.perf_counter()
+        urls(_fill(unit, 1 << 18))
+        assert time.perf_counter() - start < 0.05, unit
