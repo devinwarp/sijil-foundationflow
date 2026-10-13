@@ -25,6 +25,7 @@ from guard.pipeline import exec_hints
 from . import agents, approvals, budgets, chat, oidc, policy, record
 
 API = "foundry_responses"
+ALLOWED = ("agent", "conversation", "input", "previous_response_id", "metadata")   # the client fields forwarded
 ROUNDS = 8                                   # approval round trips per user turn
 ROOTS = Roots("/", "/", "/")                 # a relay has no workspace: path rules see absolute paths only
 
@@ -103,7 +104,7 @@ def in_task(n, task: dict, type_: str, **fields) -> dict:
                   **fields)
 
 
-async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict):
+async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict, gated=()):
     """One Responses round trip, sealed as one inference (§17.4.3). Returns (record, response) or a refusal."""
     pol, token = n.policy, os.environ.get(cfg.token_env, "")
     if not token:
@@ -142,7 +143,7 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict)
     except (httpx.HTTPError, ValueError):
         status, data = 502, None
     if not isinstance(data, dict) or not isinstance(data.get("output"), list):
-        return refused(await seal_in(n, task, settled(failed)), 502 if status == 200 else status, "upstream_error"), None
+        return refused(await seal_in(n, task, settled(failed)), 502, "upstream_error"), None
     model = data["model"] if isinstance(data.get("model"), str) and chat.MODEL.fullmatch(data["model"]) \
         else cfg.agent_name
     digest = f"api:azure-foundry:{model}"
@@ -154,7 +155,7 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict)
         if kind == "function_call":              # executed by the portal; its call_id is what it sends back
             uses.append(chat.tool_use(i.get("call_id"), i.get("name"), i.get("arguments", "")))
         elif kind == "mcp_approval_request" or (kind.endswith("_call") and kind != "mcp_call") or \
-                (kind == "mcp_call" and not i.get("approval_request_id")):
+                (kind == "mcp_call" and i.get("approval_request_id") not in gated):
             # a gated request, or a call Foundry ran without asking: the parent of its tool_call (Ruling)
             tool, _, qualified, _, args = tool_of(i)
             uses.append({"id": str(i.get("id", "")), "name": qualified.split(":", 1)[1] if kind.startswith("mcp")
@@ -182,7 +183,7 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict)
     return rec, data
 
 
-async def gate(n, task: dict, inference: dict, item: dict, conv_hash: str) -> tuple[int, bool]:
+async def gate(n, task: dict, inference: dict, item: dict, conv_hash: str, deny: bool = False) -> tuple[int, bool]:
     """An mcp_approval_request: the model's tool request, evaluated as a tool_call before Foundry runs it
     (§17.4.2). Returns (tool_call seq, approve)."""
     tool, server, qualified, _, args = tool_of(item)
@@ -190,6 +191,8 @@ async def gate(n, task: dict, inference: dict, item: dict, conv_hash: str) -> tu
     v = verdict(n, task, qualified, args, inference["seq"])
     _, over, on_exceed = budgets.evaluate(n.rulepack, n.store, task, "tool_call", qualified)
     action = max([v.action, *([on_exceed] if over else [])], key=guard_rules.ACTIONS.index)
+    if deny:                                       # the round limit: nothing more is relayed, so nothing is granted
+        action = "block"
     confirmation, decided = None, {}
     if action == "confirm":
         try:
@@ -257,6 +260,10 @@ async def result(n, task: dict, call_seq: int, item: dict, qualified: str, tool:
                                    output_hash=record.sha256_hex(text.encode("utf-8", "surrogatepass")), ext=cj(ext)))
 
 
+class _Started(Exception):
+    """The conversation's task was started meanwhile by a concurrent first request."""
+
+
 def router() -> APIRouter:
     r = APIRouter()
 
@@ -274,6 +281,16 @@ def router() -> APIRouter:
         conv = conv.get("id") if isinstance(conv, dict) else conv
         if not isinstance(conv, str) or not conv or "input" not in payload:
             raise HTTPException(400, "the body needs input and conversation: one task per Foundry conversation")
+        agent = payload.get("agent")
+        refused = [k for k in payload if k not in ALLOWED]
+        if agent is not None and (agent.get("name") if isinstance(agent, dict) else agent) != cfg.agent_name:
+            refused.append("agent")
+        given = payload["input"]
+        if any(isinstance(i, dict) and str(i.get("type", "")).startswith("mcp_approval") for i in
+               (given if isinstance(given, list) else [])):
+            refused.append("input: mcp_approval items")
+        if refused:
+            raise HTTPException(400, f"not accepted by the relay (only the ledger's gate answers approvals): {refused}")
         conv_hash = record.sha256_hex(conv.encode())
         sid = "fr_" + conv_hash[:32]                 # the relay's agent session for this conversation (not evidence)
         sess = n.store.session(sid)
@@ -292,7 +309,7 @@ def router() -> APIRouter:
                                       ext=cj({"principal_error": e.code})))
             return JSONResponse(status_code=e.status, headers={"X-Sijill-Seq": str(rec["seq"])}, content={
                 "error": {"type": "principal_refused", "code": hit}, "sijill": {"seq": rec["seq"], "rule_hits": [hit]}})
-        if sess is None:
+        if n.store.session(sid) is None:             # re-read: a concurrent first request may have created it
             n.store.add_session({"agent_session": sid, "agent_id": cfg.agent_id, "principal": human["principal"],
                                  "agent_auth": "relay", "principal_auth": "oidc", "remote_addr": "foundry-relay",
                                  "expires_at": oidc.ts_at(agents.clock() + n.policy.agents.session_ttl_s), "jti": ""})
@@ -302,13 +319,22 @@ def router() -> APIRouter:
                  "agent_session": sid, "principal_claims": human["claims"]}
 
             def start() -> dict:
+                if n.store.open_tasks(sid):
+                    raise _Started
                 n.agents.active(cfg.agent_id)
                 return n.body(n.policy, "task_start", agent_id=cfg.agent_id, principal=human["principal"],
                               input_hash=conv_hash, ext=cj(x))
-            task = await n.seal(start)
-        req, gated, data, rec = dict(payload), {}, None, None
-        for _ in range(ROUNDS):
-            rec, data = await round_trip(n, cfg, task, req, conv_hash, human)
+            try:
+                task = await n.seal(start)
+            except _Started:
+                task = n.store.open_tasks(sid)[0]
+        if task["principal"] != human["principal"]:
+            raise HTTPException(403, "this conversation belongs to another principal")
+        req, gated, data, rec = {k: v for k, v in payload.items() if k != "agent"}, {}, None, None
+        req["agent"] = {"name": cfg.agent_name, "type": "agent_reference"}
+        for turn in range(ROUNDS):
+            last = turn == ROUNDS - 1
+            rec, data = await round_trip(n, cfg, task, req, conv_hash, human, gated)
             if data is None:
                 return rec
             answers = []
@@ -318,7 +344,7 @@ def router() -> APIRouter:
                     tool, server, qualified, label, _ = tool_of(item)
                     await result(n, task, gated.pop(item["approval_request_id"]), item, qualified, tool, server, label)
                 elif kind == "mcp_approval_request":
-                    seq, approve = await gate(n, task, rec, item, conv_hash)
+                    seq, approve = await gate(n, task, rec, item, conv_hash, deny=last)
                     gated[item.get("id")] = seq
                     answers.append({"type": "mcp_approval_response", "approve": approve,
                                     "approval_request_id": item.get("id")})
@@ -326,7 +352,11 @@ def router() -> APIRouter:
                     await after_the_fact(n, task, rec, item, conv_hash)
             if not answers:
                 break
-            req = {**{k: v for k, v in payload.items() if k not in ("input", "conversation")},
+            if last:                                 # the denials are sealed; Foundry's pending requests are never relayed
+                return JSONResponse(status_code=502, headers={"X-Sijill-Seq": str(rec["seq"])}, content={
+                    "error": {"type": "round_limit", "message": "Refused by Sijil: too many approval round trips"},
+                    "sijill": {"seq": rec["seq"]}})
+            req = {**{k: v for k, v in req.items() if k not in ("input", "conversation")},
                    "previous_response_id": data.get("id"), "input": answers}
         return JSONResponse(content=data, headers={"X-Sijill-Seq": str(rec["seq"])})
 

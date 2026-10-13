@@ -1,6 +1,7 @@
 """Row 42: the Azure AI Foundry Responses relay (spec §17.4). The transcript below is synthetic, shaped like the
 OpenAI Responses API that Foundry serves; it stands in for the pilot-tenant capture §17.8 asks for."""
 
+import asyncio
 import json
 import threading
 import time
@@ -201,7 +202,7 @@ def test_relay_inferences_are_priced_and_the_chain_verifies_with_the_rulepack(tm
     with client:
         assert portal(client).status_code == 200
         state["fail"] = True
-        assert portal(client, "again").status_code == 500
+        assert portal(client, "again").status_code == 502
     first, second, failed = (json.loads(r["ext"]) for r in rows(s.db_path, "type = 'inference'"))
     assert (first["price_rule"], first["cost_micro"], first["usage"]) == ("foundry-gpt", 980, {"input_tokens": 900, "output_tokens": 40})
     assert (second["price_rule"], second["cost_micro"], "usage" in second) == ("foundry-gpt", 777, False)
@@ -230,3 +231,91 @@ def test_a_refused_approval_at_the_gate_is_denied_and_the_chain_verifies(relay):
     for flags in ((), ("--rulepack", str(s.rulepack_path))):
         code, line = verify(s.db_path, s.pubkey_path, *flags)
         assert code == 0, line
+
+
+@pytest.mark.parametrize("extra", [
+    {"tools": [{"type": "mcp", "server_label": "x", "require_approval": "never"}]},
+    {"agent": {"name": "other-agent", "type": "agent_reference"}},
+    {"model": "gpt-5"},
+    {"input": [{"type": "mcp_approval_response", "approve": True, "approval_request_id": "mcpr_02"}]},
+    {"previous_response_id": "resp_01", "input": [{"type": "mcp_approval_response", "approve": True,
+                                                   "approval_request_id": "mcpr_02"}]}])
+def test_the_client_cannot_add_tools_pick_an_agent_or_answer_approvals(relay, extra):
+    client, s, foundry = relay
+    body = {"agent": {"name": "case-agent", "type": "agent_reference"}, "conversation": "conv_abc", "input": "hi", **extra}
+    r = client.post("/v1/responses", headers={"X-Sijill-Principal-Token": officer()}, json=body)
+    assert r.status_code == 400 and foundry.seen == []
+    assert rows(s.db_path, "type = 'task_start'") == []
+
+
+def test_the_round_limit_denies_what_is_pending_and_never_relays_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    calls = []
+
+    def endless(request):
+        calls.append(1)
+        return httpx.Response(200, json={"id": f"resp_{len(calls)}", "object": "response", "model": "gpt-4.1-2025-04-14",
+                                         "status": "completed", "output": [
+                                             {"type": "mcp_approval_request", "id": f"mcpr_{len(calls)}",
+                                              "server_label": "case-mcp", "name": "get_case", "arguments": CASE_ARGS}]})
+    client, s, _ = gov_node(tmp_path, pack=PACK, handler=endless, policy=FOUNDRY_POLICY)
+    with client:
+        r = portal(client)
+    assert r.status_code == 502 and r.json()["error"]["type"] == "round_limit" and "mcpr_8" not in r.text
+    assert len(calls) == 8
+    last = rows(s.db_path, "type = 'tool_call'")[-1]
+    assert (json.loads(last["ext"])["foundry_item_id"], last["decision"]) == ("mcpr_8", "block")
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_a_function_call_is_correlated_by_its_call_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    reply = {"id": "resp_f", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
+             "output": [{"type": "function_call", "id": "fc_item", "call_id": "call_xyz", "name": "lookup",
+                         "arguments": "{}"}]}
+    client, s, _ = gov_node(tmp_path, pack=PACK, handler=lambda r: httpx.Response(200, json=reply), policy=FOUNDRY_POLICY)
+    with client:
+        assert portal(client).status_code == 200
+    assert [u["id"] for u in json.loads(rows(s.db_path, "type = 'inference'")[0]["ext"])["tool_uses"]] == ["call_xyz"]
+
+
+def test_a_foreign_approved_call_is_recorded_after_the_fact_and_listed(tmp_path, monkeypatch):
+    """A client previous_response_id can bring an mcp_call whose approval was never gated here."""
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    reply = {"id": "resp_g", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
+             "output": [{"type": "mcp_call", "id": "mcp_x", "approval_request_id": "mcpr_foreign", "server_label": "case-mcp",
+                         "name": "get_case", "arguments": CASE_ARGS, "output": "ok"}]}
+    client, s, _ = gov_node(tmp_path, pack=PACK, handler=lambda r: httpx.Response(200, json=reply), policy=FOUNDRY_POLICY)
+    with client:
+        r = portal(client, "hi")
+        assert r.status_code == 200, r.text
+    call = rows(s.db_path, "type = 'tool_call'")[0]
+    assert json.loads(call["ext"])["after_the_fact"] is True
+    for flags in ((), ("--rulepack", str(s.rulepack_path))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
+
+
+def test_an_upstream_auth_failure_is_a_502_not_the_users_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "expired")
+    client, s, _ = gov_node(tmp_path, pack=PACK, handler=lambda r: httpx.Response(401, json={}), policy=FOUNDRY_POLICY)
+    with client:
+        assert portal(client).status_code == 502
+
+
+def test_concurrent_first_requests_make_one_session_and_one_task(relay, monkeypatch):
+    from sijill import proxy
+    client, s, foundry = relay
+    human = proxy.Node.human
+
+    async def slow(self, *a, **k):               # both requests are past the session check before either writes
+        await asyncio.sleep(0.2)
+        return await human(self, *a, **k)
+    monkeypatch.setattr(proxy.Node, "human", slow)
+    out = []
+    workers = [threading.Thread(target=lambda: out.append(portal(client, "hello"))) for _ in range(6)]
+    [w.start() for w in workers]
+    [w.join(20) for w in workers]
+    assert sorted(r.status_code for r in out) == [200] * 6
+    assert len(rows(s.db_path, "type = 'task_start'")) == 1
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
