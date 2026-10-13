@@ -64,6 +64,11 @@ HUMAN = re.compile(r"human:([a-z0-9-]{1,32}):([0-9a-f]{64})")
 CLAIMS_REQ = ("issuer_id", "profile", "validation", "iss", "aud", "tenant", "assurance", "assurance_rule",
               "delegated", "token_hash")
 CLAIMS_JWT = ("kid", "alg", "jwks_hash", "nbf", "exp")
+HEX64 = re.compile(r"[0-9a-f]{64}")
+SEALED_TS = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z")           # the form record.now_ts() / oidc.ts_at() write
+SKEW_MS = 60_000                      # the ledger's oidc.SKEW_S (60 s): it accepts a token whose nbf is that far ahead
+REFUSAL_CODES = re.compile(r"missing|malformed|alg|issuer|kid|signature|audience|tenant|not_delegated|expired"
+                           r"|not_yet_valid|jwks_stale|userinfo_unreachable|userinfo_[0-9]+|assurance|task_principal")
 PRINCIPAL_KINDS = {"human": "human", "oidc": "workload", "local": "local", "email": "local"}   # Ruling: email is local
 
 BANNER_FONT = {
@@ -363,11 +368,32 @@ def start_task(st, rec, x):
                      "counts": dict.fromkeys(TASK_COUNTS, 0), "last_seq": seq, "claims": x.get("principal_claims")}
 
 
+def ms_of(t):
+    """Epoch milliseconds of a sealed timestamp, None when it is not in the sealed form."""
+    if not isinstance(t, str) or not SEALED_TS.fullmatch(t):
+        return None
+    try:
+        return int(datetime.strptime(t[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()) * 1000 \
+            + int(t[20:23])
+    except ValueError:
+        return None
+
+
 def claims_ok(c):
-    """U: every §17.2.5 key, the jwt keys when validation is jwt, enums in range."""
-    return (isinstance(c, dict) and all(k in c for k in CLAIMS_REQ)
-            and c["profile"] in ("entra", "uaepass", "oidc") and c["validation"] in ("jwt", "userinfo")
-            and c["assurance"] in ASSURANCE and (c["validation"] != "jwt" or all(k in c for k in CLAIMS_JWT)))
+    """U: every §17.2.5 key, the jwt keys when validation is jwt, enums in range, value types as sealed."""
+    if not (isinstance(c, dict) and all(k in c for k in CLAIMS_REQ)):
+        return False
+    if not (c["profile"] in ("entra", "uaepass", "oidc") and c["validation"] in ("jwt", "userinfo")
+            and c["assurance"] in ASSURANCE):
+        return False
+    if not (all(isinstance(c[k], str) for k in ("issuer_id", "iss", "aud", "tenant")) and isinstance(c["delegated"], bool)
+            and isinstance(c["token_hash"], str) and HEX64.fullmatch(c["token_hash"])):
+        return False
+    if c["validation"] != "jwt":
+        return True
+    return (all(k in c for k in CLAIMS_JWT) and isinstance(c["kid"], str) and isinstance(c["alg"], str)
+            and isinstance(c["jwks_hash"], str) and bool(HEX64.fullmatch(c["jwks_hash"]))
+            and ms_of(c["nbf"]) is not None and ms_of(c["exp"]) is not None)
 
 
 def principal_checks(st, rec, x, task):
@@ -375,7 +401,10 @@ def principal_checks(st, rec, x, task):
     the customer-kept token when --token-dir is given, and the assurance floor."""
     principal, claims = rec["principal"], x.get("principal_claims")
     human = HUMAN.fullmatch(principal)
-    refusal = "principal_error" in x                    # Ruling: a sealed refusal carries no claims (§17.2.7)
+    # Ruling: only a sealed refusal (§17.2.7: a blocked inference outside any task, with a known code and no
+    # claims) skips the claims requirement and the lifetime check.
+    refusal = (rec["type"] == "inference" and rec["decision"] == "block" and task is None and claims is None
+               and isinstance(x.get("principal_error"), str) and bool(REFUSAL_CODES.fullmatch(x["principal_error"])))
     if claims is not None and not claims_ok(claims):
         raise Fail("principal_claims_malformed", "principal claims malformed")
     if human and claims is None and not refusal and (rec["type"] == "task_start" or task is None):
@@ -390,7 +419,8 @@ def principal_checks(st, rec, x, task):
         task["claims"] = claims
     in_force = claims if claims is not None else (task or {}).get("claims")
     if in_force is not None and in_force["validation"] == "jwt" and not refusal:      # U1, lifetime
-        if not in_force["nbf"] <= rec["ts"] < in_force["exp"]:
+        ts = ms_of(rec["ts"])
+        if ts is None or not ms_of(in_force["nbf"]) <= ts + SKEW_MS or not ts < ms_of(in_force["exp"]):
             raise Fail("principal_token_not_valid", "principal token not valid at ts")
     if claims is not None:
         token_check(st, principal, claims)                                            # U2
@@ -409,13 +439,21 @@ def ts_of(epoch):
 
 def jws_valid(token, kid, alg, jwks):
     """The compact JWS verifies under the JWKS key named kid, with alg EdDSA or RS256."""
-    head, body, sig = token.split(".")
-    key = next((k for k in jwks.get("keys", []) if isinstance(k, dict) and k.get("kid") == kid), None)
+    parts = token.split(".")
+    keys = jwks.get("keys") if isinstance(jwks, dict) else None
+    if len(parts) != 3 or not isinstance(keys, list):
+        return False
+    head, body, sig = parts
+    key = next((k for k in keys if isinstance(k, dict) and k.get("kid") == kid), None)
+    if key and (key.get("use", "sig") != "sig" or key.get("alg", alg) != alg):
+        return False
     try:
-        if alg == "EdDSA" and key and key.get("kty") == "OKP":
+        if alg == "EdDSA" and key and key.get("kty") == "OKP" and key.get("crv") == "Ed25519":
             ed25519.Ed25519PublicKey.from_public_bytes(b64d(key["x"])).verify(b64d(sig), f"{head}.{body}".encode())
         elif alg == "RS256" and key and key.get("kty") == "RSA":
             n, e = (int.from_bytes(b64d(key[k]), "big") for k in ("n", "e"))
+            if n.bit_length() < 2048:
+                return False
             rsa.RSAPublicNumbers(e, n).public_key().verify(b64d(sig), f"{head}.{body}".encode(),
                                                             padding.PKCS1v15(), hashes.SHA256())
         else:
@@ -444,7 +482,9 @@ def token_check(st, principal, c):
         token = raw.decode()
         head, payload = (json.loads(b64d(p)) for p in token.split(".")[:2])
         jwks = json.loads(jwks_raw)
-    except (OSError, ValueError, UnicodeDecodeError):
+        if not (isinstance(head, dict) and isinstance(payload, dict) and isinstance(jwks, dict)):
+            raise mismatch
+    except (OSError, ValueError):                       # UnicodeDecodeError and binascii.Error are ValueErrors
         raise mismatch
     if (sha256(raw).hexdigest() != c["token_hash"] or sha256(jwks_raw).hexdigest() != c["jwks_hash"]
             or head.get("kid") != c["kid"] or head.get("alg") != c["alg"]
