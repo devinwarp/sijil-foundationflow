@@ -6,6 +6,7 @@ they would be a content channel the ledger never sees.
 """
 
 import asyncio
+import ipaddress
 import json
 import os
 import uuid
@@ -19,6 +20,26 @@ from .pipeline import Call, Pipeline, Refusal
 from .rules import NOT_ALLOWLISTED
 
 ELICIT_SCHEMA = {"type": "object", "properties": {"allow": {"type": "boolean"}}, "required": ["allow"]}
+
+
+CODES = {-32700, -32600, -32601, -32602, -32603}
+
+
+def _loopback(host: str) -> bool:
+    """An allowlist: localhost and 127.0.0.0/8 and ::1. An empty host binds every interface."""
+    host = host.strip("[]")
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _code(code) -> int:
+    """A wrapped server's error code is relayed only when it is a JSON-RPC standard or server-error code."""
+    ok = type(code) is int and (code in CODES or -32099 <= code <= -32000)
+    return code if ok else mcp.INTERNAL
 
 
 def _ledger_error(e: Exception) -> "mcp.RpcError":
@@ -38,6 +59,8 @@ class Guard:
     async def start(self) -> None:
         s = self.server
         if s.transport == "stdio":
+            if os.path.realpath(s.command) != s.real:      # retargeted since the config was checked
+                raise ValueError(f"server {s.name}: {s.command} no longer resolves to {s.real}")
             self.upstream = mcp.StdioUpstream(s.command, list(s.args), s.env, self.upstream_note)
         else:
             self.upstream = mcp.HttpUpstream(s.url, s.headers, self.upstream_note)
@@ -124,9 +147,13 @@ class GuardSession(mcp.Session):
                 "_meta": {"sijil": {"agent_session": state.agent_session, "task_seq": self.task_seq}}}
 
     async def tools_list(self, params: dict) -> dict:
-        result = await self.guard.upstream.request("tools/list", params or None)
+        try:
+            result = await self.guard.upstream.request("tools/list", params or None)
+        except mcp.RpcError as e:      # its message and data are not relayed
+            raise mcp.RpcError(_code(e.code), "wrapped server failed tools/list")
         tools = [t for t in result.get("tools", []) if isinstance(t, dict) and self.guard.server.allowed(t.get("name", ""))]
-        return {**result, "tools": tools}
+        cursor = result.get("nextCursor")
+        return {"tools": tools, **({"nextCursor": cursor} if isinstance(cursor, str) else {})}
 
     def _confirm(self, rule) -> str:
         """Elicitation for a confirm rule (spec §5.7); runs on the pipeline's worker thread."""
@@ -179,16 +206,15 @@ class GuardSession(mcp.Session):
             raise mcp.RpcError(mcp.SIJIL, f"Result withheld by Sijil rule {', '.join(r.hits) or 'halted'}; seq={r.seq}",
                                {"sijil": {"seq": r.seq, "rule_hits": r.hits}})
         if failed:      # message only, as sealed (stripped, truncated); the server's `data` is not relayed
-            raise mcp.RpcError(failed.code, r.text)
+            raise mcp.RpcError(_code(failed.code), r.text)
         if r.text != text:
             content = self._rewrite(content)
-        result = {k: v for k, v in result.items() if k != "structuredContent"}
-        if structured is not None:
-            clean = self._clean(structured)
-            if clean is not None:
-                result["structuredContent"] = clean
-        return {**result, "content": content,
-                "_meta": {**(result.get("_meta") or {}), "sijil": {"seq": r.seq, "parent_seq": sealed.seq}}}
+        out = {"content": content}      # only these keys reach the harness; upstream _meta and the rest are dropped
+        if structured is not None and (clean := self._clean(structured)) is not None:
+            out["structuredContent"] = clean
+        if result.get("isError") is True:
+            out["isError"] = True
+        return {**out, "_meta": {"sijil": {"seq": r.seq, "parent_seq": sealed.seq}}}
 
     def _clean(self, value):
         """structuredContent after the same treatment as the text: stripped, or dropped when over the budget."""
@@ -247,9 +273,11 @@ async def run(cfg: Config, server_name: str, ledger: Ledger, http_listen: str = 
     server = next((s for s in cfg.servers if s.name == server_name), None)
     if server is None:
         raise ValueError(f"no server named {server_name!r} in {cfg.path}")
+    if http_listen and ":" not in http_listen:
+        raise ValueError(f"--http {http_listen}: expected HOST:PORT")
     host, port = http_listen.rsplit(":", 1) if http_listen else ("", "")
     tls = {}
-    if host.strip("[]") not in ("", "127.0.0.1", "::1", "localhost"):
+    if http_listen and not _loopback(host):
         if not (cfg.tls_cert and cfg.tls_key and cfg.tools_token):
             raise ValueError(f"--http {http_listen} is off loopback: mcp.tls_cert, mcp.tls_key and "
                              "mcp.tools_token_env are required")

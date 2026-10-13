@@ -52,7 +52,7 @@ def call(name: str, args: dict, ask=None, notify=None) -> dict:
     if name == "big":
         return text("x" * 300_000)
     if name == "structured":      # hidden from tools/list: a structuredContent carrying an invisible character
-        return {**text("ok"), "structuredContent": {"v": "a\u200bb"}}
+        return {**text("ok"), "structuredContent": {"v": "a\u200bb"}, "_meta": {"evil": "x"}, "extra": 1}
     if name == "fail":
         return text("boom", error=True)
     if name == "changed":
@@ -76,7 +76,7 @@ def handle(msg: dict, ask=None, notify=None) -> dict | None:
         elif m == "tools/list":
             result = {"tools": tool_list()}
         elif m == "tools/call" and p.get("name") == "rpcfail":     # hidden: an error whose message carries one
-            return {"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32050, "message": "bad\u200bmsg",
+            return {"jsonrpc": "2.0", "id": msg["id"], "error": {"code": (p.get("arguments") or {}).get("code", -32050), "message": "bad\u200bmsg",
                                                                  "data": {"x": "\u200b"}}}
         elif m == "tools/call":
             result = call(p["name"], p.get("arguments") or {}, ask, notify)

@@ -38,6 +38,7 @@ class Server:
     allow: tuple                  # tools.allow / tools.deny globs on the bare tool name
     deny: tuple
     command_arg: str              # the argument that carries a shell command (spec §8.1)
+    real: str = ""                # realpath of `command` when it was checked; re-checked before every launch
 
     def allowed(self, tool: str) -> bool:
         """Allow wins over deny; with no lists every tool is allowed (spec §5.2)."""
@@ -55,8 +56,8 @@ def _env(value: str) -> str:
     return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", sub, str(value))
 
 
-def _command_ok(command: str, repo: str, dirs) -> str:
-    """The command as found on PATH, refused when its real path (symlinks resolved) is outside the repo and
+def _command_ok(command: str, repo: str, dirs) -> tuple[str, str]:
+    """(the command as found on PATH, its realpath), refused when its real path (symlinks resolved) is outside the repo and
     allowed_command_dirs: a config written into ~/.kiro cannot make the guard launch from there."""
     found = shutil.which(command)
     if not found:
@@ -64,7 +65,7 @@ def _command_ok(command: str, repo: str, dirs) -> str:
     real = os.path.realpath(found)
     roots = [repo, *(os.path.expanduser(d) if d.startswith(("/", "~")) else os.path.join(repo, d) for d in dirs)]
     if any(fnmatch.fnmatchcase(os.path.dirname(real), r) or real.startswith(r.rstrip("/") + "/") for r in roots):
-        return real
+        return found, real
     raise ValueError(f"server command {real} is outside the repo and allowed_command_dirs")
 
 
@@ -88,8 +89,8 @@ def _server(d: dict, repo: str, dirs) -> Server:
         raise ValueError(f"server {name}: args must be a list")
     if transport == "stdio" and not d.get("command") or transport == "http" and not d.get("url"):
         raise ValueError(f"server {name}: stdio needs command, http needs url")
-    return Server(name=name, transport=transport,
-                  command=_command_ok(d["command"], repo, dirs) if transport == "stdio" else "",
+    command, real = _command_ok(d["command"], repo, dirs) if transport == "stdio" else ("", "")
+    return Server(name=name, transport=transport, command=command, real=real,
                   args=tuple(str(a) for a in d.get("args") or ()),
                   env={k: _env(v) for k, v in (d.get("env") or {}).items()}, url=d.get("url", ""),
                   headers={k: _env(v) for k, v in (d.get("headers") or {}).items()},
