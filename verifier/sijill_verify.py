@@ -10,7 +10,7 @@ from the `sijill/` package: the thing that checks the records is not the thing t
 
     python verifier/sijill_verify.py --db sijill.db --pubkey node.pub [--json]
         [--allow-orphan-tool-calls] [--allow-unauthenticated-agents]
-        [--token-dir DIR] [--jwks-dir DIR] [--min-principal-assurance low|substantial|high]
+        [--token-dir DIR] [--jwks-dir DIR] [--min-principal-assurance low|substantial|high] [--rulepack FILE]
 
 Prints exactly one result line, `PASS records=N first=<ts> last=<ts> attestation=... agent_auth=...`
 or `FAIL seq=N <reason>`; with --json, one JSON object instead. When stdout is a terminal the line
@@ -19,6 +19,7 @@ is preceded by a large banner for projector display (disable with --plain). Exit
 
 import argparse
 import base64
+import fnmatch
 import json
 import os
 import re
@@ -70,6 +71,11 @@ SKEW_MS = 60_000                      # the ledger's oidc.SKEW_S (60 s): it acce
 REFUSAL_CODES = re.compile(r"missing|malformed|alg|issuer|kid|signature|audience|tenant|not_delegated|expired"
                            r"|not_yet_valid|jwks_stale|userinfo_unreachable|userinfo_[0-9]+|assurance|task_principal")
 PRINCIPAL_KINDS = {"human": "human", "oidc": "workload", "local": "local", "email": "local"}   # Ruling: email is local
+APPROVAL_REQUEST = ("tool", "server", "qualified", "correlation", "route_id", "approver_set", "min_assurance",
+                    "timeout_ms", "on_timeout", "sod")
+METRIC_TYPE = {"tool_calls": "tool_call", "tool_calls_by": "tool_call", "egress_hosts": "egress",
+               "model_spend_micro": "inference"}
+HTTP_QUALIFIED = re.compile(r"http:[a-z0-9_-]{1,32}:\S(.*\S)?")   # Ruling: section 17.3.3 names carry a space
 
 BANNER_FONT = {
     "P": ["█████ ", "██  ██", "█████ ", "██    ", "██    "],
@@ -157,6 +163,11 @@ class State:
         self.token_dir, self.jwks_dir, self.min_assurance = token_dir, jwks_dir, min_assurance
         self.principals = dict.fromkeys(("human", "workload", "local", "none"), 0)
         self.principal_tokens = dict.fromkeys(("verified", "unverified", "unverifiable"), 0)
+        self.approvals = {}             # approval_id -> the request (V-V4)
+        self.decisions = {}             # decision seq -> {request, outcome, used}
+        self.approval_counts = dict.fromkeys(("granted", "refused", "timeout"), 0)
+        self.budget_hits = self.after_the_fact = 0
+        self.pack = None                # --rulepack: {hash, budgets, pricing} (W2)
         self.seen = {}                  # seq -> Seen
         self.result_parents = set()     # B3: tool_call seqs that already have a tool_result
         self.rulepack, self.rulepack_seen = "", False
@@ -300,6 +311,9 @@ def identity_checks(st, rec, x, parent):
         raise Fail("principal_malformed", "principal malformed")
     if t in ("task_start", "inference"):
         principal_checks(st, rec, x, task)
+    approval_checks(st, rec, x, parent, task)
+    if task is not None:
+        budget_checks(st, rec, x, task)
     if t == "task_start":
         start_task(st, rec, x)
     elif t == "agent_register":
@@ -367,7 +381,8 @@ def start_task(st, rec, x):
     st.agent_auth[auth] += 1
     st.principals[PRINCIPAL_KINDS.get(rec["principal"].split(":", 1)[0], "none")] += 1
     st.tasks[seq] = {"agent_id": rec["agent_id"], "principal": rec["principal"], "ended": False,
-                     "counts": dict.fromkeys(TASK_COUNTS, 0), "last_seq": seq, "claims": x.get("principal_claims")}
+                     "counts": dict.fromkeys(TASK_COUNTS, 0), "last_seq": seq, "claims": x.get("principal_claims"),
+                     "pending": set(), "calls": [], "hosts": set(), "spend": 0}
 
 
 def ms_of(t):
@@ -506,6 +521,173 @@ def token_check(st, principal, c):
     st.principal_tokens["verified"] += 1
 
 
+def approval_checks(st, rec, x, parent, task):
+    """V-V4 (spec §17.7): named approval requests and decisions, the tool_call that cites one, none left open."""
+    t, seq = rec["type"], rec["seq"]
+    if t == "approval" and x.get("phase") == "decision":
+        approval_decision(st, rec, x)
+    elif t == "approval":                                                              # V
+        aid, at = x.get("approval_id"), ms_of(rec["ts"])
+        ok = (task is not None and at is not None and x.get("phase") == "request"
+              and all(k in x for k in APPROVAL_REQUEST) and isinstance(aid, str) and aid not in st.approvals
+              and type(x["timeout_ms"]) is int and x["min_assurance"] in ASSURANCE)
+        if parent is None:
+            ok = ok and x.get("correlation") == "none" and st.allow_orphans
+        else:
+            ok = ok and parent.type == "inference"
+        if not ok:
+            raise Fail("approval_request_malformed", "approval request malformed")
+        st.approvals[aid] = {"seq": seq, "task": rec["task_seq"], "qualified": x["qualified"],
+                             "input_hash": rec["input_hash"], "deadline": at + x["timeout_ms"],
+                             "min_assurance": x["min_assurance"], "sod": x["sod"] is True, "decided": None}
+        task["pending"].add(aid)
+    elif t == "tool_call" and "approval_seq" in x:                                    # V2, V3
+        d = st.decisions.get(x["approval_seq"]) if type(x["approval_seq"]) is int else None
+        granted = d is not None and d["outcome"] == "granted"
+        if (d is None or d["request"]["task"] != rec["task_seq"] or d["request"]["qualified"] != x.get("qualified")
+                or d["request"]["input_hash"] != rec["input_hash"] or (x.get("confirmation") == "granted") != granted
+                or (rec["decision"], rec["mode"]) != (("flag", "record") if granted else ("block", "enforce"))):
+            raise Fail("approval_mismatch", "tool_call approval mismatch")
+        if d["used"]:
+            raise Fail("approval_reused", "approval reused")
+        d["used"] = True
+    elif t == "task_end" and task is not None and task["pending"]:                    # V4
+        raise Fail("approval_undecided", "approval undecided at task_end")
+
+
+def approval_decision(st, rec, x):
+    """V1: the decision answers its own request, once, in time, by a well-formed approver who may answer."""
+    aid, outcome, at = x.get("approval_id"), x.get("outcome"), ms_of(rec["ts"])
+    req = st.approvals.get(aid) if isinstance(aid, str) else None
+    invalid = Fail("approval_decision_invalid", "approval decision invalid")
+    if (req is None or at is None or req["decided"] is not None or rec["parent_seq"] != str(req["seq"])
+            or rec["task_seq"] != req["task"] or rec["input_hash"] != req["input_hash"]
+            or (rec["mode"], rec["decision"]) != (("record", "allow") if outcome == "granted" else ("enforce", "block"))):
+        raise invalid
+    if outcome in ("granted", "refused"):
+        if at >= req["deadline"]:
+            raise Fail("approval_after_deadline", "approval after deadline")
+        claims = x.get("approver_claims")
+        if not (isinstance(x.get("approver"), str) and HUMAN.fullmatch(x["approver"]) and isinstance(claims, dict)
+                and claims.get("assurance") in ASSURANCE
+                and ASSURANCE.index(claims["assurance"]) >= ASSURANCE.index(req["min_assurance"])):
+            raise invalid
+        if req["sod"] and x["approver"] == rec["principal"]:
+            raise Fail("approver_is_principal", "approver is task principal")
+    elif outcome != "timeout" or at < req["deadline"] or "approver" in x:
+        raise invalid
+    req["decided"] = rec["seq"]
+    st.decisions[rec["seq"]] = {"request": req, "outcome": outcome, "used": False}
+    st.approval_counts[outcome] += 1
+    st.tasks[int(rec["task_seq"])]["pending"].discard(x["approval_id"])
+
+
+def budget_checks(st, rec, x, task):
+    """X, X1 and W-W2 (spec §17.6, §17.7) on a record inside a task; then this record's own contribution to the
+    task's counters, which the next record's `used` must equal."""
+    t = rec["type"]
+    try:
+        hits = json.loads(rec["rule_hits"])
+    except (ValueError, RecursionError):
+        hits = None
+    if not (isinstance(hits, list) and all(isinstance(h, str) for h in hits)):
+        raise Fail("rule_hits_malformed", "rule_hits malformed")
+    if t == "tool_call" and x.get("observed_by") == "http_adapter":                  # X
+        summary = x.get("summary")
+        if not (HTTP_QUALIFIED.fullmatch(str(x.get("qualified"))) and isinstance(summary, dict)
+                and all(k in summary for k in ("method", "host", "path_template"))):
+            raise Fail("http_tool_call_malformed", "http tool_call malformed")
+    if t == "tool_call" and x.get("after_the_fact") is True:                          # X1
+        if rec["mode"] != "record" or rec["decision"] == "block":
+            raise Fail("after_the_fact_enforced", "after-the-fact tool_call claims enforcement")
+        st.after_the_fact += 1
+    budget, failed = x.get("budget") if t in METRIC_TYPE.values() else None, set()
+    if budget is not None and not isinstance(budget, dict):
+        raise Fail("budget_counter_mismatch", "budget counter mismatch")
+    for bid, metrics in (budget or {}).items():
+        for metric, v in (metrics.items() if isinstance(metrics, dict) else [(None, None)]):
+            limit, used = (v.get("limit"), v.get("used")) if isinstance(v, dict) else (None, None)
+            kind = "tool_calls_by" if str(metric).startswith("tool_calls_by:") else metric
+            if (type(limit) is not int or type(used) is not int or not isinstance(metric, str)
+                    or METRIC_TYPE.get(kind) != t or used != own_count(task, metric)):
+                raise Fail("budget_counter_mismatch", "budget counter mismatch")             # W
+            if metric == "egress_hosts" and isinstance(x.get("host"), str) and x["host"] in task["hosts"]:
+                admitted = True
+            else:
+                admitted = used < limit if metric == "model_spend_micro" else used + 1 <= limit
+            hit = f"budget:{bid}:{metric}"
+            if not admitted:                                                          # W1
+                d = st.decisions.get(x["approval_seq"]) if type(x.get("approval_seq")) is int else None
+                granted = d is not None and d["outcome"] == "granted"
+                if hit not in hits or not (rec["decision"] == "block" or granted):
+                    raise Fail("budget_unenforced", "budget exceeded without enforcement")
+                failed.add(hit)
+            if st.pack and rec["rulepack_hash"] == st.pack["hash"] and pack_limit(st.pack, bid, metric) != limit:
+                raise Fail("budget_limit_not_in_pack", "budget limit not in rule pack")      # W2
+    if any(h.startswith("budget:") and h not in failed for h in hits):
+        raise Fail("budget_spurious_hit", "budget hit without excess")
+    st.budget_hits += bool(failed)
+    if t == "inference" and "cost_micro" in x and st.pack and rec["rulepack_hash"] == st.pack["hash"]:
+        if x["cost_micro"] != cost(st.pack, rec["model_digest"], x):                 # W2
+            raise Fail("cost_mismatch", "cost mismatch")
+    if t == "tool_call" and rec["decision"] != "block":
+        task["calls"].append(str(x.get("qualified", "")))
+    elif t == "egress" and rec["decision"] != "block" and isinstance(x.get("host"), str):
+        task["hosts"].add(x["host"])
+    elif t == "inference" and type(x.get("cost_micro")) is int:
+        task["spend"] += x["cost_micro"]
+
+
+def own_count(task, metric):
+    """The verifier's own value of a budget metric over the task's earlier records (§17.6.2)."""
+    if metric == "tool_calls":
+        return len(task["calls"])
+    if metric.startswith("tool_calls_by:"):
+        return sum(fnmatch.fnmatchcase(q, metric.split(":", 1)[1]) for q in task["calls"])
+    return len(task["hosts"]) if metric == "egress_hosts" else task["spend"]
+
+
+def pack_limit(pack, bid, metric):
+    limits = pack["budgets"].get(bid, {})
+    if metric.startswith("tool_calls_by:"):
+        by = limits.get("tool_calls_by")
+        return by.get(metric.split(":", 1)[1]) if isinstance(by, dict) else None
+    return limits.get(metric)
+
+
+def cost(pack, digest, x):
+    """cost_micro from usage and the first pricing entry whose model glob matches the digest (§17.6.2)."""
+    price = next((p for p in pack["pricing"] if fnmatch.fnmatchcase(digest, str(p.get("model")))), None)
+    if price is None or price.get("id") != x.get("price_rule"):
+        return None
+    u = x.get("usage")
+    if not isinstance(u, dict):
+        return price.get("missing_usage_cost_micro")
+    n = (u.get("input_tokens", 0), price.get("input_per_mtok_micro", 0),
+         u.get("output_tokens", 0), price.get("output_per_mtok_micro", 0))
+    if any(type(v) is not int for v in n):
+        return None
+    return (n[0] * n[1] + n[2] * n[3]) // 1_000_000
+
+
+def load_pack(path):
+    """--rulepack: the budgets and pricing of a rule pack file, keyed by the SHA-256 of its bytes (W2). PyYAML is
+    read only here (Ruling: the pack is YAML; the verifier's other checks need nothing beyond `cryptography`)."""
+    import yaml
+    with open(path, "rb") as f:
+        raw = f.read()
+    try:
+        doc = yaml.safe_load(raw) or {}
+    except (yaml.YAMLError, RecursionError) as e:
+        raise ValueError(f"not YAML: {type(e).__name__}") from None
+    if not isinstance(doc, dict):
+        raise ValueError("not a mapping")
+    listed = lambda key: [e for e in doc.get(key) or [] if isinstance(e, dict)] if isinstance(doc.get(key), list) else []
+    return {"hash": sha256(raw).hexdigest(), "pricing": listed("pricing"),
+            "budgets": {b["id"]: b["limits"] if isinstance(b.get("limits"), dict) else {}
+                        for b in listed("budgets") if isinstance(b.get("id"), str)}}
+
+
 def register_agent(st, rec, x):
     """K: structure per auth, and for auth=key the self-proof over the v2.1 or v2.2 message."""
     seq, aid, auth = rec["seq"], rec["agent_id"], x.get("auth")
@@ -548,12 +730,13 @@ def read_rows(conn):
 
 
 def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated=False, token_dir=None,
-                jwks_dir=None, min_assurance=None):
+                jwks_dir=None, min_assurance=None, rulepack=None):
     """Walk the chain in seq order, stop at the first failure. Returns the --json object."""
     st = State(allow_orphans, allow_unauthenticated, token_dir, jwks_dir, min_assurance)
     res = {"ok": False, "line": "", "seq": None, "code": None, "records": 0, "attestation": st.attestation,
            "agent_auth": st.agent_auth, "orphans": 0, "unauthenticated": 0, "agents": {},
-           "principals": st.principals, "principal_tokens": st.principal_tokens}
+           "principals": st.principals, "principal_tokens": st.principal_tokens, "approvals": st.approval_counts,
+           "budget_hits": 0, "after_the_fact": 0}
 
     def fail(seq, code, reason):
         res.update(seq=seq, code=code, line=f"FAIL seq={seq} {reason}" if seq is not None else f"FAIL {reason}",
@@ -562,6 +745,11 @@ def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated
 
     if not os.path.exists(db_path):
         return fail(None, "database_not_found", f"database not found: {db_path}")
+    if rulepack:
+        try:
+            st.pack = load_pack(rulepack)
+        except (OSError, ValueError, ImportError) as e:
+            return fail(None, "rulepack_unreadable", f"rule pack unreadable: {e}")
     try:
         public_key = load_public_key(pubkey_path)
     except (OSError, ValueError) as e:
@@ -604,12 +792,14 @@ def verify_full(db_path, pubkey_path, allow_orphans=False, allow_unauthenticated
             conn.close()
     line = (f"PASS records={res['records']} first={first_ts or '-'} last={last_ts or '-'} "
             f"attestation={counts(st.attestation)} agent_auth={counts(st.agent_auth)} "
-            f"principals={counts(st.principals)} principal_tokens={counts(st.principal_tokens)}")
+            f"principals={counts(st.principals)} principal_tokens={counts(st.principal_tokens)} "
+            f"approvals={counts(st.approval_counts)} budgets=hits:{st.budget_hits} after_the_fact={st.after_the_fact}")
     if allow_orphans and st.orphans:
         line += f" orphans={st.orphans}"
     if allow_unauthenticated and st.unauthenticated:
         line += f" unauthenticated={st.unauthenticated}"
     res.update(ok=True, line=line, orphans=st.orphans, unauthenticated=st.unauthenticated,
+               budget_hits=st.budget_hits, after_the_fact=st.after_the_fact,
                agents={k: {f: a[f] for f in ("registered_seq", "current_pubkey", "revoked")}
                        for k, a in st.agents.items()})
     return res
@@ -641,11 +831,12 @@ def main(argv=None):
     parser.add_argument("--jwks-dir", help="JWKS snapshots, <jwks_hash>.json (check U2; default: --token-dir)")
     parser.add_argument("--min-principal-assurance", choices=ASSURANCE,
                         help="every task with a human principal has at least this assurance (check U3)")
+    parser.add_argument("--rulepack", help="rule pack file: sealed budget limits and costs recompute (check W2)")
     args = parser.parse_args(argv)
 
     res = verify_full(args.db, args.pubkey, allow_orphans=args.allow_orphan_tool_calls,
                       allow_unauthenticated=args.allow_unauthenticated_agents, token_dir=args.token_dir,
-                      jwks_dir=args.jwks_dir, min_assurance=args.min_principal_assurance)
+                      jwks_dir=args.jwks_dir, min_assurance=args.min_principal_assurance, rulepack=args.rulepack)
     ok, line = res["ok"], res["line"]
     if args.json:
         print(json.dumps(res, sort_keys=True))
