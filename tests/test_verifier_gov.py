@@ -205,3 +205,23 @@ def test_jwk_crv_use_alg_and_rsa_size_are_checked(tmp_path):
         sig = key.sign(f"{head}.{body}".encode(), padding.PKCS1v15(), hashes.SHA256())
         tok = f"{head}.{body}.{base64.urlsafe_b64encode(sig).rstrip(b'=').decode()}"
         assert sv.jws_valid(tok, "k", "RS256", {"keys": [{"kid": "k", "kty": "RSA", "n": b64(n.n), "e": b64(n.e)}]}) is ok
+
+
+def test_deeply_nested_kept_token_or_jwks_is_a_mismatch_not_a_crash(tmp_path):
+    claims = json.loads(vectors_v2.out[70]["ext"])["principal_claims"]
+    deep = b"[" * 100000
+    b64 = base64.urlsafe_b64encode(deep).rstrip(b"=")
+    d = tmp_path / "kept"
+    d.mkdir()
+    (d / (claims["token_hash"] + ".jwt")).write_bytes(b64 + b"." + b64 + b".AA")
+    (d / (claims["jwks_hash"] + ".json")).write_bytes((TOKENS / (claims["jwks_hash"] + ".json")).read_bytes())
+    assert run(v2chain.gov(), tmp_path, "--token-dir", str(d)) == (1, "FAIL seq=70 principal token mismatch")
+    (d / (claims["token_hash"] + ".jwt")).write_bytes((TOKENS / (claims["token_hash"] + ".jwt")).read_bytes())
+    (d / (claims["jwks_hash"] + ".json")).write_bytes(deep)
+    assert run(v2chain.gov(), tmp_path, "--token-dir", str(d)) == (1, "FAIL seq=70 principal token mismatch")
+
+
+def test_a_deeply_nested_ext_is_ext_not_canonical(tmp_path):
+    c = v2chain.gov()
+    c[71]["ext"] = "[" * 100000
+    assert run(c, tmp_path) == (1, "FAIL seq=71 ext not canonical")

@@ -133,9 +133,11 @@ def parse_ext(ext):
         return {}
     try:
         obj = json.loads(ext)
-    except ValueError:
+        if not isinstance(obj, dict) or canonical_json(obj).decode("utf-8") != ext:
+            obj = None
+    except (ValueError, RecursionError):                 # deeply nested JSON is not canonical either
         obj = None
-    if not isinstance(obj, dict) or canonical_json(obj).decode("utf-8") != ext:
+    if obj is None:
         raise Fail("ext_not_canonical", "ext not canonical")
     return obj
 
@@ -484,7 +486,7 @@ def token_check(st, principal, c):
         jwks = json.loads(jwks_raw)
         if not (isinstance(head, dict) and isinstance(payload, dict) and isinstance(jwks, dict)):
             raise mismatch
-    except (OSError, ValueError):                       # UnicodeDecodeError and binascii.Error are ValueErrors
+    except (OSError, ValueError, RecursionError):        # UnicodeDecodeError and binascii.Error are ValueErrors
         raise mismatch
     if (sha256(raw).hexdigest() != c["token_hash"] or sha256(jwks_raw).hexdigest() != c["jwks_hash"]
             or head.get("kid") != c["kid"] or head.get("alg") != c["alg"]
