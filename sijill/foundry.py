@@ -8,6 +8,7 @@ the portal never sees the round trip. Server-side tool calls that Foundry report
 the fact (§17.4.4): recorded, never enforced.
 """
 
+import asyncio
 import json
 import os
 import re
@@ -28,6 +29,7 @@ API = "foundry_responses"
 ALLOWED = ("agent", "conversation", "input", "previous_response_id", "metadata")   # the client fields forwarded
 ITEMS = ("message", "function_call_output")   # the input item types a client may send, spelled exactly
 ROUNDS = 8                                   # approval round trips per user turn
+GRACE_S = 60                                 # past the deadline, as the guard: the timer has failed, do not hang
 ROOTS = Roots("/", "/", "/")                 # a relay has no workspace: path rules see absolute paths only
 
 
@@ -204,9 +206,14 @@ async def gate(n, task: dict, inference: dict, item: dict, conv_hash: str, deny:
         except HTTPException:
             confirmation = "unavailable"
         else:
-            await p.event.wait()                   # the ledger's own timer seals the timeout
-            confirmation = "granted" if p.outcome == "granted" else "denied"
-            decided = {"approval_seq": p.decision_seq}
+            remaining = (approvals.ts_ms(p.deadline) - approvals.ts_ms(record.now_ts())) / 1000
+            try:                                   # the ledger's own timer seals the timeout
+                await asyncio.wait_for(p.event.wait(), max(0, remaining) + GRACE_S)
+            except asyncio.TimeoutError:
+                confirmation = "unavailable"       # no decision to cite: the call is blocked
+            else:
+                confirmation = "granted" if p.outcome == "granted" else "denied"
+                decided = {"approval_seq": p.decision_seq}
     decision, mode = guard_rules.outcome(action, confirmation)
     hits = [*v.hits, *over]
     ext = {"harness": "foundry", "session_id": conv_hash, "tool": tool, "server": server, "qualified": qualified,

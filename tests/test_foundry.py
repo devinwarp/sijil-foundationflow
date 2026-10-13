@@ -348,3 +348,23 @@ def test_the_relay_verdict_blocks_a_command_over_the_cap_unparsed(tmp_path):
     over = foundry.verdict(n, {"seq": 1}, "mcp:shell:run_command", {"command": "ls " + "a" * rules.MAX_COMMAND}, 9)
     assert (over.hits, over.action) == (["command-too-long"], "block")
     assert foundry.verdict(n, {"seq": 1}, "mcp:shell:run_command", {"command": "ls"}, 9).action == "allow"
+
+
+def test_the_gate_stops_waiting_when_no_decision_comes(tmp_path, monkeypatch):
+    from sijill import approvals, foundry as relay_module
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    monkeypatch.setattr(approvals, "schedule", lambda n, p: None)       # the timer has died
+    monkeypatch.setattr(relay_module, "GRACE_S", 0.2)
+    foundry = Foundry()
+    client, s, _ = gov_node(tmp_path, pack=PACK.replace("min_assurance: high", "min_assurance: high\n      timeout_seconds: 1"),
+                            handler=foundry, policy=FOUNDRY_POLICY)
+    with client:
+        started = time.monotonic()
+        r = portal(client, "close the case")
+        assert r.status_code == 200 and time.monotonic() - started < 10      # deadline + grace, not forever
+    assert foundry.seen[1][1]["input"][0]["approve"] is False
+    call = rows(s.db_path, "type = 'tool_call'")[0]
+    x = json.loads(call["ext"])
+    assert (call["decision"], x["confirmation"], "approval_seq" in x) == ("block", "unavailable", False)
+    for flags in ((), ("--rulepack", str(s.rulepack_path))):
+        assert verify(s.db_path, s.pubkey_path, *flags)[0] == 0
