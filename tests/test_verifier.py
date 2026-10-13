@@ -81,7 +81,9 @@ def test_empty_and_missing_database(tmp_path, chain):
     assert verify(tmp_path / "empty.db", pub) == (0, "PASS records=0 first=- last=- attestation=weights:0,api:0,"
                                                      "api+tee:0,none:0 agent_auth=key:0,mtls:0,oidc:0,relay:0,none:0 "
                                                      "principals=human:0,workload:0,local:0,none:0 "
-                                                     "principal_tokens=verified:0,unverified:0,unverifiable:0")
+                                                     "principal_tokens=verified:0,unverified:0,unverifiable:0 "
+                                                     "approvals=granted:0,refused:0,timeout:0 budgets=hits:0 "
+                                                     "after_the_fact=0")
     code, out = verify(tmp_path / "nope.db", pub)
     assert code == 1 and out.startswith("FAIL database not found")
 

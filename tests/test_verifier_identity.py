@@ -11,7 +11,8 @@ from v2chain import AGENT, AGENT_KEY, NEW_KEY, PRINCIPAL, SENTRY_ARGS
 
 DEMO_PASS = ("PASS records=15 first=2026-10-01T08:00:00.000Z last=2026-10-01T08:00:14.000Z "
              "attestation=weights:0,api:2,api+tee:0,none:0 agent_auth=key:1,mtls:0,oidc:0,relay:0,none:0 "
-             "principals=human:0,workload:0,local:1,none:0 principal_tokens=verified:0,unverified:0,unverifiable:0")
+             "principals=human:0,workload:0,local:1,none:0 principal_tokens=verified:0,unverified:0,unverifiable:0 "
+             "approvals=granted:0,refused:0,timeout:0 budgets=hits:0 after_the_fact=0")
 OTHER = "spiffe://acme.example/agent/intruder"
 
 
