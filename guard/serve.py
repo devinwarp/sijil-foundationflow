@@ -6,6 +6,8 @@ they would be a content channel the ledger never sees.
 """
 
 import asyncio
+import base64
+import binascii
 import ipaddress
 import json
 import os
@@ -47,6 +49,16 @@ def _code(code) -> int:
     """A wrapped server's error code is relayed only when it is a JSON-RPC standard or server-error code."""
     ok = type(code) is int and (code in CODES or -32099 <= code <= -32000)
     return code if ok else mcp.INTERNAL
+
+
+def _decode(data: str, limit: int) -> bytes | None:
+    """The bytes of a base64 payload, or None when it is not base64 or is over the result budget."""
+    if len(data) > limit or not BASE64.fullmatch(data):
+        return None
+    try:
+        return base64.b64decode("".join(data.split()), validate=True)
+    except (binascii.Error, ValueError):
+        return None
 
 
 def _ledger_error(e: Exception) -> "mcp.RpcError":
@@ -203,9 +215,10 @@ class GuardSession(mcp.Session):
         if structured is not None:      # part of the result: sealed, scanned and bounded like the text
             text += json.dumps(structured, ensure_ascii=False, sort_keys=True)
         status = "error" if result.get("isError") else "ok"
+        raw = self._raw(content, text)
         try:
             r = await asyncio.to_thread(self.pipeline.result, call, sealed, text, status,
-                                        [c["type"] for c in content], s.label)
+                                        [c["type"] for c in content], s.label, raw)
         except (Unreachable, Refused, Refusal) as e:      # fail closed: the result is withheld unsealed
             raise _ledger_error(e)
         if r.blocked:
@@ -253,11 +266,23 @@ class GuardSession(mcp.Session):
                 body.update({k: c[k] for k in binary if isinstance(c.get(k), str)})
                 bins = [(body, k) for k in binary if k in body]
             ok = (kind in ITEMS or kind == "resource" and "resource" in body) and (kind != "text" or "text" in body)
-            if ok and all(BASE64.fullmatch(d[k]) and len(d[k]) <= self.guard.cfg.max_result_bytes for d, k in bins):
+            if ok and all(_decode(d[k], self.guard.cfg.max_result_bytes) is not None for d, k in bins):
                 out.append(body)
             else:
                 out.append({"type": "text", "text": f"sijil-guard: unsupported content type {str(kind)[:40]}"})
         return out
+
+    def _raw(self, content: list, text: str) -> bytes | None:
+        """What output_hash and bytes commit to: the sealed text followed by each decoded binary payload
+        (length-prefixed, in item order), so changing one byte of an image changes the hash. None without any."""
+        limit, blobs = self.guard.cfg.max_result_bytes, []
+        for c in content:
+            holder = c.get("resource", {}) if c["type"] == "resource" else c
+            for k in ("data", "blob"):
+                if k in holder:
+                    b = _decode(holder[k], limit) or b""
+                    blobs.append(len(b).to_bytes(8, "big") + b)
+        return text.encode("utf-8", "surrogatepass") + b"".join(blobs) if blobs else None
 
     @staticmethod
     def _strings(content: list) -> list:

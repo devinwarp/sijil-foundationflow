@@ -53,6 +53,8 @@ def call(name: str, args: dict, ask=None, notify=None) -> dict:
         return text("x" * 300_000)
     if name == "structured":      # hidden from tools/list: a structuredContent carrying an invisible character
         return {**text("ok"), "structuredContent": {"v": "a\u200bb"}, "_meta": {"evil": "x"}, "extra": 1}
+    if name == "pixel":           # hidden: one image whose data is the argument
+        return {"content": [{"type": "image", "data": args["d"], "mimeType": "image/png"}]}
     if name == "rich":            # hidden: items with _meta, annotations, invisible characters and odd types
         return {"content": [
             {"type": "text", "text": "hi", "_meta": {"x": 1}, "annotations": {"a": 1}, "extra": "e"},
