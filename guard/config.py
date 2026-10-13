@@ -27,7 +27,8 @@ KEYS = {"sijil": {"url", "token_env", "on_unreachable"},
                               "command_arg"}}
 SERVER_KEYS = {"name", "transport", "command", "args", "env", "url", "headers", "label", "tools", "command_arg"}
 HARNESSES = ("foundry", "http-agent", "other")                      # X-Sijil-Harness values (spec §17.3.3)
-NOT_FORWARDED = {"host", "content-length", "transfer-encoding", "connection"}      # the adapter sets these itself
+NOT_FORWARDED = {"host", "content-length", "transfer-encoding", "connection", "te", "upgrade", "keep-alive",
+                 "proxy-authorization"}      # the adapter sets these itself
 SERVER_NAME = re.compile(r"[a-z0-9_-]{1,32}")                      # source_label mcp:<name> (spec §17.1)
 LABELS = ("telemetry", "web", "memory", "repo")                    # `user` cannot be assigned (spec §5.2)
 COMMAND_DIRS = ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "~/.nvm/versions/*/bin", "node_modules/.bin")
@@ -182,10 +183,14 @@ def _strs(v, what: str, path: str) -> tuple:
 def _http_server(s, path: str, base: Path) -> HttpServer:
     s = _keys(s, "http_tools.server", path)
     name, label, up, spec = s.get("name", ""), s.get("label", ""), s.get("upstream"), s.get("spec")
-    if not isinstance(name, str) or not SERVER_NAME.fullmatch(name) or not isinstance(label, str) \
+    if not isinstance(name, str) or not SERVER_NAME.fullmatch(name) or name == "_sijil" or not isinstance(label, str) \
             or (label and label not in LABELS) or not isinstance(up, str) or not isinstance(spec, str) or not spec:
         raise ValueError(f"{path}: http_tools server {name!r} needs a [a-z0-9_-] name, upstream and spec")
     u = urlsplit(up)
+    try:
+        u.port
+    except ValueError:
+        raise ValueError(f"{path}: http_tools server {name}: upstream port is not valid") from None
     if u.scheme not in ("http", "https") or not u.hostname or u.query or u.fragment or u.username:
         raise ValueError(f"{path}: http_tools server {name}: upstream must be an http(s) URL without credentials")
     ops = _keys(s.get("operations"), "http_tools.operations", path)
@@ -215,6 +220,8 @@ def _http_tools(d, path: str, base: Path) -> HttpTools | None:
         raise ValueError(f"{path}: http_tools.listen must be HOST:PORT")
     if mode not in ("bearer_env", "mtls", "none"):
         raise ValueError(f"{path}: http_tools.inbound_auth.mode must be bearer_env or mtls (entra is not built)")
+    if not all(isinstance(v, str) for v in (tls.get("cert", ""), tls.get("key", ""), auth.get("client_ca", ""))):
+        raise ValueError(f"{path}: http_tools tls.cert, tls.key and inbound_auth.client_ca must be paths")
     cert, key = _path(tls.get("cert", ""), "http_tools.tls.cert", base), _path(tls.get("key", ""), "http_tools.tls.key", base)
     if not loopback(host) and (not cert or not key or mode == "none"):
         raise ValueError(f"{path}: http_tools off loopback needs tls.cert, tls.key and inbound_auth")

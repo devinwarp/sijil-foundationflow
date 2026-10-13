@@ -1,5 +1,6 @@
 """Row 8b: the HTTP tool adapter in front of a REST case API, sealing through a real ledger (spec §17.3)."""
 
+import dataclasses
 import json
 
 import httpx
@@ -55,17 +56,19 @@ class CaseApi:
     """The real upstream: records what reached it."""
 
     def __init__(self):
-        self.seen, self.down, self.big = [], False, None
+        self.seen, self.down, self.big, self.last, self.extra = [], False, None, None, {}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         if self.down:
             raise httpx.ConnectError("refused")
         self.seen.append((request.method, request.url.path, request.url.query.decode(), dict(request.headers)))
+        self.last = request
         if self.big:
-            return httpx.Response(200, content=self.big, headers={"content-type": "application/json"})
+            content, ctype, status = self.big
+            return httpx.Response(status, content=content, headers={"content-type": ctype})
         if request.url.path.endswith("/notes"):
             return httpx.Response(201, content=SAVED, headers={"content-type": "application/json"})
-        return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, json={"ok": True}, headers=self.extra)
 
 
 @pytest.fixture
@@ -91,6 +94,7 @@ http_tools:
         api = CaseApi()
         adapter = http.Adapter(cfg, ledger_of(client), httpx.AsyncClient(transport=httpx.MockTransport(api)))
         with TestClient(http.app(adapter), headers={"X-Sijil-Tools-Token": "tools-secret"}) as tools:
+            tools.adapter = adapter
             yield client, s, cfg, tools, api
 
 
@@ -248,14 +252,152 @@ def test_dot_segments_never_reach_the_upstream(env):
     assert r.status_code == 404 and r.json()["error"]["rule_hits"] == ["http-operation-unknown"] and api.seen == []
 
 
-def test_oversized_result_is_cut_and_sealed_as_truncated(env):
+def test_oversized_text_is_cut_at_a_character_boundary_and_sealed_truncated(env):
     client, s, cfg, tools, api = env
-    big = json.dumps({"rows": ["x" * 1000] * 400}).encode()
-    api.big = big
+    limit = cfg.max_result_bytes
+    big = b"a" * (limit - 1) + "\u00e9".encode() + b"tail"            # the two-byte character straddles the limit
+    api.big = (big, "text/plain", 200)
     t = start(tools)
     think(client, t, "list the open cases")
     r = tools.get("/case-api/cases?limit=10&open=true", headers={"X-Sijil-Task-Seq": str(t["task_seq"])})
-    assert r.status_code == 502 and len(r.content) <= cfg.max_result_bytes
+    assert r.status_code == 200 and r.content == b"a" * (limit - 1)
     x = json.loads(rows(s.db_path, "type = 'tool_result'")[0]["ext"])
-    assert x["truncated"] is True and x["bytes"] == len(big)
+    assert x["truncated"] is True and x["bytes"] == len(big) and x["http_status"] == 200
     assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_oversized_json_is_withheld_with_the_upstream_status(env):
+    client, s, cfg, tools, api = env
+    big = json.dumps({"rows": ["x" * 1000] * 400}).encode()
+    api.big = (big, "application/json", 201)
+    t = start(tools)
+    think(client, t, "list the open cases")
+    r = tools.get("/case-api/cases?limit=10&open=true", headers={"X-Sijil-Task-Seq": str(t["task_seq"])})
+    assert r.status_code == 201 and r.json() == {"sijil": "result withheld: over max_result_bytes"}
+    result = rows(s.db_path, "type = 'tool_result'")[0]
+    x = json.loads(result["ext"])
+    assert "truncated" not in x and x["bytes"] == len(big) and x["http_status"] == 201
+    assert result["output_hash"] == record.sha256_hex(big) and r.headers["x-sijil-seq"] == str(result["seq"])
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_ledger_unreachable_is_503_with_a_generic_message(env):
+    client, s, cfg, tools, api = env
+    t = start(tools)
+    think(client, t, "get the case")
+
+    def down(request):
+        raise httpx.ConnectError("secret-host:5432 refused")
+    tools.adapter.ledger.http = httpx.Client(base_url="http://ledger", transport=httpx.MockTransport(down))
+    r = tools.get("/case-api/cases/MOI-2026-004211", headers={"X-Sijil-Task-Seq": str(t["task_seq"])})
+    assert r.status_code == 503 and r.json() == {"error": "Sijil ledger unreachable"} and api.seen == []
+    assert tools.post("/_sijil/task/start", json={"intent": "x"}).status_code == 503
+
+
+def test_missing_token_header_is_401_and_nothing_is_sealed(env):
+    client, s, cfg, tools, api = env
+    before = len(rows(s.db_path))
+    with TestClient(tools.app) as bare:
+        assert bare.get("/case-api/cases").status_code == 401
+        assert bare.post("/_sijil/task/start", json={"intent": "x"}).status_code == 401
+    assert len(rows(s.db_path)) == before and api.seen == []
+
+
+@pytest.mark.parametrize("url", ["/case-api/cases/a%2fb", "/case-api//cases", "/case-api/cases/", "/case-api/Cases",
+                                 "/case-api/cases/x/y/z", "/case-api/admin/export?secret=1", "/case-api"])
+def test_evasive_paths_never_reach_the_upstream(env, url):
+    client, s, cfg, tools, api = env
+    t = start(tools)
+    cid = think(client, t, "export everything")
+    r = tools.get(url, headers={"X-Sijil-Task-Seq": str(t["task_seq"]), "X-Sijil-Tool-Use-Id": cid})
+    assert r.status_code in (403, 404) and api.seen == []
+
+
+def test_only_listed_headers_reach_the_upstream_and_none_come_back(env):
+    client, s, cfg, tools, api = env
+    api.extra = {"Set-Cookie": "sid=1", "Location": "http://evil", "WWW-Authenticate": "Basic", "X-Up": "1",
+                 "Connection": "close"}
+    t = start(tools)
+    think(client, t, "get the case")
+    h = [("x-sijil-task-seq", str(t["task_seq"])), ("authorization", "Bearer pat"), ("cookie", "a=b"),
+         ("proxy-authorization", "x"), ("x-api-key", "k"), ("accept", "a/1"), ("accept", "b/2")]
+    r = tools.get("/case-api/cases/MOI-2026-004211", headers=h)
+    assert r.status_code == 200
+    got = api.last.headers
+    assert got["authorization"] == "Bearer pat" and got.get_list("accept") == ["a/1", "b/2"]
+    assert not {"cookie", "proxy-authorization", "x-api-key"} & set(got)
+    assert not {"set-cookie", "location", "www-authenticate", "x-up"} & set(r.headers)
+    # Authorization is forwarded only when the server lists it
+    ad = tools.adapter
+    server, ops = ad.servers["case-api"]
+    ad.servers["case-api"] = (dataclasses.replace(server, forward_headers=()), ops)
+    think(client, t, "get the case again")
+    assert tools.get("/case-api/cases/MOI-2026-004211", headers=h).status_code == 200
+    assert "authorization" not in api.last.headers
+
+
+def test_body_cap_is_413_by_length_and_when_chunked(env):
+    client, s, cfg, tools, api = env
+    ad = tools.adapter
+    server, ops = ad.servers["case-api"]
+    ad.servers["case-api"] = (dataclasses.replace(server, max_body_bytes=10), ops)
+    before = len(rows(s.db_path))
+    assert tools.post("/case-api/cases/x/notes", content=b"x" * 11).status_code == 413
+    chunks = (b"x" * 4 for _ in range(4))
+    assert tools.post("/case-api/cases/x/notes", content=chunks).status_code == 413
+    assert len(rows(s.db_path)) == before and api.seen == []
+
+
+def test_task_refusals_are_told_apart_and_stale_pipelines_dropped(env):
+    client, s, cfg, tools, api = env
+    t = start(tools)
+    ad = tools.adapter
+    ad.pipelines["stale-session"] = object()
+    r = tools.get("/case-api/cases/MOI-2026-004211", headers={"X-Sijil-Task-Seq": "99999"})
+    assert r.status_code == 409 and r.json()["error"]["type"] == "http-task-not-open"
+    assert "stale-session" not in ad.pipelines
+    tools.post("/_sijil/task/end", json={"task_seq": t["task_seq"]})
+    r = tools.get("/case-api/cases/MOI-2026-004211")
+    assert r.status_code == 409 and r.json()["error"]["type"] in ("http-task-none", "http-task-not-open")
+
+
+def _cfg(tmp_path, monkeypatch, block):
+    monkeypatch.setenv("SIJIL_TOOLS_TOKEN", "t")
+    return config.load(str(guard_yaml(tmp_path, block)))
+
+
+@pytest.mark.parametrize("listen", ["[::1]:8090", "localhost:8090", "127.0.0.2:8090"])
+def test_loopback_allowlist_accepts_without_tls_or_auth(tmp_path, monkeypatch, listen):
+    assert _cfg(tmp_path, monkeypatch, f"http_tools:\n  listen: '{listen}'\n").http_tools.auth == "none"
+
+
+@pytest.mark.parametrize("listen", ["0.0.0.0:8090", ":8090", "example.com:8090", "[::]:8090"])
+def test_off_loopback_needs_tls_and_auth(tmp_path, monkeypatch, listen):
+    with pytest.raises(ValueError, match="needs tls"):
+        _cfg(tmp_path, monkeypatch, f"http_tools:\n  listen: '{listen}'\n  inbound_auth: {{mode: bearer_env}}\n")
+    block = f"http_tools:\n  listen: '{listen}'\n  tls: {{cert: c.pem, key: k.pem}}\n  inbound_auth: {{mode: bearer_env}}\n"
+    assert _cfg(tmp_path, monkeypatch, block).http_tools.auth == "bearer_env"
+
+
+def test_auth_modes(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="client_ca"):
+        _cfg(tmp_path, monkeypatch, "http_tools:\n  tls: {cert: c, key: k}\n  inbound_auth: {mode: mtls}\n")
+    ok = _cfg(tmp_path, monkeypatch, "http_tools:\n  tls: {cert: c, key: k}\n  inbound_auth: {mode: mtls, client_ca: ca}\n")
+    assert ok.http_tools.auth == "mtls" and ok.http_tools.client_ca.endswith("/ca")
+    with pytest.raises(ValueError, match="must be paths"):
+        _cfg(tmp_path, monkeypatch, "http_tools:\n  tls: {cert: [1], key: k}\n")
+    with pytest.raises(ValueError, match="not supported|only"):
+        _cfg(tmp_path, monkeypatch, "http_tools:\n  inbound_auth: {mode: none, bogus: 1}\n")
+
+
+@pytest.mark.parametrize("server,message", [
+    ("{name: a, upstream: 'https://x', spec: s, forward_headers: [X-Sijil-Task-Seq]}", "forward_headers"),
+    ("{name: a, upstream: 'https://x', spec: s, forward_headers: [Host]}", "forward_headers"),
+    ("{name: a, upstream: 'https://x', spec: s, forward_headers: [Proxy-Authorization]}", "forward_headers"),
+    ("{name: _sijil, upstream: 'https://x', spec: s}", "needs a"),
+    ("{name: a, upstream: 'https://x:99999', spec: s}", "port"),
+    ("{name: a, upstream: 'ftp://x', spec: s}", "http"),
+])
+def test_http_server_config_refusals(tmp_path, monkeypatch, server, message):
+    with pytest.raises(ValueError, match=message):
+        _cfg(tmp_path, monkeypatch, f"http_tools:\n  servers: [{server}]\n")

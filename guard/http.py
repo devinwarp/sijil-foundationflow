@@ -5,9 +5,10 @@ tool_result, and forwarded only if the rules allow it. Without the base-URL chan
 `POST /_sijil/task/start` and `/_sijil/task/end` open and close the agent's tasks under the adapter's agent
 session, so the agent can bind its model calls to the same task (the ledger's H3).
 
-What the agent receives is what was sealed: the result's output_hash and bytes commit to the upstream's bytes,
-the relayed body is those bytes with invisible Unicode stripped (re-serialised JSON, or text), and it never
-exceeds results.max_result_bytes; a result over the budget is withheld and recorded as truncated.
+The result's output_hash and bytes commit to the upstream's bytes as they arrived. The relayed body is those
+bytes with invisible Unicode stripped (re-serialised JSON, or text) and never exceeds results.max_result_bytes:
+over the budget a text body is cut at a UTF-8 boundary (sealed truncated); a JSON or binary body is replaced by
+a short notice (nothing in the record marks it, ext has no key for it). The upstream status is always relayed.
 """
 
 import asyncio
@@ -38,6 +39,9 @@ METHODS = ("get", "put", "post", "delete", "patch", "head", "options")
 UNKNOWN = "http-operation-unknown"
 ALWAYS_FORWARD = ("content-type", "accept")       # needed to be understood; never credentials
 MAX_UPSTREAM = 4 * 2 ** 20                        # bytes read from an upstream before the response is refused
+TASK_409 = {"task ambiguous: send X-Sijil-Task-Seq": "http-task-ambiguous",       # the ledger's exact details
+            "task not open in this agent session": "http-task-not-open",
+            "no open task in this agent session": "http-task-none"}
 MAX_TASK_BODY = 65536                             # /_sijil/task/* bodies
 
 
@@ -271,9 +275,17 @@ class Adapter:
         if entry is None:
             return JSONResponse({"error": "unknown tool server"}, 404)
         server, ops = entry
-        body = await request.body()
-        if len(body) > server.max_body_bytes:
-            return JSONResponse({"error": f"body over max_body_bytes ({server.max_body_bytes})"}, 413)
+        too_big = JSONResponse({"error": f"body over max_body_bytes ({server.max_body_bytes})"}, 413)
+        declared = request.headers.get("content-length", "")
+        if declared.isdecimal() and int(declared) > server.max_body_bytes:
+            return too_big
+        chunks, n = [], 0
+        async for c in request.stream():
+            n += len(c)
+            if n > server.max_body_bytes:
+                return too_big
+            chunks.append(c)
+        body = b"".join(chunks)
         path = "/" + path
         found = match(ops, request.method, path)
         op, path_params = found if found else (None, {})
@@ -293,27 +305,38 @@ class Adapter:
                         qualified=f"http:{server.name}:{name}")
             call.summary = {"method": request.method, "host": upstream_host, "path_template": call.path_template,
                             "arg_keys": sorted(call.args)}
+        except RecursionError:
+            return JSONResponse({"error": "request body is nested too deeply"}, 400)
+        try:
             st = await asyncio.to_thread(self.state)
+            for stale in [k for k in self.pipelines if k != st.agent_session]:
+                del self.pipelines[stale]
             p = self.pipelines.get(st.agent_session)
             if p is None:
                 p = self.pipelines[st.agent_session] = Pipeline(self.ledger, st.agent_session, self.cfg, pins=self.pins)
+        except Refused as e:
+            return JSONResponse({"error": f"Sijil ledger refused the session: {e.detail}"}, 502)
+        except (Unreachable, OSError, ValueError) as e:
+            return unavailable(e)
+        try:
             sealed = await asyncio.to_thread(p.check, call, None, forced)
             u = urlsplit(server.upstream)
             port = u.port or (443 if u.scheme == "https" else 80)
             await asyncio.to_thread(p.egress, call, sealed, upstream_host, port, u.scheme, request.method, self.pins)
         except Refusal as r:
             if r.status is not None:       # the ledger refused (a 4xx): nothing was sealed
-                if r.status == 409 and "task" in str(r.detail):     # H2: a call outside a task is never sealed
-                    return blocked(None, ["http-task-ambiguous"], 409, "http-task-ambiguous", str(r.detail))
+                kind = TASK_409.get(str(r.detail)) if r.status == 409 else None      # H2: never sealed
+                if kind:
+                    return blocked(None, [kind], 409, kind, str(r.detail))
                 return JSONResponse({"error": f"Sijil ledger refused the record: {r.detail}"},
                                     409 if r.status == 409 else 502)
             return blocked(r.seq, r.hits, 404 if forced and r.seq else 403, message=str(r))
         except RecursionError:
             return JSONResponse({"error": "request body is nested too deeply"}, 400)
-        except (Unreachable, OSError, ValueError) as e:
+        except (Unreachable, OSError) as e:
             return unavailable(e)
-        headers = {k: v for k, v in request.headers.items() if k.lower() in (*server.forward_headers, *ALWAYS_FORWARD)
-                   and not k.lower().startswith("x-sijil-")}
+        headers = [(k.decode("latin-1"), v.decode("latin-1")) for k, v in request.headers.raw
+                   if k.decode("latin-1") in (*server.forward_headers, *ALWAYS_FORWARD)]
         status, data, ctype = await self.fetch(request, server.upstream + quote(path), body, headers)
         media = ctype.split(";")[0].strip()
         try:
@@ -327,7 +350,13 @@ class Adapter:
                 out = json.dumps(_strip_json(parsed)).encode()          # ASCII: nothing left to hide
             else:
                 out, out_type = unicode.strip(text).encode("utf-8", "surrogateescape"), f"{media}; charset=utf-8"
-        cut = len(out) > self.cfg.max_result_bytes
+        limit = self.cfg.max_result_bytes
+        cut = len(out) > limit and media.startswith("text/")        # text is cut; JSON and binary are withheld
+        withheld = len(out) > limit and not cut
+        if cut:
+            out, out_type = out[:limit].decode("utf-8", "ignore").encode(), f"{media}; charset=utf-8"
+        elif withheld:
+            out, out_type = b'{"sijil":"result withheld: over max_result_bytes"}', "application/json"
         try:
             r = await asyncio.to_thread(p.result, call, sealed, text, "ok" if status and 200 <= status < 300 else "error",
                                         [media] if media else [], server.label, data, status, False, None, cut)
@@ -340,9 +369,6 @@ class Adapter:
             return blocked(r.seq, r.hits)
         if status is None:
             return JSONResponse({"error": data.decode()}, 502, headers=seq)
-        if cut:
-            return JSONResponse({"error": {"type": "sijil_result_too_large", "limit": self.cfg.max_result_bytes,
-                                           "seq": r.seq}}, 502, headers=seq)
         return Response(out, status, media_type=out_type or None, headers=seq)
 
 
@@ -352,7 +378,7 @@ def app(adapter: Adapter) -> FastAPI:
     @api.middleware("http")
     async def inbound(request: Request, call_next):
         origin = request.headers.get("origin")
-        if origin is not None and not origin_ok(origin):      # a browser page cannot drive the adapter
+        if origin is not None and not origin_ok(origin, adapter.cfg.allowed_origins):      # a browser page cannot drive the adapter
             return JSONResponse({"error": "Origin not allowed"}, 403)
         if not adapter.authorised(request):        # before anything is sealed (spec §17.3.2)
             return JSONResponse({"error": "X-Sijil-Tools-Token required"}, 401)
