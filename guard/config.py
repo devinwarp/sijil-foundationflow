@@ -35,6 +35,14 @@ COMMAND_DIRS = ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "~/.nvm/versi
 UNICODE_ACTIONS = ("strip", "block", "record")
 
 
+def _allowed(name: str, allow: tuple, deny: tuple) -> bool:
+    """The tools.allow/deny (operations.allow/deny) filter, one rule for both doors (spec §5.2): allow wins over
+    deny; an allow list without a deny list is the filter (deny ["*"] implied); with no lists all are allowed."""
+    if any(fnmatch.fnmatchcase(name, g) for g in allow):
+        return True
+    return not any(fnmatch.fnmatchcase(name, g) for g in deny or (("*",) if allow else ()))
+
+
 @dataclass(frozen=True)
 class Server:
     name: str
@@ -51,10 +59,7 @@ class Server:
     real: str = ""                # realpath of `command` when it was checked; re-checked before every launch
 
     def allowed(self, tool: str) -> bool:
-        """Allow wins over deny; with no lists every tool is allowed (spec §5.2)."""
-        if any(fnmatch.fnmatchcase(tool, g) for g in self.allow):
-            return True
-        return not self.deny or not any(fnmatch.fnmatchcase(tool, g) for g in self.deny)
+        return _allowed(tool, self.allow, self.deny)
 
 
 def _env(value: str) -> str:
@@ -135,10 +140,7 @@ class HttpServer:
     command_arg: str
 
     def allowed(self, operation: str) -> bool:
-        """Allow wins over deny; with no lists every operation is allowed (as for an MCP server)."""
-        if any(fnmatch.fnmatchcase(operation, g) for g in self.allow):
-            return True
-        return not self.deny or not any(fnmatch.fnmatchcase(operation, g) for g in self.deny)
+        return _allowed(operation, self.allow, self.deny)
 
 
 @dataclass(frozen=True)
@@ -161,6 +163,21 @@ def loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def mcp_listen(cfg: "Config", listen: str) -> tuple[str, int, dict]:
+    """`serve --http HOST:PORT` checked against the config before anything starts: (host, port, uvicorn TLS
+    settings). Off loopback the MCP door needs mcp.tls_cert, mcp.tls_key and mcp.tools_token_env, as the HTTP
+    adapter needs TLS and inbound auth (checked in _http_tools)."""
+    host, _, port = listen.rpartition(":")
+    if not port.isdecimal() or not 0 <= int(port) < 65536:
+        raise ValueError(f"--http {listen}: expected HOST:PORT")
+    if loopback(host):
+        return host.strip("[]"), int(port), {}
+    if not (cfg.tls_cert and cfg.tls_key and cfg.tools_token):
+        raise ValueError(f"--http {listen} is off loopback: mcp.tls_cert, mcp.tls_key and mcp.tools_token_env "
+                         "are required")
+    return host.strip("[]"), int(port), {"ssl_certfile": cfg.tls_cert, "ssl_keyfile": cfg.tls_key}
 
 
 def _keys(d, name: str, path: str) -> dict:

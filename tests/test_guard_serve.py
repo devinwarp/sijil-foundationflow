@@ -467,7 +467,18 @@ def test_unset_repo_in_home_or_root_is_refused(tmp_path, monkeypatch):
                                       ("10.0.0.5", True), ("localhost", False), ("127.0.0.1", False),
                                       ("127.5.5.5", False), ("::1", False), ("[::1]", False)])
 def test_loopback_is_an_allowlist(host, off):
-    assert serve._loopback(host) is not off
+    assert config.loopback(host) is not off
+
+
+@pytest.mark.parametrize("allow,deny,ok", [(("get_*",), (), ["get_issue"]), (("get_*",), ("*",), ["get_issue"]),
+                                           ((), ("run_*",), ["get_issue", "list"]), ((), (), ["get_issue", "run_x", "list"]),
+                                           (("get_*",), ("run_*",), ["get_issue", "list"])])
+def test_an_allow_list_alone_is_the_filter_in_both_doors(allow, deny, ok):
+    """Final review Important 2: allow without deny allows only what it lists (deny ["*"] implied); allow wins."""
+    mcp_server = config.Server("s", "stdio", "", (), {}, "", {}, "mcp:s", allow, deny, "command")
+    http_server = config.HttpServer("s", "https://x.test", "", "http:s", (), allow, deny, 1, "")
+    for door in (mcp_server, http_server):
+        assert [n for n in ("get_issue", "run_x", "list") if door.allowed(n)] == ok
 
 
 def test_empty_host_http_listen_is_refused_without_tls(env):

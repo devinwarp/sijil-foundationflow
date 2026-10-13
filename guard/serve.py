@@ -8,7 +8,6 @@ they would be a content channel the ledger never sees.
 import asyncio
 import base64
 import binascii
-import ipaddress
 import json
 import os
 import re
@@ -22,7 +21,7 @@ import uvicorn
 
 from . import identity, integrity, mcp, rules, task, unicode
 from .canon import sha256_hex
-from .config import Config, Server
+from .config import Config, Server, mcp_listen
 from .ledger import Ledger, Refused, Unreachable
 from .pipeline import Call, Pipeline, Refusal
 from .rules import NOT_ALLOWLISTED
@@ -42,17 +41,6 @@ RESOURCE = (("uri", "mimeType", "text"), ("blob",))
 REQUIRED = {"text": "text", "image": "data", "audio": "data"}
 MAX_ITEMS = 256      # content items relayed per result; the rest collapse into one note
 CODES = {-32700, -32600, -32601, -32602, -32603}
-
-
-def _loopback(host: str) -> bool:
-    """An allowlist: localhost and 127.0.0.0/8 and ::1. An empty host binds every interface."""
-    host = host.strip("[]")
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
 
 
 def _code(code) -> int:
@@ -618,21 +606,13 @@ async def pin(cfg: Config, server_name: str, ledger: Ledger) -> tuple[int, int]:
 
 async def run(cfg: Config, server_name: str, ledger: Ledger, http_listen: str = "") -> None:
     server = server_named(cfg, server_name)
-    if http_listen and ":" not in http_listen:
-        raise ValueError(f"--http {http_listen}: expected HOST:PORT")
-    host, port = http_listen.rsplit(":", 1) if http_listen else ("", "")
-    tls = {}
-    if http_listen and not _loopback(host):
-        if not (cfg.tls_cert and cfg.tls_key and cfg.tools_token):
-            raise ValueError(f"--http {http_listen} is off loopback: mcp.tls_cert, mcp.tls_key and "
-                             "mcp.tools_token_env are required")
-        tls = {"ssl_certfile": cfg.tls_cert, "ssl_keyfile": cfg.tls_key}
+    host, port, tls = mcp_listen(cfg, http_listen) if http_listen else ("", 0, {})
     guard = Guard(cfg, server, ledger)
     await guard.start()
     try:
         if http_listen:
             app = mcp.http_app(guard.new_session, cfg.allowed_origins, cfg.tools_token)
-            await uvicorn.Server(uvicorn.Config(app, host=host.strip("[]"), port=int(port), log_level="warning",
+            await uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning",
                                                 **tls)).serve()
         else:
             reader, write = await mcp.stdio_streams()
