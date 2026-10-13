@@ -403,7 +403,7 @@ def test_close_never_opens_a_session(env):
     async def go():
         g = serve.Guard(cfg, cfg.servers[1], ledger_of(client), open_session=lambda: pytest.fail("opened a session"))
         a = await g.new_session(Harness(), {})
-        a.owned, a.task_seq, a.agent_session = True, 1, "x"
+        a.own = ("x", 1)
         a.guard.ledger = Ledger("http://x", "t", http=httpx.Client(base_url="http://x", transport=httpx.MockTransport(
             lambda r: httpx.Response(500))))
         task.state_path(cfg).unlink(missing_ok=True)
@@ -758,4 +758,63 @@ def test_a_result_the_guard_cannot_process_is_sealed_as_an_error(env, monkeypatc
     rec = rows(s.db_path, "type = 'tool_result'")[0]
     x = json.loads(rec["ext"])
     assert (x["status"], x["truncated"], rec["output_hash"]) == ("error", True, record.sha256_hex(note.encode()))
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def cli(cfg, client, *args) -> int:
+    from guard.__main__ import main
+    return main([*args, "--config", cfg.path], ledger=ledger_of(client))
+
+
+def follow(cfg, client, between) -> tuple:
+    """A stdio guard joins (or starts) a task; `between` runs; then a model call and a tool call. (the task the
+    guard got at initialize, the state file's task at the call)."""
+    async def go():
+        g = guard(cfg, client, "shell")
+        await g.start()
+        a = await g.new_session(Harness(), {})
+        first = (await a.handle("initialize", INIT))["_meta"]["sijil"]["task_seq"]
+        await asyncio.to_thread(between)
+        now = task.load(task.state_path(cfg), cfg.agent_id).task_seq
+        await asyncio.to_thread(ask, client, cfg, "poison it")
+        await call(a, "poisoned", {})
+        await a.close()
+        await g.aclose()
+        return first, now
+    return asyncio.run(go())
+
+
+def test_a_stdio_guard_follows_task_end_then_start_from_the_cli(env):
+    """Final review Important 3 (a): the next call goes to the new task, not the ended one."""
+    client, s, cfg = env
+    assert cli(cfg, client, "task", "start") == 0
+    first, now = follow(cfg, client, lambda: (cli(cfg, client, "task", "end"), cli(cfg, client, "task", "start")))
+    rec = rows(s.db_path, "type = 'tool_call'")[-1]
+    assert now != first and rec["task_seq"] == str(now) and rec["decision"] != "block"
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_a_hook_task_start_after_a_guard_owned_task_is_not_refused(env):
+    """(b): with no task open the guard starts its own; a later `task start` goes above it, the guard's calls
+    follow, and the guard still ends its own task at close."""
+    client, s, cfg = env
+    codes = []
+    first, now = follow(cfg, client, lambda: codes.append(cli(cfg, client, "task", "start")))
+    rec = rows(s.db_path, "type = 'tool_call'")[-1]
+    assert codes == [0] and now != first and rec["task_seq"] == str(now)
+    st = task.load(task.state_path(cfg), cfg.agent_id)
+    assert (st.tasks, st.guard_task) == ([now], None)
+    assert [r["task_seq"] for r in rows(s.db_path, "type = 'task_end'")] == [str(first)]
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_a_delegated_sub_task_is_seen_by_a_running_guard(env):
+    """(c): a sub-task's tool calls carry the sub-task's task_seq (spec §5.9)."""
+    client, s, cfg = env
+    assert cli(cfg, client, "task", "start") == 0
+    first, now = follow(cfg, client, lambda: cli(cfg, client, "task", "start", "--delegate"))
+    rec = rows(s.db_path, "type = 'tool_call'")[-1]
+    sub = rows(s.db_path, "type = 'task_start'")[-1]
+    assert now != first and json.loads(sub["ext"])["delegated_from"] == str(first)
+    assert rec["task_seq"] == str(now) == str(sub["seq"])
     assert verify(s.db_path, s.pubkey_path)[0] == 0

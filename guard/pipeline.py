@@ -157,6 +157,8 @@ class Pipeline:
                          "rule_hits": hits, "input_hash": h, "rulepack_hash": pack.hash, "ext": ext})
             return body
         r = self.seal(call.task_seq, build)
+        if call.task_seq in (None, "") and r.get("task_seq"):      # the task resolved once: the egress and the
+            call.task_seq = r["task_seq"]                         # result are sealed into it, whatever opens since
         sealed = Sealed(r["seq"], r["decision"], body["rule_hits"], parent, body["ext"]["qualified"])
         if r["decision"] == "block":
             why = ", ".join(sealed.hits) or "halted"

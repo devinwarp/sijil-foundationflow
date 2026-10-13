@@ -1,15 +1,17 @@
 """Row 8b: the HTTP tool adapter in front of a REST case API, sealing through a real ledger (spec §17.3)."""
 
+import asyncio
 import dataclasses
 import json
 
 import httpx
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from agentkit import chat
 from conftest import ADMIN, rows, verify
-from guard import config, http, identity
+from guard import config, http, identity, serve, task
 from guardkit import guard_yaml, ledger_node, ledger_of
 from sijill import record
 
@@ -416,3 +418,60 @@ def test_auth_modes(tmp_path, monkeypatch):
 def test_http_server_config_refusals(tmp_path, monkeypatch, server, message):
     with pytest.raises(ValueError, match=message):
         _cfg(tmp_path, monkeypatch, f"http_tools:\n  servers: [{server}]\n")
+
+
+def test_adapter_and_a_stdio_guard_of_one_agent_share_one_task(env):
+    """Final review Important 3 (d): a task opened through the adapter is the state file's task, so a stdio MCP
+    guard of the same agent joins it and the adapter's calls without X-Sijil-Task-Seq still find one task."""
+    from test_guard_serve import INIT, SERVERS, Harness
+    client, s, cfg, tools, api = env
+    t = start(tools)
+    both = dataclasses.replace(cfg, servers=config._servers(yaml.safe_load(SERVERS), cfg.path, cfg.repo))
+
+    async def go():
+        g = serve.Guard(both, both.servers[1], ledger_of(client))
+        await g.start()
+        a = await g.new_session(Harness(), {})
+        meta = (await a.handle("initialize", INIT))["_meta"]["sijil"]
+        await g.aclose()
+        return meta
+    assert asyncio.run(go()) == {"agent_session": t["agent_session"], "task_seq": t["task_seq"]}
+    assert len(rows(s.db_path, "type = 'task_start'")) == 1 and rows(s.db_path, "type = 'task_end'") == []
+    think(client, t, "get the case")
+    assert tools.get("/case-api/cases/MOI-2026-004211").status_code == 200
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_adapter_task_routes_use_the_shared_state_file_and_renew_a_lost_session(env):
+    """(e): conversations sit side by side on the state file's stack, an end takes its own off, and a session the
+    ledger no longer knows (401) is renewed as `sijil-guard task start` renews it."""
+    client, s, cfg, tools, api = env
+    path = task.state_path(cfg)
+    t1, t2 = start(tools), start(tools, "second conversation")
+    assert task.load(path, cfg.agent_id).tasks == [t1["task_seq"], t2["task_seq"]]
+    assert tools.post("/_sijil/task/end", json={"task_seq": str(t1["task_seq"])}).status_code == 200
+    assert task.load(path, cfg.agent_id).tasks == [t2["task_seq"]]
+    st = task.load(path, cfg.agent_id)
+    st.agent_session = "as_" + "0" * 32
+    task.save(st, path)
+    t3 = start(tools, "third conversation")
+    st = task.load(path, cfg.agent_id)
+    assert t3["agent_session"] == st.agent_session != "as_" + "0" * 32 and st.tasks == [t3["task_seq"]]
+
+
+def test_the_task_is_resolved_once_per_request(env, monkeypatch):
+    """Final review Minor 8: without X-Sijil-Task-Seq the tool_call's task is the one the egress and the result
+    are sealed into, though another task opens while the upstream runs."""
+    client, s, cfg, tools, api = env
+    t = start(tools)
+    think(client, t, "get the case")
+    ad, fetch = tools.adapter, tools.adapter.fetch
+
+    async def racing(*a):
+        await asyncio.to_thread(task.start_task, ad.ledger, t["agent_session"], "another conversation", "foundry")
+        return await fetch(*a)
+    monkeypatch.setattr(ad, "fetch", racing)
+    assert tools.get("/case-api/cases/MOI-2026-004211").status_code == 200
+    sealed = rows(s.db_path, "type IN ('tool_call', 'egress', 'tool_result')")
+    assert [r["task_seq"] for r in sealed] == [str(t["task_seq"])] * 3
+    assert verify(s.db_path, s.pubkey_path)[0] == 0

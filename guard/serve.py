@@ -289,7 +289,8 @@ class GuardSession(mcp.Session):
     def __init__(self, guard: Guard, client: mcp.Client, headers: dict):
         self.guard, self.client, self.headers = guard, client, headers
         self.stdio = isinstance(client, mcp.StdioClient)
-        self.elicit, self.owned, self.task_seq, self.pipeline = False, False, None, None
+        self.elicit, self.task_seq, self.pipeline = False, None, None
+        self.own = None      # (agent_session, task_seq) of the task this session started and ends at close
         self.session_id, self.last_blocked, self.closed = str(uuid.uuid4()), False, False
         self.loop = asyncio.get_running_loop()
 
@@ -320,8 +321,8 @@ class GuardSession(mcp.Session):
             token = self.headers.get(cfg.principal_header.lower()) or os.environ.get("SIJIL_PRINCIPAL_TOKEN")
             seq = task.start_task(g.ledger, state.agent_session, cfg.intent, cfg.harness, self.session_id,
                                   principal_token=token or None, principal_header=cfg.principal_header)
-            if self.stdio:      # the harness's other guards and its model calls join this task
-                state.tasks = [seq]
+            if self.stdio:      # the harness's other guards and its model calls join this task, until a hook's
+                state.guard_task = seq      # `task start` goes above it
             return state, seq, True
         return task.update(task.state_path(cfg), cfg.agent_id, g.open_session, join)
 
@@ -333,10 +334,11 @@ class GuardSession(mcp.Session):
         except (Unreachable, Refused) as e:
             raise _ledger_error(e)
         try:
-            state, self.task_seq, self.owned = await asyncio.to_thread(self._join_or_start)
+            state, self.task_seq, owned = await asyncio.to_thread(self._join_or_start)
         except (Unreachable, Refused, ValueError, OSError) as e:
             raise mcp.RpcError(mcp.SIJIL, f"Sijil: no agent session or task: {e}")
         self.agent_session = state.agent_session
+        self.own = (state.agent_session, self.task_seq) if owned else None
         self.pipeline = Pipeline(self.guard.ledger, state.agent_session, self.guard.cfg)
         if g.changed and g.snap[0] is not None:
             try:
@@ -369,12 +371,34 @@ class GuardSession(mcp.Session):
         ok = answer.get("action") == "accept" and (answer.get("content") or {}).get("allow") is True
         return "granted" if ok else "denied"
 
+    def _follow(self) -> None:
+        """A stdio session's calls go to the state file's current task, read under its lock at every call, so a
+        `task end` then `task start`, a delegated sub-task, a hook's task above this guard's own, or a session
+        renewed after a 401 is seen at the next call (spec §5.9). Load-only: a call never opens a session. The
+        task this session started stays its own to end at close."""
+        cfg = self.guard.cfg
+        path = task.state_path(cfg)
+        with task.locked(path):
+            st = task.load(path, cfg.agent_id)
+        if st is None or st.task_seq is None:
+            raise mcp.RpcError(mcp.SIJIL, "Sijil: no open task in the state file")
+        if st.agent_session != self.agent_session:
+            self.pipeline = Pipeline(self.guard.ledger, st.agent_session, cfg)
+            self.agent_session = st.agent_session
+        self.task_seq = st.task_seq
+
     async def tools_call(self, params: dict) -> dict:
         s, cfg = self.guard.server, self.guard.cfg
         name, args = params.get("name"), params.get("arguments")
         args = {} if args is None else args
         if not isinstance(name, str) or not isinstance(args, dict):
             raise mcp.RpcError(mcp.INVALID_PARAMS, "tools/call needs a name and an arguments object")
+        if self.stdio:      # an HTTP session's task is fixed at initialize (named, or its own)
+            try:
+                await asyncio.to_thread(self._follow)
+            except OSError as e:
+                raise mcp.RpcError(mcp.SIJIL, f"Sijil: the state file cannot be read: {e}")
+        p = self.pipeline
         call = Call(rule_tool=f"mcp:{s.name}:{name}", tool=name, server=s.name, args=args, harness=cfg.harness,
                     session_id=self.session_id, observed_by="mcp_guard", parent_names=[name, f"mcp__{s.name}__{name}"],
                     command_arg=s.command_arg, task_seq=self.task_seq)
@@ -390,7 +414,7 @@ class GuardSession(mcp.Session):
         listed = s.allowed(name) and any(t["name"] == name for t in self.guard.seen)
         forced = (s.allowed(name) and self.guard.removed.get(name)) or (None if listed else [NOT_ALLOWLISTED])
         try:
-            sealed = await asyncio.to_thread(self.pipeline.check, call, self._confirm if self.elicit else None, forced)
+            sealed = await asyncio.to_thread(p.check, call, self._confirm if self.elicit else None, forced)
         except Refusal as r:
             self.last_blocked = r.seq is not None
             sealed_filter = forced == [NOT_ALLOWLISTED] and r.seq is not None
@@ -422,7 +446,7 @@ class GuardSession(mcp.Session):
             content = [_note("the result could not be processed")]
             clean, text, raw, size, is_error, types, cut = None, content[0]["text"], None, None, True, ["text"], True
         try:
-            r = await asyncio.to_thread(self.pipeline.result, call, sealed, text, "error" if is_error else "ok",
+            r = await asyncio.to_thread(p.result, call, sealed, text, "error" if is_error else "ok",
                                         types, s.label, raw, size=size, cut=cut)
         except (Unreachable, Refused, Refusal) as e:      # fail closed: the result is withheld unsealed
             raise _ledger_error(e)
@@ -561,10 +585,10 @@ class GuardSession(mcp.Session):
             return
         self.closed = True
         self.guard.sessions.discard(self)
-        if self.owned:
+        if self.own:
             outcome = "blocked" if self.last_blocked else "completed"
             try:
-                await asyncio.to_thread(task.end_task, self.guard.ledger, self.agent_session, self.task_seq, outcome)
+                await asyncio.to_thread(task.end_task, self.guard.ledger, *self.own, outcome)
             except (Unreachable, Refused):
                 pass                  # the ledger closes the task as timeout when the session expires
             if self.stdio:
@@ -572,14 +596,14 @@ class GuardSession(mcp.Session):
 
     def _clear(self) -> None:
         """Drop the ended task from the state file. Load-only: shutdown never opens a session. The sibling
-        guards of a stdio owner that closes first fail closed at the ledger (the task is ended)."""
+        guards of a stdio owner that closes first find no open task and refuse their calls."""
         cfg = self.guard.cfg
         path = task.state_path(cfg)
         try:
             with task.locked(path):
                 st = task.load(path, cfg.agent_id)
-                if st and st.task_seq == self.task_seq:
-                    st.tasks = []
+                if st and self.own[1] in (st.guard_task, *st.tasks):
+                    task.drop(st, self.own[1])
                     task.save(st, path)
         except OSError:
             pass

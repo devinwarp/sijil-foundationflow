@@ -3,7 +3,9 @@ URL points here; each request is matched to an OpenAPI operation, sealed as a to
 tool_result, and forwarded only if the rules allow it. Without the base-URL change nothing is seen.
 
 `POST /_sijil/task/start` and `/_sijil/task/end` open and close the agent's tasks under the adapter's agent
-session, so the agent can bind its model calls to the same task (the ledger's H3).
+session, so the agent can bind its model calls to the same task (the ledger's H3). They go through the shared
+state file, under its lock and with its 401 renewal, as `sijil-guard task start|end` do: one task per
+conversation, side by side, so a stdio MCP guard of the same agent joins the current one (spec §5.9).
 
 The result's output_hash and bytes commit to the upstream's bytes as they arrived (Pipeline.result has the
 definition both doors share). The relayed body is those
@@ -219,6 +221,9 @@ class Adapter:
     def state(self) -> task.State:
         return task.shared(task.state_path(self.cfg), self.cfg.agent_id, self.open_session)
 
+    def update(self, fn):
+        return task.update(task.state_path(self.cfg), self.cfg.agent_id, self.open_session, fn)
+
     def authorised(self, request: Request) -> bool:
         if self.tools.auth != "bearer_env":
             return True                  # mtls is enforced by the TLS layer; none only on loopback
@@ -228,27 +233,32 @@ class Adapter:
         b = await body_of(request)
         if b is None or b.get("harness", "http-agent") not in HARNESSES or not isinstance(b.get("intent", ""), str):
             return JSONResponse({"error": "body: {intent, session_id, harness in " + ", ".join(HARNESSES) + "}"}, 400)
-        harness = b.get("harness", "http-agent")
+        intent = b.get("intent") or self.cfg.intent
+        if not intent.strip():
+            return JSONResponse({"error": "a task needs an intent (body intent, or task.intent in guard.yaml)"}, 400)
         token = request.headers.get(self.cfg.principal_header.lower())
+
+        def start(st: task.State) -> tuple[int, str]:
+            return task.start(self.ledger, st, intent, b.get("harness", "http-agent"), str(b.get("session_id", "")),
+                              principal_token=token, principal_header=self.cfg.principal_header,
+                              alongside=True), st.agent_session
         try:
-            st = await asyncio.to_thread(self.state)
-            seq = await asyncio.to_thread(task.start_task, self.ledger, st.agent_session, b.get("intent", ""),
-                                          harness, str(b.get("session_id", "")), "", token,
-                                          self.cfg.principal_header)
+            seq, session = await asyncio.to_thread(self.update, start)
         except Refused as e:
             return JSONResponse({"error": e.detail}, e.status)
         except (Unreachable, OSError, ValueError) as e:
             return unavailable(e)
-        return JSONResponse({"task_seq": seq, "agent_session": st.agent_session})
+        return JSONResponse({"task_seq": seq, "agent_session": session})
 
     async def task_end(self, request: Request) -> JSONResponse:
         b = await body_of(request)
-        if b is None or b.get("outcome", "completed") not in ("completed", "aborted", "blocked", "error"):
+        seq = b.get("task_seq") if b is not None else None
+        seq = int(seq) if isinstance(seq, str) and seq.isdecimal() else seq
+        if type(seq) is not int or b.get("outcome", "completed") not in ("completed", "aborted", "blocked", "error"):
             return JSONResponse({"error": "body: {task_seq, outcome}"}, 400)
         try:
-            st = await asyncio.to_thread(self.state)
-            r = await asyncio.to_thread(task.end_task, self.ledger, st.agent_session, b.get("task_seq"),
-                                        b.get("outcome", "completed"))
+            r = await asyncio.to_thread(self.update, lambda st: task.end(self.ledger, st, b.get("outcome", "completed"),
+                                                                         seq))
         except Refused as e:
             return JSONResponse({"error": e.detail}, e.status)
         except (Unreachable, OSError, ValueError) as e:

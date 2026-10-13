@@ -1,7 +1,10 @@
 """Tasks (spec §5.9) and the per-session state file that lets separate processes share one agent session.
 
 The state file holds the session (a bearer credential for its lifetime) and the stack of open tasks, newest
-last; a delegated task sits above the task it was delegated from. It is written 0600 outside the repo.
+last; a delegated task sits above the task it was delegated from, and the HTTP adapter's conversations sit side
+by side. `guard_task` is a task a stdio MCP guard started for itself because none was open: it is current only
+while the stack is empty, so a later `task start` (the hook) is not refused and goes above it. Every process of
+one agent reads the current task from here (spec §5.9). It is written 0600 outside the repo.
 """
 
 import fcntl
@@ -28,10 +31,11 @@ class State:
     principal: str
     expires_at: str
     tasks: list[int] = field(default_factory=list)
+    guard_task: int | None = None
 
     @property
     def task_seq(self) -> int | None:
-        return self.tasks[-1] if self.tasks else None
+        return self.tasks[-1] if self.tasks else self.guard_task
 
     def headers(self) -> dict:
         """What the agent puts on its model calls so they land in this task (spec §5.4, M2b chat binding)."""
@@ -132,14 +136,17 @@ def end_task(ledger: Ledger, agent_session: str, task_seq: int, outcome: str) ->
 
 
 def start(ledger: Ledger, state: State, intent: str, harness: str, session_id: str = "", delegate: bool = False,
-          principal_token: str | None = None, principal_header: str = "X-Sijil-Principal-Token") -> int:
-    """Start a task in the state file's session; with `delegate`, delegated from the current one (spec §5.9).
-    Refused while a task is open unless delegating, and when delegating with none open: never drop a task."""
+          principal_token: str | None = None, principal_header: str = "X-Sijil-Principal-Token",
+          alongside: bool = False) -> int:
+    """Start a task in the state file's session; with `delegate`, delegated from the current one (spec §5.9);
+    with `alongside`, next to the open ones (the adapter's one task per conversation, §17.2.8). Refused while a
+    task is open unless delegating or alongside, and when delegating with none open: never drop a task. A stdio
+    guard's own task does not count as open here."""
     if not intent.strip():
         raise ValueError("a task needs an intent (--intent or task.intent in guard.yaml)")
-    if state.tasks and not delegate:
+    if state.tasks and not (delegate or alongside):
         raise ValueError(f"task {state.task_seq} is still open: end it, or pass --delegate to start a child task")
-    if delegate and not state.tasks:
+    if delegate and state.task_seq is None:
         raise ValueError("--delegate needs an open task to delegate from")
     seq = start_task(ledger, state.agent_session, intent, harness, session_id,
                      str(state.task_seq) if delegate else "", principal_token, principal_header)
@@ -147,9 +154,17 @@ def start(ledger: Ledger, state: State, intent: str, harness: str, session_id: s
     return seq
 
 
-def end(ledger: Ledger, state: State, outcome: str) -> dict:
-    if state.task_seq is None:
+def end(ledger: Ledger, state: State, outcome: str, task_seq: int | None = None) -> dict:
+    """End the current task, or the one named (the adapter's), and take it off the state file."""
+    seq = state.task_seq if task_seq is None else task_seq
+    if seq is None:
         raise ValueError("no open task in this state file")
-    r = end_task(ledger, state.agent_session, state.task_seq, outcome)
-    state.tasks.pop()
+    r = end_task(ledger, state.agent_session, seq, outcome)
+    drop(state, seq)
     return r
+
+
+def drop(state: State, seq: int) -> None:
+    state.tasks = [t for t in state.tasks if t != seq]
+    if state.guard_task == seq:
+        state.guard_task = None

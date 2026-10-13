@@ -444,7 +444,8 @@ def router(require_admin) -> APIRouter:
             raise HTTPException(409, "rulepack mismatch")
         except ValueError as e:
             raise HTTPException(400, str(e))
-        return {"seq": rec["seq"], "record_hash": rec["record_hash"], "ts": rec["ts"], "decision": rec["decision"]}
+        return {"seq": rec["seq"], "record_hash": rec["record_hash"], "ts": rec["ts"], "decision": rec["decision"],
+                "task_seq": rec["task_seq"]}
 
     @r.get("/api/agent/parent")
     async def parent(request: Request, tool_use_id: str = "", name: str = "", args_hash: str = "",

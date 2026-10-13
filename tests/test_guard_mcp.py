@@ -136,6 +136,29 @@ def test_stdio_downstream_answers_requests_asks_the_client_and_closes_at_eof():
     assert log == [("open", True, None), ("note", "notifications/initialized"), ("close",)]
 
 
+def test_a_cancelled_initialize_closes_its_session():
+    """Final review Minor 12: a session whose initialize never finished is closed (its owned task ended)."""
+    log, started = [], asyncio.Event()
+
+    class Slow(Echo):
+        async def handle(self, method, params):
+            started.set()
+            await asyncio.Event().wait()
+
+    async def go():
+        async def new(client, headers):
+            return Slow(client, headers, log)
+        app = mcp.http_app(new)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://guard") as h:
+            req = asyncio.create_task(h.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize"}))
+            await started.wait()
+            req.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await req
+        return app.state.sessions
+    assert asyncio.run(go()) == {} and log[-1] == ("close",)
+
+
 def test_http_downstream_sessions():
     log = []
 
@@ -146,7 +169,10 @@ def test_http_downstream_sessions():
                    headers={"X-Sijil-Principal-Token": "tok"})
         sid = r.headers["mcp-session-id"]
         assert r.json()["result"] == {"protocolVersion": mcp.PROTOCOL} and sid.startswith("ms_")
-        assert c.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "echo"}).status_code == 404
+        assert c.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "echo"}).status_code == 400   # missing
+        assert c.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "echo"},
+                      headers={"Mcp-Session-Id": "ms_x"}).status_code == 404                           # unknown
+        assert c.delete("/mcp").status_code == 400
         h = {"Mcp-Session-Id": sid}
         assert c.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "echo", "params": {"b": 2}},
                       headers=h).json()["result"] == {"echo": {"b": 2}}

@@ -576,7 +576,11 @@ def http_app(new_session: NewSession, allowed_origins: tuple = (), token: str = 
             try:
                 sid = "ms_" + secrets.token_hex(16)
                 session = await new_session(Client(), dict(request.headers))
-                out = await _answer(session, msg)
+                try:
+                    out = await _answer(session, msg)
+                except BaseException:                           # cancelled: its owned task must not stay open
+                    await session.close()
+                    raise
                 if "error" in out:                              # a failed initialize opens nothing
                     await session.close()
                     return JSONResponse(out)
@@ -584,8 +588,10 @@ def http_app(new_session: NewSession, allowed_origins: tuple = (), token: str = 
             finally:
                 opening[0] -= 1
             return JSONResponse(out, headers={"Mcp-Session-Id": sid})
+        if not sid:                                     # MCP 2025-06-18: 400; 404 would tell it to re-initialize
+            return _error(400, INVALID_REQUEST, "missing Mcp-Session-Id", msg.get("id"))
         if sid not in sessions:
-            return _error(404, INVALID_REQUEST, "unknown or missing Mcp-Session-Id", msg.get("id"))
+            return _error(404, INVALID_REQUEST, "unknown Mcp-Session-Id", msg.get("id"))
         session, touched[sid] = sessions[sid], time.monotonic()
         if "id" not in msg:
             try:
@@ -599,7 +605,7 @@ def http_app(new_session: NewSession, allowed_origins: tuple = (), token: str = 
     async def delete(request: Request):
         sid = request.headers.get("mcp-session-id", "")
         if sid not in sessions:
-            return Response(status_code=404)
+            return Response(status_code=404 if sid else 400)
         await drop(sid)
         return Response(status_code=204)
 
