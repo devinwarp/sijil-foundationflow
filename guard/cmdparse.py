@@ -38,7 +38,6 @@ WRAPPERS = {
                "--max-lines", "--max-procs", "--max-chars"}, 0),
 }
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
-SHORT_C = re.compile(r"-[A-Za-z]*c")                        # -c, -lc, -ec, -xc: a cluster ending in c runs a string
 READERS = {"cat", "less", "more", "head", "tail", "base64", "xxd", "od", "strings", "source", ".", "wc", "sort",
            "uniq", "nl", "tac", "jq", "yq", "file", "stat", "diff", "cmp", "md5sum", "sha256sum", "shasum"}
 PATTERN_FIRST = {"grep", "egrep", "fgrep", "rg", "ag"}           # first positional is the pattern
@@ -122,6 +121,7 @@ def normalise(path: str, roots: Roots) -> list[str]:
     $HOME, absolute elsewhere (spec §7.2). The real home directory never appears in the result. Both the
     resolved and the as-written form are returned when they differ, so `ln -s ~/.ssh k; cat k/id_rsa` and
     /etc on a host where /etc is a symlink both still match their globs."""
+    path = path.replace("\x00", "")
     for prefix in ("~", "$HOME", "${HOME}"):
         if path == prefix or path.startswith(prefix + "/"):
             path = roots.home + path[len(prefix):]
@@ -285,6 +285,11 @@ def _unwrap(argv: list[str]) -> tuple[list[str], list[str]]:
         name = os.path.basename(argv[i])
         if ASSIGN.fullmatch(argv[i]) or argv[i] in KEYWORDS:
             i += 1
+        elif argv[i] in ("for", "select", "case"):
+            words = argv[i + 1:]
+            if argv[i] != "case":
+                words = words[words.index("in") + 1:] if "in" in words else []
+            return [""] + [w for w in words if w != "in"], []   # the word list stays visible, `for` is no command
         elif name in WRAPPERS:
             value_opts, positionals = WRAPPERS[name]
             i += 1
@@ -546,9 +551,26 @@ def _find_execs(args: list[str]) -> list[str]:
     return out
 
 
+def _shell_command(args: list[str]) -> list[str]:
+    """The string `sh -c` runs: if any short-option cluster before the first operand has a c (-c, -lc, -cl, -ci),
+    it is the first operand. Option clusters, `-o name` / `+o name` pairs and `--` are skipped on the way."""
+    has_c, i = False, 0
+    while i < len(args):
+        a, i = args[i], i + 1
+        if a == "--":
+            break
+        if not a.startswith(("-", "+")):
+            return [a] if has_c else []                  # the first operand: a command string, or a script file
+        if not a.startswith("--"):
+            has_c |= a[0] == "-" and "c" in a
+            if a[-1] in "oO" and i < len(args):
+                i += 1                                    # -o pipefail, +o errexit, -O extglob
+    return args[i:i + 1] if has_c else []
+
+
 def _nested_commands(argv0: str, args: list[str]) -> list[str]:
     if argv0 in SHELLS:
-        return [args[i + 1] for i, a in enumerate(args[:-1]) if SHORT_C.fullmatch(a)][:1]
+        return _shell_command(args)
     if argv0 == "eval":
         return [" ".join(args)]
     return _find_execs(args) if argv0 == "find" else []
@@ -575,20 +597,33 @@ def _fed_commands(argv0: str, feeds: list[tuple[str, str]], bodies: list) -> tup
 
 
 def _segments(tokens: list[str]) -> list[list[str]]:
-    segments, current = [], []
+    """Split at separators. A `)` with no open `(` ends a case-arm pattern (`a|b)`): the pattern words are kept
+    as a segment with an empty argv0, so they are seen but are not a command."""
+    segments, current, depth, joined = [], [], 0, 0      # joined: trailing segments ended by `|`
     for tok in tokens + [Op(";")]:
-        if isinstance(tok, Op) and tok in SEPARATORS:
+        if not (isinstance(tok, Op) and tok in SEPARATORS):
+            current.append(tok)
+            continue
+        depth += {"(": 1, ")": -1}.get(tok, 0)
+        if tok == ")" and depth < 0:
+            depth = 0
             if current:
                 segments.append(current)
-            current = []
-        else:
-            current.append(tok)
+                joined += 1
+            for k in range(len(segments) - joined, len(segments)):
+                segments[k] = [""] + segments[k]
+            current, joined = [], 0
+            continue
+        if current:
+            segments.append(current)
+        joined = joined + 1 if tok == "|" and current else 0
+        current = []
     return segments
 
 
 def parse(command: str, roots: Roots, _depth: int = 0, _bodies: list | None = None) -> Parsed:
     bodies = [] if _bodies is None else _bodies           # heredoc bodies, shared with nested parses
-    text, inner = _substitutions(_heredocs(command, bodies))
+    text, inner = _substitutions(_heredocs(command.replace("\x00", " "), bodies))   # NUL separates, never raises
     out, nested, piped, stdin_shell = [], list(inner), [], False
     for raw in _segments(_tokens(text)):
         argv, reads, writes, feeds = _redirections(raw)
@@ -600,7 +635,7 @@ def parse(command: str, roots: Roots, _depth: int = 0, _bodies: list | None = No
         nested += wrapped + commands + run
         piped += texts + ([" ".join(args)] if argv0 in ("echo", "printf") else [])
         stdin_shell |= argv0 in SHELLS and not commands and not _positionals(args)
-        if not (argv0 or reads or writes):
+        if not (argv0 or args or reads or writes):
             continue                                       # `fi`, `done`, `}` and the like
         r, w = _paths(argv0, args)
         out.append(Segment(argv0=argv0, args=args, reads=[n for p in reads + r for n in normalise(p, roots)],
