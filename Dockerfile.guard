@@ -1,0 +1,16 @@
+# sijil-guard and its HTTP tool adapter (Apache-2.0). Holds guard/ only: no sijill/, no ledger code.
+# python:3.11-slim, pinned by its multi-arch index digest (refresh: docker buildx imagetools inspect python:3.11-slim)
+FROM python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce
+WORKDIR /app
+COPY deploy/guard-requirements.lock requirements.lock
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
+COPY guard guard
+COPY rulepacks/starter.yaml rulepacks/starter.yaml
+# OpenShift runs an arbitrary UID in group 0: make /state group-writable. The agent key and the session
+# state file live there (both 0600, owned by the running UID); guard.yaml is mounted read-only at /config.
+RUN mkdir /state /config && chgrp 0 /state && chmod g=u /state
+ENV HOME=/state XDG_RUNTIME_DIR=/state PYTHONDONTWRITEBYTECODE=1
+USER 1001
+EXPOSE 8090
+ENTRYPOINT ["python", "-m", "guard", "--config", "/config/guard.yaml"]
+CMD ["http"]

@@ -1,0 +1,11 @@
+Sijil {{ .Chart.AppVersion }} installed as {{ include "sijil.fullname" . }}.
+
+Ledger: {{ include "sijil.ledgerUrl" . }}  (in-cluster). Agents must call it through this Service, not a Route or
+Ingress: an agent session is bound to the address that opened it, and a router rewrites the source address.
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "sijil.fullname" . }}-ledger 8000:{{ .Values.ledger.service.port }}
+  curl -s localhost:8000/api/verify
+  kubectl -n {{ .Release.Namespace }} exec {{ include "sijil.fullname" . }}-ledger-0 -- cat /data/node.pub   # for auditors
+
+The adapter runs as a sidecar of your agent: see examples/agent-sidecar.yaml in the chart source and
+docs/OPERATOR_GUIDE_M2.md.

@@ -1,0 +1,18 @@
+{{- if and .Values.networkPolicy.enabled .Values.ledger.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sijil.fullname" . }}-ledger
+  labels: {{- include "sijil.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/instance: {{ .Release.Name }}, app.kubernetes.io/component: ledger}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {sijil.io/agent: "true"}}
+        {{- with .Values.networkPolicy.from }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports: [{port: http}]
+{{- end }}

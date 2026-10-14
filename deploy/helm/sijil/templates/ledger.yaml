@@ -1,0 +1,134 @@
+{{- if .Values.ledger.enabled }}
+{{- $name := printf "%s-ledger" (include "sijil.fullname" .) }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels: {{- include "sijil.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.ledger.service.type }}
+  selector: {app.kubernetes.io/instance: {{ .Release.Name }}, app.kubernetes.io/component: ledger}
+  ports:
+    - {name: http, port: {{ .Values.ledger.service.port }}, targetPort: http}
+---
+# The StatefulSet's governing Service (pod DNS). Clients use the Service above.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-headless
+  labels: {{- include "sijil.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector: {app.kubernetes.io/instance: {{ .Release.Name }}, app.kubernetes.io/component: ledger}
+  ports:
+    - {name: http, port: {{ .Values.ledger.service.port }}, targetPort: http}
+---
+# One replica, always: one writer holds the chain head in memory (SQLite, one uvicorn worker).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels: {{- include "sijil.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ledger
+spec:
+  replicas: 1
+  serviceName: {{ $name }}-headless
+  selector:
+    matchLabels: {app.kubernetes.io/instance: {{ .Release.Name }}, app.kubernetes.io/component: ledger}
+  template:
+    metadata:
+      labels: {{- include "sijil.labels" . | nindent 8 }}
+        app.kubernetes.io/component: ledger
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{ toJson . }}
+      {{- end }}
+      automountServiceAccountToken: false   # the ledger never talks to the Kubernetes API
+      securityContext: {{ toJson .Values.podSecurityContext }}
+      containers:
+        - name: ledger
+          image: {{ include "sijil.image" (dict "image" .Values.image.ledger "name" "ledger") | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports: [{name: http, containerPort: 8000}]
+          env:
+            - name: SIJILL_ADMIN_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ include "sijil.secretName" . }}, key: admin-token}}
+            - name: SIJILL_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ include "sijil.secretName" . }}, key: agent-token}}
+            {{- if .Values.rulepack }}
+            - {name: SIJILL_RULEPACK_PATH, value: /rulepack/rulepack.yaml}
+            {{- end }}
+            {{- if .Values.ledger.nodeKeySecret }}
+            - {name: NODE_KEY_PATH, value: /node-key/node.key}
+            {{- end }}
+            {{- if .Values.ledger.publicUrl }}
+            - {name: SIJILL_PUBLIC_URL, value: {{ .Values.ledger.publicUrl | quote }}}
+            {{- end }}
+            # read-only root: caches (fontconfig for the PDF report) go to /tmp
+            - {name: HOME, value: /tmp}
+            - {name: XDG_CACHE_HOME, value: /tmp/.cache}
+            {{- range $k, $v := .Values.ledger.env }}
+            - {name: {{ $k }}, value: {{ $v | quote }}}
+            {{- end }}
+            {{- with .Values.ledger.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            httpGet: {path: /api/policy, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /api/policy, port: http}
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 4
+          securityContext: {{ toJson .Values.securityContext }}
+          resources: {{ toJson .Values.ledger.resources }}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: policy, mountPath: /config, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+            {{- if .Values.rulepack }}
+            - {name: rulepack, mountPath: /rulepack, readOnly: true}
+            {{- end }}
+            {{- if .Values.ledger.nodeKeySecret }}
+            - {name: node-key, mountPath: /node-key, readOnly: true}
+            {{- end }}
+            {{- if .Values.ledger.models.existingClaim }}
+            - {name: models, mountPath: /models, readOnly: true}
+            {{- end }}
+            {{- with .Values.ledger.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: policy
+          configMap: {name: {{ include "sijil.fullname" . }}-policy}
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.rulepack }}
+        - name: rulepack
+          configMap: {name: {{ include "sijil.fullname" . }}-rulepack}
+        {{- end }}
+        {{- if .Values.ledger.nodeKeySecret }}
+        - name: node-key
+          # 0440: root-owned, readable through the group: GID 0 (no runAsGroup) or fsGroup (OpenShift injects one).
+          # If you set runAsGroup to a non-zero GID, set fsGroup too (podSecurityContext).
+          secret: {secretName: {{ .Values.ledger.nodeKeySecret }}, defaultMode: 0440}
+        {{- end }}
+        {{- if .Values.ledger.models.existingClaim }}
+        - name: models
+          persistentVolumeClaim: {claimName: {{ .Values.ledger.models.existingClaim }}, readOnly: true}
+        {{- end }}
+        {{- with .Values.ledger.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.ledger.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests: {storage: {{ .Values.ledger.persistence.size }}}
+{{- end }}

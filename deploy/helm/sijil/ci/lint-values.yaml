@@ -1,0 +1,8 @@
+# helm lint / helm template only (CI): every template rendered, placeholder tokens. Not for installs.
+image: {ledger: {tag: v0.0.0}, guard: {digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}}
+secrets: {values: {adminToken: a, agentToken: b, toolsToken: c}}
+ledger: {policy: "policy_id: x\n", configFiles: {jwks.json: '{"keys": []}'}}
+rulepack: "rulepack_id: r\nversion: 1\n"
+guard: {agentKeySecret: k, files: {case-api.json: "{}"}, probes: {enabled: true}}
+agent: {enabled: true, image: busybox, mcpGuards: [{server: docs, port: 8091}]}
+networkPolicy: {enabled: true}

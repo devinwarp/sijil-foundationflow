@@ -1,0 +1,8 @@
+# The guard's runtime dependencies only; pins match requirements.txt. Dockerfile.guard installs the hashed
+# lock built from this file, deploy/guard-requirements.lock (regenerate it after any change here).
+anyio==4.15.1
+cryptography==50.0.1
+fastapi==0.141.1
+httpx==0.28.1
+PyYAML==6.0.3
+uvicorn[standard]==0.54.0
