@@ -248,7 +248,33 @@ def test_a_lone_surrogate_from_the_model_is_sealed_as_an_upstream_error(tmp_path
     [rec] = rows(s.db_path)
     x = ext(rec)
     assert (rec["model_digest"], rec["output_hash"], json.loads(rec["rule_hits"])) == \
-        ("api:azure-openai:" + DATED, "", ["upstream_error"])
+        ("api:azure-openai:" + DATED, "", ["upstream_error"] if model == DATED else ["approved_models", "upstream_error"])
     assert (x["response_hash"], x["tool_uses"]) == (record.sha256_hex(body.encode()), [])
     assert sqlite(s.db_path, "SELECT count(*) FROM tool_use_index") == "0"
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def raw_answer(model: str, content: str):
+    """answer(), but the body escapes lone surrogates as JSON does on the wire."""
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "application/json"}, content=json.dumps({
+            "id": "chatcmpl-1", "model": model, "choices": [{"index": 0, "finish_reason": "stop",
+                                                             "message": {"role": "assistant", "content": content}}]}).encode())
+    return handler
+
+
+@pytest.mark.parametrize("handler,stream", [
+    (raw_answer("gpt-4.1-2025-09-30", "lone \udfff"), False),   # unapproved, and the answer cannot be hashed
+    (streamed(chunk(model="gpt-5\ud800", content="hidden")), True),
+], ids=["content", "streamed-model"])
+def test_api_mode_an_unhashable_answer_from_an_unapproved_model_keeps_the_block(tmp_path, handler, stream):
+    """The allowlist decided block before the answer proved unhashable: the record keeps that evidence."""
+    client, s = make_node(tmp_path, handler, API_POLICY, **API)
+    with client:
+        r = client.post("/v1/chat/completions", json={"model": "gpt-4.1", "messages": [{"role": "user", "content": "hi"}],
+                                                      "stream": stream})
+    [rec] = rows(s.db_path)
+    assert (rec["decision"], rec["mode"], json.loads(rec["rule_hits"])) == \
+        ("block", "enforce", ["approved_models", "upstream_error"])
+    assert rec["model_digest"] == "api:azure-openai:gpt-4.1" and rec["output_hash"] == ""
     assert verify(s.db_path, s.pubkey_path)[0] == 0

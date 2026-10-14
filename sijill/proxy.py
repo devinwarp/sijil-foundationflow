@@ -428,11 +428,14 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                                         "ext": ext(**budgets.cost(n.rulepack, digest, None))}))
             return JSONResponse(status_code=status, headers=headers(rec, upstream_ms), content=content)
 
-        def unhashable(spent, response_hash: str) -> dict:
+        def unhashable(spent, response_hash: str, post=None) -> dict:
             """An answer carrying a value no record can hash (§2.2: NaN, an infinity, a lone surrogate) was forwarded
-            and billed: sealed as an upstream_error, priced, with only its raw bytes hashed and nothing parsed from it."""
+            and billed: sealed as an upstream_error, priced, with only its raw bytes hashed and nothing parsed from it.
+            An allowlist block of the answering model stands, under the requested digest."""
             x = json.loads(ext(**budgets.cost(n.rulepack, digest, spent)) or "{}")   # weights mode drops response_hash
-            return {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]),
+            decided = {"decision": "block", "mode": post[0]["mode"], "rule_hits": policy.rule_hits_json(
+                post[1] + [policy.UPSTREAM_ERROR_HIT])} if post and post[0]["decision"] == "block" else {}
+            return {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]), **decided,
                     "ext": record.canonical_json({**x, "response_hash": response_hash}).decode()}
 
         UNHASHABLE = {"error": {"message": "model runtime returned an answer no record can hash (NaN, an infinity "
@@ -532,7 +535,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                         record.canonical_json(sealed)      # every field the seal will hash, model_digest included
                     except (record.NotCanonical, UnicodeEncodeError):
                         ok, bad = False, True
-                        sealed = unhashable(spent, relayed.hexdigest())
+                        sealed = unhashable(spent, relayed.hexdigest(), post)
                         if halted:
                             sealed = {**sealed, "decision": "block", "mode": "enforce", "rule_hits":
                                       policy.rule_hits_json(hits + [policy.HALT_HIT, policy.UPSTREAM_ERROR_HIT])}
@@ -600,7 +603,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                                  **budgets.cost(n.rulepack, answered_by, usage(data.get("usage"))))}
             record.canonical_json(sealed)          # every field the seal will hash, model_digest included
         except (record.NotCanonical, UnicodeEncodeError):
-            rec = await n.seal(settled(unhashable(usage(data.get("usage")), record.sha256_hex(resp.content))))
+            rec = await n.seal(settled(unhashable(usage(data.get("usage")), record.sha256_hex(resp.content), post)))
             return JSONResponse(status_code=502, headers=headers(rec, upstream_ms), content=UNHASHABLE)
         if post and post[0]["decision"] == "block":
             # The provider answered, but not with an approved model: the answer is withheld.
