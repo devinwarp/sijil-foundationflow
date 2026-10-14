@@ -485,8 +485,8 @@ def test_64_kb_of_letters_in_any_argument_is_blocked_before_any_scan(env, tool, 
     v = rules.evaluate(pack, facts, pins)
     assert time.perf_counter() - start < 0.05 and parsed is None
     assert (v.hits, v.action) == ([rules.COMMAND_TOO_LONG], "block")
-    nested = call(env, "mcp:srv:any_tool", {"a": {"b": ["a" * 40000]}})              # nested values count too
-    assert (nested.hits, nested.action) == ([rules.COMMAND_TOO_LONG], "block")
+    listed = call(env, "mcp:srv:any_tool", {"paths": ["a" * 20000, "b" * 20000]})     # a list's strings count too
+    assert (listed.hits, listed.action) == ([rules.COMMAND_TOO_LONG], "block")
 
 
 @pytest.mark.parametrize("unit", ARG_FILLER)
@@ -516,3 +516,57 @@ def test_the_url_scan_is_the_regex_in_linear_time():
         start = time.perf_counter()
         urls(_fill(unit, 1 << 18))
         assert time.perf_counter() - start < 0.05, unit
+
+
+BIG = 1 << 20      # 1 MB, 32 times the default argument cap
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("Write", {"file_path": "notes/case.md", "content": _fill("a/b ", BIG)}),
+    ("Edit", {"file_path": "notes/case.md", "old_string": "x", "new_string": _fill("a/", BIG)}),
+    ("http:case-api:uploadDocument", {"caseId": "MOI-2026-004211", "data": _fill("QUJD/+", BIG), "message": "x"}),
+    ("mcp:srv:any_tool", {"caseId": "MOI-2026-004211", "attachment": {"bytes": _fill("ab/", BIG)}}),   # nested
+])
+def test_content_no_rule_reads_is_not_capped(env, tool, args):
+    """The argument cap covers what the engine scans as a path (top-level strings and lists of strings outside the
+    content arguments) and what an arg_regex rule reads; text payloads are only URL-scanned, in linear time."""
+    import time
+    start = time.perf_counter()
+    v = call(env, tool, args)
+    assert time.perf_counter() - start < 0.5 and rules.COMMAND_TOO_LONG not in v.hits
+    write = call(env, "Write", {"file_path": "/etc/sudoers", "content": _fill("a", BIG)})     # its path is still read
+    assert write.action == "block" and rules.COMMAND_TOO_LONG not in write.hits
+
+
+def test_a_heredoc_is_part_of_the_command_and_stays_capped(env):
+    """command_regex reads the whole command string, heredoc bodies included, so the command cap applies to it."""
+    v = call(env, "Bash", {"command": "cat > notes.md <<'EOF'\n" + _fill("a ", rules.MAX_COMMAND) + "\nEOF"})
+    assert (v.hits, v.action) == ([rules.COMMAND_TOO_LONG], "block")
+
+
+def test_an_argument_an_arg_regex_rule_reads_stays_capped(tmp_path, env):
+    (tmp_path / "p.yaml").write_text("""rulepack_id: p
+version: 1
+rules:
+  - id: no-secrets-in-notes
+    on: tool_call
+    action: block
+    match: {tool: ["http:case-api:*"], arg_regex: {content: "BEGIN (RSA )?PRIVATE KEY"}}
+""")
+    pack, pins, roots = rules.load(str(tmp_path / "p.yaml")), env[1], env[2]
+    big = {"content": _fill("ab ", rules.MAX_ARGS + 1)}
+    for tool, hits in (("http:case-api:addCaseNote", [rules.COMMAND_TOO_LONG]), ("Write", [])):
+        facts, _ = rules.call_facts(tool, tool.rsplit(":", 1)[-1], big, roots, "x")
+        assert rules.evaluate(pack, facts, pins).hits == hits, tool
+    facts, _ = rules.call_facts("http:case-api:addCaseNote", "addCaseNote", {"content": "BEGIN PRIVATE KEY"}, roots, "x")
+    assert rules.evaluate(pack, facts, pins).hits == ["no-secrets-in-notes"]
+
+
+def test_the_caps_are_set_per_call(env):
+    pack, pins, roots = env
+    facts, _ = rules.call_facts("Bash", "Bash", {"command": "ls " + "a" * 100}, roots, "x", max_command=64)
+    assert facts.too_long
+    facts, _ = rules.call_facts("mcp:srv:t", "t", {"note": "a" * 100}, roots, "x", max_args=64)
+    assert facts.too_long
+    facts, _ = rules.call_facts("mcp:srv:t", "t", {"note": "a" * 40000}, roots, "x", max_args=65536)
+    assert not facts.too_long and rules.evaluate(pack, facts, pins).hits == []

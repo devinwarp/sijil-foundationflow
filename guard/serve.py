@@ -172,6 +172,11 @@ class Guard:
             raw = result.get("tools")
             for t in raw if isinstance(raw, list) else []:
                 if isinstance(t, dict) and isinstance(t.get("name"), str):
+                    try:
+                        integrity.tool_hash(t)      # pinned and checked by this hash
+                    except ValueError:
+                        raise mcp.RpcError(mcp.INTERNAL, "wrapped server lists a tool carrying NaN or an infinity") \
+                            from None
                     size += _wire(t)
                     if len(out) >= MAX_TOOLS or size > MAX_TOOLS_BYTES:
                         raise mcp.RpcError(mcp.INTERNAL, "wrapped server lists more tools than sijil-guard relays")

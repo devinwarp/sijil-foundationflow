@@ -119,8 +119,8 @@ def canonical_json(obj) -> bytes:
     try:
         return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
                           allow_nan=False).encode("utf-8")
-    except ValueError as e:        # NaN or an infinity; a lone surrogate's UnicodeEncodeError is a ValueError too
-        raise NotCanonical(str(e)) from e
+    except (ValueError, RecursionError) as e:  # NaN, an infinity, nesting past the encoder's limit; a lone
+        raise NotCanonical(str(e)) from e      # surrogate's UnicodeEncodeError is a ValueError too
 
 
 def sha256_hex(data: bytes) -> str:

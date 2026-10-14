@@ -49,9 +49,13 @@ PATH_SUFFIXES = ("path", "paths", "file", "files", "dir", "directory", "folder",
 # A command longer than this is not parsed or matched: it is blocked as COMMAND_TOO_LONG, never truncated. Sized so
 # the starter pack's command_regex rules, evaluated together on benign filler at the cap, take about 40 ms; past it
 # their backtracking grows quadratically and, holding the GIL, would stall the whole guard and the ledger's relay.
+# The command string is matched whole, heredoc bodies included. Default; guard.yaml limits.max_command sets it.
 MAX_COMMAND = 2048
-# Every argument the engine looks at, serialised, is capped the same way and checked before any scan: resolving a
-# long path argument costs a stat per segment. At this size the worst benign filler takes about 40 ms in all.
+# The arguments the engine scans as paths (top-level strings and lists of strings outside CONTENT_ARGS, counted in
+# characters) are capped the same way, checked before any scan: resolving a long path argument costs a stat per
+# segment. At this size the worst benign filler takes about 40 ms in all. So is each argument an arg_regex rule
+# reads (evaluate). Text payloads (CONTENT_ARGS) and nested values are read by neither, only URL-scanned, which is
+# linear, so they are not capped. Default; guard.yaml limits.max_args sets it.
 MAX_ARGS = 32768
 COMMAND_TOO_LONG = "command-too-long"
 CONTENT_ARGS = {"content", "contents", "text", "body", "data", "message", "old_string", "new_string", "new_source"}
@@ -240,6 +244,7 @@ class Facts:
     method: str = ""
     path_template: str = ""
     too_long: bool = False        # the command is over MAX_COMMAND: nothing was parsed, the call is blocked
+    max_args: int = MAX_ARGS      # the cap on an argument an arg_regex rule reads
 
 
 def _as_text(command) -> str | None:
@@ -269,31 +274,43 @@ def _path_args(args: dict):
                 yield _file_uri_path(s)
 
 
+def _scanned(args: dict) -> int:
+    """Characters of what _path_args may resolve: top-level strings and the strings of top-level lists, outside
+    CONTENT_ARGS."""
+    return sum(len(s) for k, v in args.items() if k not in CONTENT_ARGS
+               for s in (v if isinstance(v, list) else [v]) if isinstance(s, str))
+
+
+def _size(v) -> int:
+    """An argument as arg_regex reads it; one too deep to serialise is over any cap."""
+    try:
+        return len(v if isinstance(v, str) else json.dumps(v, sort_keys=True))
+    except (ValueError, TypeError, RecursionError):
+        return 1 << 62
+
+
 def call_facts(tool: str, bare: str, args: dict, roots: Roots, harness: str, command_arg: str = "command",
-               **context) -> tuple[Facts, Parsed | None]:
+               max_command: int = MAX_COMMAND, max_args: int = MAX_ARGS, **context) -> tuple[Facts, Parsed | None]:
     """Facts for a tool_call. A shell tool carries its command in `command_arg` (or cmd, script, commandLine);
     every tool's path-like arguments are paths too, written when the tool is a write tool. Over-seeing a path
     is acceptable, missing one is not."""
-    try:                                       # first, before any parse or scan of what the call carries
-        size = len(json.dumps(args, ensure_ascii=False, default=str))
-    except (ValueError, TypeError, RecursionError):
-        size = MAX_ARGS + 1
-    if size > MAX_ARGS:
-        return Facts("tool_call", tool, harness, args=args, too_long=True, **context), None
+    if _scanned(args) > max_args:            # first, before any parse or scan of what the call carries
+        return Facts("tool_call", tool, harness, args=args, too_long=True, max_args=max_args, **context), None
     names = ([command_arg] if command_arg else []) + (list(COMMAND_ARGS) if bare in SHELL_TOOLS else [])
     command = _as_text(next((args[n] for n in names if args.get(n) is not None), None))
-    if command is not None and len(command) > MAX_COMMAND:
-        return Facts("tool_call", tool, harness, command, args=args, too_long=True, **context), None
+    if command is not None and len(command) > max_command:
+        return Facts("tool_call", tool, harness, command, args=args, too_long=True, max_args=max_args, **context), None
     paths = [n for p in _path_args(args) for n in normalise(p, roots)]
     write = bare in WRITE_TOOLS
     hosts = sorted({h for v in args.values() if isinstance(v, str) for m in urls(v) if (h := host_of(m))})
     seg = Segment(argv0="", args=[], reads=[] if write else paths, writes=paths if write else [], hosts=hosts)
     if command is None:
-        return Facts("tool_call", tool, harness, None, [seg], [], args, hosts, **context), None
+        return Facts("tool_call", tool, harness, None, [seg], [], args, hosts, max_args=max_args, **context), None
     parsed = parse(command, roots)
     hosts = sorted(set(hosts) | {h for s in parsed.segments for h in s.hosts})
     segments = parsed.segments + ([seg] if paths else [])
-    return Facts("tool_call", tool, harness, command, segments, parsed.env_refs, args, hosts, **context), parsed
+    return Facts("tool_call", tool, harness, command, segments, parsed.env_refs, args, hosts, max_args=max_args,
+                 **context), parsed
 
 
 def _any_glob(values, patterns) -> bool:
@@ -375,9 +392,18 @@ class Verdict:
     fired: tuple[Rule, ...] = ()
 
 
+def _unread(rule: Rule, f: Facts) -> bool:
+    """An argument this rule's arg_regex would read is over the cap: the regex never runs on it."""
+    m = rule.match
+    if rule.reserved or rule.on != f.type or "arg_regex" not in m or (
+            "tool" in m and not _any_glob([f.tool], m["tool"])) or ("harness" in m and f.harness not in m["harness"]):
+        return False
+    return any(key in f.args and _size(f.args[key]) > f.max_args for key in m["arg_regex"])
+
+
 def evaluate(pack: RulePack, facts: Facts, pins: Pins) -> Verdict:
-    if facts.too_long:                 # fails closed before any rule runs: no regex sees the over-long command
-        return Verdict([COMMAND_TOO_LONG], "block")
+    if facts.too_long or any(_unread(r, facts) for r in pack.rules):
+        return Verdict([COMMAND_TOO_LONG], "block")   # fails closed before any rule runs: no regex sees it
     fired = tuple(r for r in pack.rules if matches(r, facts, pins))
     action = max((r.action for r in fired), key=ACTIONS.index, default="allow")
     return Verdict([r.id for r in fired], action, fired)

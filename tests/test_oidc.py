@@ -57,7 +57,7 @@ def test_the_m2a_fixture_token_verifies_under_its_pinned_jwks(tmp_path):
     (jws(claims(), alg="EdDSA"), "alg"),                       # FETCH allows RS256 only
     (jws(claims(aud="api://someone-else")), "audience"),
     (jws(claims(life=-1)), "expired"),
-    (jws({**claims(), "nbf": int(time.time()) + 120}), "not_yet_valid"),
+    (jws({**claims(), "nbf": int(time.time()) + 1800}), "not_yet_valid"),   # minted at collection: past any suite run
 ])
 def test_refusal_codes(tmp_path, token, code):
     with pytest.raises(oidc.OidcError) as e:

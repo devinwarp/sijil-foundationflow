@@ -165,6 +165,8 @@ def test_without_a_valid_user_token_nothing_reaches_foundry(relay):
     assert foundry.seen == []
     refusal = rows(s.db_path, "type = 'inference'")[0]
     assert (refusal["decision"], refusal["task_seq"], refusal["agent_id"]) == ("block", "", FOUNDRY_AGENT)
+    # §17.4.3: model_id is the agent name until Foundry reports one, and model_digest follows it
+    assert (refusal["model_id"], refusal["model_digest"]) == ("case-agent", "api:azure-foundry:case-agent")
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
 
@@ -376,19 +378,58 @@ def test_informational_items_still_pass(tmp_path, monkeypatch):
     assert rows(s.db_path, "type = 'inference'")[-1]["decision"] == "allow"
 
 
-@pytest.mark.parametrize("arguments", ['{"caseId": "\\ud800"}', '{"caseId": "\\udc00x"}'])
-def test_a_lone_surrogate_in_gated_arguments_is_400_not_500(tmp_path, monkeypatch, arguments):
-    """§2.2: the ledger cannot hash a lone surrogate, so the request is refused; Foundry's request is not answered."""
+UNHASHABLE = [                             # (output items, answer text) Foundry may send back
+    ([{"type": "mcp_approval_request", "id": "mcpr_s", "server_label": "case-mcp", "name": "get_case",
+       "arguments": '{"caseId": "\\ud800"}'}], ""),                       # gated arguments escaping a lone surrogate
+    ([{"type": "mcp_approval_request", "id": "mcpr_s", "server_label": "case-mcp", "name": "get_case",
+       "arguments": '{"caseId": NaN}'}], ""),                              # or carrying NaN
+    ([{"type": "function_call", "call_id": "call_s", "name": "lookup", "arguments": "{bad \udc00"}], ""),
+    ([], "lone \udfff"),                                                    # the answer text
+]
+SPEND = """pricing:
+  - {id: foundry-any, model: "api:azure-foundry:*", input_per_mtok_micro: 1000000000, output_per_mtok_micro: 0,
+     missing_usage_cost_micro: 555}
+budgets:
+  - id: relay
+    match: {harness: [foundry]}
+    limits: {model_spend_micro: 1500000}
+    currency: AED
+    on_exceed: block
+"""
+
+
+@pytest.mark.parametrize("items,text", UNHASHABLE)
+def test_an_unhashable_answer_is_sealed_priced_and_counts_toward_the_budget(tmp_path, monkeypatch, items, text):
+    """§2.2: the ledger cannot hash NaN or a lone surrogate, but Foundry answered and billed: the round trip is sealed
+    as a priced upstream_error with the raw bytes hashed, nothing is gated, and the spend counts (§17.6.2)."""
     monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
-    reply = {"id": "resp_s", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
-             "output": [{"type": "mcp_approval_request", "id": "mcpr_s", "server_label": "case-mcp",
-                         "name": "get_case", "arguments": arguments}]}
-    client, s, _ = gov_node(tmp_path, pack=PACK, handler=lambda r: httpx.Response(200, json=reply), policy=FOUNDRY_POLICY)
+    seen = []
+    message = [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}]
+    reply = json.dumps({"id": "resp_s", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
+                        "usage": {"input_tokens": 1000, "output_tokens": 7}, "output": items + message}).encode()
+
+    def handler(r):
+        seen.append(r)
+        return httpx.Response(200, content=reply, headers={"content-type": "application/json"})
+    client, s, _ = gov_node(tmp_path, pack=PACK + SPEND, handler=handler, policy=FOUNDRY_POLICY)
     with client:
+        for _ in range(2):
+            r = portal(client)
+            assert r.status_code == 502 and r.json()["error"]["type"] == "upstream_error" and "mcpr_s" not in r.text
         r = portal(client)
-    assert r.status_code == 400 and "mcpr_s" not in r.text
-    assert rows(s.db_path, "type = 'tool_call'") == [] and rows(s.db_path, "type = 'inference'") == []
-    assert verify(s.db_path, s.pubkey_path)[0] == 0
+        assert r.status_code == 403 and r.json()["sijill"]["rule_hits"] == ["budget:relay:model_spend_micro"]
+    assert len(seen) == 2 and rows(s.db_path, "type = 'tool_call'") == []
+    first, second, third = rows(s.db_path, "type = 'inference'")
+    for rec in (first, second):
+        x = json.loads(rec["ext"])
+        assert (rec["model_digest"], rec["output_hash"], json.loads(rec["rule_hits"])) == \
+            ("api:azure-foundry:case-agent", "", ["upstream_error"])
+        assert (x["usage"], x["cost_micro"], x["response_hash"]) == \
+            ({"input_tokens": 1000, "output_tokens": 7}, 1000000, record.sha256_hex(reply))
+    assert third["decision"] == "block"
+    for flags in ((), ("--rulepack", str(tmp_path / "starter.yaml"))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
 
 
 def test_a_lone_surrogate_in_the_conversation_id_is_400(relay):
@@ -533,5 +574,147 @@ def test_a_confirm_rule_call_foundry_ran_unasked_is_flagged_and_verifies_with_th
     assert (call["decision"], json.loads(call["rule_hits"]), x["after_the_fact"], x["observed_by"]) == \
         ("flag", ["case-closure-needs-approval"], True, "foundry_relay")
     for flags in ((), ("--rulepack", str(s.rulepack_path))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
+
+
+DEEP = "[" * 100000 + "]" * 100000          # past the parser's recursion limit
+DONE = {"id": "resp_d2", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
+        "usage": {"input_tokens": 1000, "output_tokens": 7},
+        "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}]}
+
+
+@pytest.mark.parametrize("item", [
+    {"type": "function_call", "call_id": "call_d", "name": "lookup", "arguments": DEEP},
+    {"type": "mcp_approval_request", "id": "mcpr_d", "server_label": "case-mcp", "name": "get_case", "arguments": DEEP},
+], ids=["function_call", "mcp_approval_request"])
+def test_deeply_nested_arguments_are_sealed_raw_priced_and_counted(tmp_path, monkeypatch, item):
+    """Arguments nested past the parser's limit hash as their raw text: the round trip is sealed and priced, a gated
+    request is gated like any other, and the spend reaches the budget."""
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    ask = {**DONE, "id": "resp_d1", "output": [item]}
+
+    def handler(r):
+        return httpx.Response(200, json=DONE if json.loads(r.content).get("previous_response_id") else ask)
+    client, s, _ = gov_node(tmp_path, pack=PACK + SPEND, handler=handler, policy=FOUNDRY_POLICY)
+    with client:
+        statuses = [portal(client).status_code for _ in range(3)]
+    gated = item["type"] == "mcp_approval_request"
+    assert statuses == ([200, 403, 403] if gated else [200, 200, 403])
+    infs = rows(s.db_path, "type = 'inference'")
+    x = json.loads(infs[0]["ext"])
+    assert x["cost_micro"] == 1000000 and len(x["tool_uses"]) == 1
+    if gated:
+        assert x["tool_uses"][0]["args_hash"] == record.sha256_hex(record.canonical_json({"_raw": DEEP}))
+        call, = rows(s.db_path, "type = 'tool_call'")
+        assert call["input_hash"] == x["tool_uses"][0]["args_hash"]
+    else:
+        assert x["tool_uses"][0]["args_raw"] is True
+    assert json.loads(infs[-1]["rule_hits"]) == ["budget:relay:model_spend_micro"]
+    for flags in ((), ("--rulepack", str(tmp_path / "starter.yaml"))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
+
+
+def answer_once(tmp_path, monkeypatch, output):
+    """One portal turn whose Foundry answer carries `output` then a message; returns (response, store, reply)."""
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    reply = json.dumps({**DONE, "output": output + DONE["output"]}).encode()
+    client, s, _ = gov_node(tmp_path, pack=PACK + SPEND, handler=lambda r: httpx.Response(
+        200, content=reply, headers={"content-type": "application/json"}), policy=FOUNDRY_POLICY)
+    with client:
+        return portal(client), s, reply
+
+
+@pytest.mark.parametrize("item", [
+    {"type": "mcp_approval_request", "id": "mcpr_t", "server_label": "case-mcp", "name": "get_case",
+     "arguments": {"caseId": 1}},                                    # arguments not a string
+    {"type": "mcp_approval_request", "id": ["mcpr_t"], "server_label": "case-mcp", "name": "get_case",
+     "arguments": "{}"},                                             # an id no approval response can answer
+], ids=["arguments-object", "id-list"])
+def test_an_answer_item_of_the_wrong_type_is_a_priced_upstream_error(tmp_path, monkeypatch, item):
+    """Foundry answered and billed, but an item cannot be read: sealed as a priced upstream_error, nothing gated."""
+    r, s, reply = answer_once(tmp_path, monkeypatch, [item])
+    assert r.status_code == 502 and r.json()["error"]["type"] == "upstream_error"
+    rec, = rows(s.db_path, "type = 'inference'")
+    x = json.loads(rec["ext"])
+    assert json.loads(rec["rule_hits"]) == ["upstream_error"] and x["cost_micro"] == 1000000
+    assert x["response_hash"] == record.sha256_hex(reply) and rows(s.db_path, "type = 'tool_call'") == []
+    code, line = verify(s.db_path, s.pubkey_path)
+    assert code == 0, line
+
+
+def test_an_mcp_call_naming_no_string_request_is_sealed_after_the_fact(tmp_path, monkeypatch):
+    """An approval_request_id that is not a string answers no gated request: the call is recorded as run unasked."""
+    r, s, _ = answer_once(tmp_path, monkeypatch, [
+        {"type": "mcp_call", "id": "mcp_t", "server_label": "case-mcp", "name": "get_case", "arguments": "{}",
+         "approval_request_id": [1], "output": "ok"}])
+    assert r.status_code == 200
+    call, = rows(s.db_path, "type = 'tool_call'")
+    assert json.loads(call["ext"])["after_the_fact"] is True and len(rows(s.db_path, "type = 'tool_result'")) == 1
+    code, line = verify(s.db_path, s.pubkey_path)
+    assert code == 0, line
+
+
+def test_a_gated_call_reported_with_an_unhashable_name_still_has_its_result_sealed(tmp_path, monkeypatch):
+    """The ledger approved the call and Foundry ran it: the output is sealed under the approved tool_call even when
+    the reported name cannot be hashed, marked upstream_error; the answer carrying it is not relayed."""
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    ask = {**DONE, "id": "resp_g1", "output": [{"type": "mcp_approval_request", "id": "mcpr_g", "server_label": "case-mcp",
+                                               "name": "get_case", "arguments": CASE_ARGS}]}
+    ran_ = {**DONE, "output": [{"type": "mcp_call", "id": "mcp_g", "approval_request_id": "mcpr_g",
+                                "server_label": "case-mcp", "name": "get_case\ud800", "arguments": CASE_ARGS,
+                                "output": "open"}] + DONE["output"]}
+
+    def handler(r):
+        return httpx.Response(200, content=json.dumps(ran_ if json.loads(r.content).get("previous_response_id")
+                                                      else ask).encode(), headers={"content-type": "application/json"})
+    client, s, _ = gov_node(tmp_path, pack=PACK + SPEND, handler=handler, policy=FOUNDRY_POLICY)
+    with client:
+        r = portal(client)
+    assert r.status_code == 502 and r.json()["error"]["type"] == "upstream_error"
+    call, = rows(s.db_path, "type = 'tool_call'")
+    res, = rows(s.db_path, "type = 'tool_result'")
+    x = json.loads(res["ext"])
+    assert (res["parent_seq"], res["output_hash"], json.loads(res["rule_hits"])) == \
+        (str(call["seq"]), record.sha256_hex(b"open"), ["upstream_error"])
+    assert (x["tool"], x["server"], res["source_label"]) == ("", "", "mcp:case-mcp")
+    for flags in ((), ("--rulepack", str(tmp_path / "starter.yaml"))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
+
+
+def test_an_answer_the_seal_did_not_read_is_not_relayed_when_it_cannot_be_rendered(tmp_path, monkeypatch):
+    r, s, _ = answer_once(tmp_path, monkeypatch, [{"type": "reasoning", "id": "rs_1", "summary": [{"score": float("nan")}]}])
+    assert r.status_code == 502 and r.json()["sijill"]["seq"] == rows(s.db_path, "type = 'inference'")[0]["seq"]
+
+
+@pytest.mark.parametrize("extra", ['"metadata": {"x": NaN}', '"previous_response_id": "resp_\\ud800"'])
+def test_an_unhashable_forwarded_field_is_400_before_anything_is_sent(relay, extra):
+    """Every forwarded field is hashed at the front door (request_hash), as on /v1/chat/completions."""
+    client, s, foundry = relay
+    r = client.post("/v1/responses", headers={"X-Sijil-Principal-Token": officer(), "Content-Type": "application/json"},
+                    content='{"conversation": "conv_n", "input": "hello", ' + extra + "}")
+    assert r.status_code == 400 and foundry.seen == [] and rows(s.db_path, "type = 'inference'") == []
+
+
+def test_a_round_trip_whose_task_ended_in_flight_is_sealed_outside_it(tmp_path, monkeypatch):
+    """Foundry answered and billed after the task ended: the inference is sealed outside the task, as on the model
+    door, keeping the validated human, rather than not at all."""
+    from sijill import agents
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    client, s, _ = gov_node(tmp_path, pack=PACK + SPEND, handler=lambda r: end_then(r), policy=FOUNDRY_POLICY)
+
+    async def end_then(request):
+        n, (start,) = client.app.state.node, rows(s.db_path, "type = 'task_start'")
+        await agents.end_task(n, n.store.get(start["seq"]), "timeout")
+        return httpx.Response(200, json=DONE)
+    with client:
+        assert portal(client).status_code == 200
+    inf, = rows(s.db_path, "type = 'inference'")
+    x = json.loads(inf["ext"])
+    assert (inf["task_seq"], inf["agent_id"], inf["principal"], x["session_id"]) == ("", FOUNDRY_AGENT, human(OFFICER), "")
+    assert x["principal_claims"]["token_hash"] and x["cost_micro"] == 1000000
+    for flags in ((), ("--rulepack", str(tmp_path / "starter.yaml"))):
         code, line = verify(s.db_path, s.pubkey_path, *flags)
         assert code == 0, line

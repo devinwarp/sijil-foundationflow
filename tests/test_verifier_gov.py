@@ -580,3 +580,21 @@ def test_after_the_fact_exempts_a_confirm_hit_only_from_the_foundry_relay(tmp_pa
         c[77]["ext"] = record_json({**x, "after_the_fact": True, "observed_by": observed_by})
         c.ext(79, confirmed=0)
         assert run(c, tmp_path, "--rulepack", str(p)) == (1, "FAIL seq=77 tool_call approval mismatch"), observed_by
+
+
+@pytest.mark.parametrize("subject", ["NaN", "Infinity", '"\\ud800"', '{"x": NaN}'])
+def test_a_kept_token_whose_subject_no_record_can_hash_is_a_mismatch(tmp_path, subject):
+    """U2: a correctly signed kept token whose subject is NaN, an infinity or a lone surrogate (§2.2) cannot hash to
+    the principal; it is a FAIL line, never a crash."""
+    payload = json.dumps({**vectors_v2.OFFICER_JWT_CLAIMS, "oid": "SUBJECT"}).replace('"SUBJECT"', subject)
+    head = vectors_v2.b64u(vectors_v2.cj({"alg": "EdDSA", "kid": "moi-fixture-1", "typ": "JWT"}))
+    signing_input = head + "." + vectors_v2.b64u(payload.encode())
+    token = (signing_input + "." + vectors_v2.b64u(vectors_v2.ISSUER_KEY.sign(signing_input.encode()))).encode()
+    c = v2chain.gov()
+    claims = {**claims_of(c, 70), "token_hash": hashlib.sha256(token).hexdigest()}
+    c.ext(70, principal_claims=claims)
+    d = tmp_path / "kept"
+    d.mkdir()
+    (d / (claims["jwks_hash"] + ".json")).write_bytes((TOKENS / (claims["jwks_hash"] + ".json")).read_bytes())
+    (d / (claims["token_hash"] + ".jwt")).write_bytes(token)
+    assert run(c, tmp_path, "--token-dir", str(d)) == (1, "FAIL seq=70 principal token mismatch")

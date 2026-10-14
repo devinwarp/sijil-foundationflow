@@ -11,13 +11,14 @@ MODEL = re.compile(r"\S{1,256}")
 
 
 def tool_use(id_, name, arguments) -> dict:
-    """{id, name, args_hash}. Arguments that do not parse as JSON hash as UTF-8 and carry args_raw: true."""
+    """{id, name, args_hash}. Arguments that do not parse as JSON (nesting past the parser's limit included) hash
+    as UTF-8 and carry args_raw: true."""
     use = {"id": id_ if isinstance(id_, str) else "", "name": name if isinstance(name, str) else ""}
     if not isinstance(arguments, str):
         return {**use, "args_hash": record.sha256_hex(record.canonical_json(arguments))}
     try:
         parsed = json.loads(arguments)
-    except ValueError:
+    except (ValueError, RecursionError):
         return {**use, "args_hash": record.sha256_hex(arguments.encode()), "args_raw": True}
     return {**use, "args_hash": record.sha256_hex(record.canonical_json(parsed))}
 

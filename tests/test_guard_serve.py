@@ -841,3 +841,35 @@ def test_one_tool_use_parents_one_call_without_a_tool_use_id(env):
     assert err.code == mcp.SIJIL and "no parent inference" in err.message and err.data["sijil"]["seq"] is None
     assert len(rows(s.db_path, "type = 'tool_call'")) == 1
     assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_nan_in_arguments_or_a_tool_definition_fails_closed(env):
+    """§2.2: NaN and infinities have no canonical JSON. A call whose arguments carry one is refused before anything is
+    sealed or run; a wrapped server whose tool definitions carry one cannot be checked, so nothing is relayed."""
+    client, s, cfg = env
+
+    async def go():
+        g = guard(cfg, client, "shell")
+        await g.start()
+        a = await g.new_session(Harness(), {})
+        await a.handle("initialize", INIT)
+        await asyncio.to_thread(ask, client, cfg, "list the files")
+        with pytest.raises(mcp.RpcError) as call_err:
+            await call(a, "run_command", {"command": "ls", "n": float("nan")})
+        real = g.upstream.request
+
+        async def nan_tools(method, params=None, **kw):
+            if method == "tools/list":
+                return {"tools": [{"name": "run_command", "inputSchema": {"type": "object", "maximum": float("inf")}}]}
+            return await real(method, params, **kw)
+        g.upstream.request = nan_tools
+        with pytest.raises(mcp.RpcError) as list_err:
+            await a.handle("tools/list", {})
+        await a.close()
+        await g.aclose()
+        return call_err.value, list_err.value
+    call_err, list_err = asyncio.run(go())
+    assert call_err.code == mcp.SIJIL and "NaN" in call_err.message
+    assert list_err.code == mcp.INTERNAL and "NaN" in list_err.message
+    assert rows(s.db_path, "type = 'tool_call'") == []
+    assert verify(s.db_path, s.pubkey_path)[0] == 0

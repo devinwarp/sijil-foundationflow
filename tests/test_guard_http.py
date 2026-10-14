@@ -490,3 +490,15 @@ def test_the_task_is_resolved_once_per_request(env, monkeypatch):
 def test_typed_parameters_accept_only_strict_json_numbers(value, kind, typed):
     got = http._typed(value, kind)
     assert got == typed and type(got) is type(typed)
+
+
+def test_the_health_endpoint_needs_no_token_and_tells_nothing(env):
+    """GET /_sijil/healthz for the sidecar's probe: no token, no ledger call, only {"ok": true}."""
+    client, s, cfg, tools, api = env
+    before = rows(s.db_path)
+    bare = TestClient(tools.app)
+    r = bare.get("/_sijil/healthz")
+    assert (r.status_code, r.json()) == (200, {"ok": True})
+    assert bare.post("/_sijil/healthz").status_code == 401           # only the probe is open
+    assert bare.get("/case-api/cases/x").status_code == 401
+    assert rows(s.db_path) == before and api.seen == []

@@ -157,6 +157,11 @@ def normalise(path: str, roots: Roots) -> list[str]:
     return list(dict.fromkeys((_shown(os.path.realpath(lexical), roots), _shown(lexical, roots))))
 
 
+# A host longer than DNS allows (253) cannot resolve. Hosts pulled from uncapped content arguments can be 1 MB long,
+# so past the limit the host is this one short name: still seen by the rules, matched by no pin and no regex cost.
+TOO_LONG_HOST = "host-too-long.invalid"
+
+
 def host_of(url: str) -> str | None:
     try:
         h = urlsplit(url).hostname
@@ -165,9 +170,10 @@ def host_of(url: str) -> str | None:
     if not h:
         return None
     try:
-        return h.encode("idna").decode("ascii").lower()
+        h = h.encode("idna").decode("ascii")
     except UnicodeError:
-        return h.lower()
+        pass
+    return h.lower() if len(h) <= 253 else TOO_LONG_HOST
 
 
 def path_like(tok: str) -> bool:

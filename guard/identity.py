@@ -73,18 +73,30 @@ def load_key(path: str) -> Ed25519PrivateKey:
 
 
 def local_principal() -> str:
-    """`principal: auto` on a laptop: local:<sha256 of user@host> (spec §5.2)."""
-    return "local:" + sha256_hex(f"{getpass.getuser()}@{socket.gethostname()}".encode())
+    """`principal: auto` on a laptop: local:<sha256 of user@host> (spec §5.2). A process with no user name (a
+    container UID with no passwd entry and no USER or LOGNAME) has no local principal: guard.yaml must name one."""
+    try:
+        user = getpass.getuser()
+    except (KeyError, OSError):         # KeyError to Python 3.12, OSError from 3.13
+        raise ValueError("this process has no user name to derive a local principal from "
+                         "(no passwd entry, no USER or LOGNAME): set identity.registered_by in guard.yaml") from None
+    return "local:" + sha256_hex(f"{user}@{socket.gethostname()}".encode())
 
 
 def register(ledger: Ledger, agent_id: str, key: Ed25519PrivateKey, registered_by: str, display_name: str = "",
-             admin_token: str = "") -> int:
+             admin_token: str = "", principal_token: str = "",
+             principal_header: str = "X-Sijil-Principal-Token") -> int:
     """Seal agent_register for a key agent (spec §2.4.7). Under register_policy: closed the operator's admin
-    token is required; under principal_oidc the ledger takes registered_by from the principal token."""
-    nonce = ledger.challenge(agent_id, "register")
+    token is required; under principal_oidc the ledger takes registered_by from the principal token, and names it
+    in the challenge's answer so that the self-proof signs it."""
+    principal = {principal_header: principal_token} if principal_token else {}
+    ch = ledger.call("POST", "/api/agent/challenge", json={"agent_id": agent_id, "purpose": "register"},
+                     headers=principal)
+    # the ledger names registered_by under principal_oidc; otherwise guard.yaml's, or the local principal
+    nonce, registered_by = ch["nonce"], ch.get("registered_by") or registered_by or local_principal()
     msg = {"agent_id": agent_id, "agent_pubkey": pubkey(key), "nonce": nonce, "registered_by": registered_by}
     body = {**msg, "self_proof": proof(key, msg), **({"display_name": display_name} if display_name else {})}
-    headers = {"Authorization": f"Bearer {admin_token}"} if admin_token else {}
+    headers = {**({"Authorization": f"Bearer {admin_token}"} if admin_token else {}), **principal}
     return ledger.call("POST", "/api/agent/register", json=body, headers=headers)["seq"]
 
 

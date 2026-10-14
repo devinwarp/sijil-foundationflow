@@ -8,12 +8,14 @@ import json
 import threading
 
 import httpx
+import pytest
 
 from agentkit import register, session
 from conftest import ADMIN, MODEL, VERIFIER, StubResolver, make_node, rows, verify
 import govkit
 from govkit import CASE, CLOSE, NOTE, PACK, gov_node, officer, supervisor
 from guard.ledger import Ledger
+from sijill import record
 from test_chat_tool_uses import API, API_POLICY, answer, ask
 from test_approvals import h, open_task, seal_call, think
 from test_guard_approval import env, pending_approval  # noqa: F401  (env is a fixture)
@@ -426,3 +428,183 @@ pricing:
     assert (rec["decision"], x["price_rule"], x["cost_micro"]) == ("block", "metered", 700)
     assert verify(s.db_path, s.pubkey_path)[0] == 0
     assert verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "pack.yaml"))[0] == 0
+
+
+USAGE = {"prompt_tokens": 1840, "completion_tokens": 96}            # 1936000 micro: two calls pass the limit
+UNHASHABLE = [                                                       # (tool call arguments, answer text)
+    ('{"note": NaN}', None),                         # NaN in the arguments
+    ('{"note": "\\ud800"}', None),                   # JSON arguments escaping a lone surrogate
+    ("{not json \ud800", None),                      # raw arguments carrying one
+    ("{}", "lone \udfff"),                           # the answer text carrying one
+]
+
+
+def task_of(client) -> dict:
+    register(client)
+    sess = session(client)
+    r = client.post("/api/agent/task/start", json={"intent_hash": "c" * 64, "harness": "http-agent"},
+                    headers={"X-Sijil-Agent-Session": sess["agent_session"], "X-Sijil-Principal-Token": officer()})
+    return {"agent_session": sess["agent_session"], "task_seq": r.json()["seq"]}
+
+
+def spent_then_blocked(tmp_path, s, seen, results):
+    """Both unhashable answers are sealed as priced upstream_errors, so the third call is blocked unforwarded."""
+    assert len(seen) == 2
+    first, second, third = rows(s.db_path, "type = 'inference'")
+    for rec in (first, second):
+        x = json.loads(rec["ext"])
+        assert json.loads(rec["rule_hits"]) == ["upstream_error"] and rec["output_hash"] == ""
+        assert (x["usage"], x["cost_micro"], x["price_rule"]) == \
+            ({"input_tokens": 1840, "output_tokens": 96}, 1936000, "local-metered")
+        assert "tool_uses" not in x and len(x["response_hash"]) == 64
+    assert json.loads(second["ext"])["response_hash"] == results[1]
+    assert json.loads(third["rule_hits"]) == ["budget:case-agent:model_spend_micro"] and third["decision"] == "block"
+    code, line = verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))
+    assert code == 0 and " budgets=hits:1 " in line, line
+
+
+@pytest.mark.parametrize("arguments,content", UNHASHABLE)
+def test_an_unhashable_answer_is_sealed_priced_and_counts_toward_the_budget(tmp_path, arguments, content):
+    """A model answer no record can hash (§2.2) was forwarded and billed: sealed as an upstream_error, priced, its raw
+    bytes hashed, so a prompt-injected model cannot spend outside the budget by repeating it."""
+    seen, raw = [], []
+
+    def model(request):
+        seen.append(request)
+        calls = [{"id": "call_U", "type": "function", "function": {"name": "addCaseNote", "arguments": arguments}}]
+        body = json.dumps({"id": "c", "model": MODEL, "usage": USAGE, "choices": [{"index": 0, "finish_reason": "stop",
+                           "message": {"role": "assistant", "content": content, "tool_calls": calls}}]}).encode()
+        raw.append(record.sha256_hex(body))
+        return httpx.Response(200, content=body, headers={"content-type": "application/json"})
+    client, s, _ = gov_node(tmp_path, pack=pack(), handler=model)
+    with client:
+        t = task_of(client)
+        for _ in range(2):
+            r = chat(client, t, "add the note")
+            assert r.status_code == 502 and r.json()["error"]["type"] == "upstream_error"
+        assert chat(client, t, "add the note").status_code == 403
+    spent_then_blocked(tmp_path, s, seen, raw)
+
+
+@pytest.mark.parametrize("arguments,content", UNHASHABLE)
+def test_an_unhashable_streamed_answer_is_sealed_priced_and_counts_toward_the_budget(tmp_path, arguments, content):
+    seen, raw = [], []
+
+    def model(request):
+        seen.append(request)
+        lines = [{"model": MODEL, "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]},
+                 {"model": MODEL, "choices": [{"index": 0, "finish_reason": None, "delta": {"tool_calls": [
+                     {"index": 0, "id": "call_U", "function": {"name": "addCaseNote", "arguments": arguments}}]}}]},
+                 {"model": MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": USAGE}]
+        events = ["data: " + json.dumps(e) for e in lines]
+        raw.append(record.sha256_hex(("\n\n".join(events) + "\n\n").encode()))     # every line relayed
+        return httpx.Response(200, content=("\n\n".join(events) + "\n\ndata: [DONE]\n\n").encode(),
+                              headers={"content-type": "text/event-stream"})
+    client, s, _ = gov_node(tmp_path, pack=pack(), handler=model)
+    with client:
+        t = task_of(client)
+        for _ in range(2):
+            r = client.post("/v1/chat/completions", json={"model": MODEL, "stream": True, "messages": [
+                {"role": "user", "content": "add the note"}]}, headers={
+                "X-Sijil-Agent-Session": t["agent_session"], "X-Sijil-Task-Seq": str(t["task_seq"]),
+                "X-Sijil-Principal-Token": officer()})
+            assert '"type": "upstream_error"' in r.text and "[DONE]" not in r.text
+        assert chat(client, t, "add the note").status_code == 403
+    spent_then_blocked(tmp_path, s, seen, raw)
+
+
+DEEP = "[" * 100000 + "]" * 100000          # past the parser's recursion limit
+
+
+def deep_post(client, t, stream):
+    return client.post("/v1/chat/completions", json={"model": MODEL, "stream": stream, "messages": [
+        {"role": "user", "content": "add the note"}]}, headers={
+        "X-Sijil-Agent-Session": t["agent_session"], "X-Sijil-Task-Seq": str(t["task_seq"]),
+        "X-Sijil-Principal-Token": officer()})
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_deeply_nested_tool_arguments_are_sealed_raw_priced_and_counted(tmp_path, stream):
+    """Arguments nested past the parser's limit do not parse, so they hash as raw UTF-8 (args_raw): the answer is
+    sealed and priced like any other, and a prompt-injected model cannot spend outside the budget with them."""
+    def model(request):
+        call = {"id": "call_U", "type": "function", "function": {"name": "addCaseNote", "arguments": DEEP}}
+        if not stream:
+            return httpx.Response(200, json={"id": "c", "model": MODEL, "usage": USAGE, "choices": [{
+                "index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": None,
+                                                                 "tool_calls": [call]}}]})
+        lines = [{"model": MODEL, "choices": [{"index": 0, "finish_reason": None, "delta": {"tool_calls": [
+                     {**call, "index": 0}]}}]},
+                 {"model": MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": USAGE}]
+        return httpx.Response(200, content=("".join(f"data: {json.dumps(e)}\n\n" for e in lines) +
+                                            "data: [DONE]\n\n").encode(), headers={"content-type": "text/event-stream"})
+    client, s, _ = gov_node(tmp_path, pack=pack(), handler=model)
+    with client:
+        t = task_of(client)
+        for _ in range(2):
+            r = deep_post(client, t, stream)
+            assert r.status_code == 200 and (not stream or "data: [DONE]" in r.text)
+        assert chat(client, t, "add the note").status_code == 403
+    first, second, third = rows(s.db_path, "type = 'inference'")
+    for rec in (first, second):
+        x = json.loads(rec["ext"])
+        assert rec["decision"] == "allow" and x["cost_micro"] == 1936000
+        assert x["tool_uses"] == [{"id": "call_U", "name": "addCaseNote", "args_hash": record.sha256_hex(DEEP.encode()),
+                                   "args_raw": True}]
+    assert json.loads(third["rule_hits"]) == ["budget:case-agent:model_spend_micro"]
+    code, line = verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))
+    assert code == 0, line
+
+
+def test_a_deeply_nested_streamed_event_is_relayed_and_sealed(tmp_path):
+    """An event nested past the parser's limit is relayed as it came and hashed with the rest; the usage still counts."""
+    def model(request):
+        lines = ['data: {"x": ' + DEEP + "}",
+                 "data: " + json.dumps({"model": MODEL, "choices": [{"index": 0, "delta": {"content": "ok"},
+                                                                     "finish_reason": "stop"}], "usage": USAGE})]
+        return httpx.Response(200, content=("\n\n".join(lines) + "\n\ndata: [DONE]\n\n").encode(),
+                              headers={"content-type": "text/event-stream"})
+    client, s, _ = gov_node(tmp_path, pack=pack(), handler=model)
+    with client:
+        t = task_of(client)
+        for _ in range(2):
+            assert "data: [DONE]" in deep_post(client, t, True).text
+        assert chat(client, t, "add the note").status_code == 403
+    first, second, _ = rows(s.db_path, "type = 'inference'")
+    assert [json.loads(r["ext"])["cost_micro"] for r in (first, second)] == [1936000, 1936000]
+    code, line = verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))
+    assert code == 0, line
+
+
+def test_a_deeply_nested_answer_is_a_priced_upstream_error(tmp_path):
+    """An answer body nested past the parser's limit is malformed: sealed as an upstream_error priced at
+    missing_usage_cost_micro, so repeating it reaches the budget like any forwarded call."""
+    seen = []
+
+    def model(request):
+        seen.append(request)
+        return httpx.Response(200, content=('{"x": ' + DEEP + "}").encode(), headers={"content-type": "application/json"})
+    client, s, _ = gov_node(tmp_path, pack=pack(), handler=model)
+    with client:
+        t = task_of(client)
+        statuses = [chat(client, t, "add the note").status_code for _ in range(61)]
+    assert statuses == [502] * 60 + [403] and len(seen) == 60
+    recs = rows(s.db_path, "type = 'inference'")
+    assert all(json.loads(r["rule_hits"]) == ["upstream_error"] and json.loads(r["ext"])["cost_micro"] == 50000
+               for r in recs[:60])
+    code, line = verify(s.db_path, s.pubkey_path, "--rulepack", str(tmp_path / "starter.yaml"))
+    assert code == 0, line
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("body", ['{"x": ' + DEEP + "}", "{not json"], ids=["deep", "malformed"])
+def test_an_error_answer_that_does_not_parse_is_sealed_as_an_upstream_error(tmp_path, stream, body):
+    """A non-200 answer is relayed as the model runtime's error; one that does not parse is still sealed and priced."""
+    def model(request):
+        return httpx.Response(500, content=body.encode(), headers={"content-type": "application/json"})
+    client, s, _ = gov_node(tmp_path, pack=pack(), handler=model)
+    with client:
+        t = task_of(client)
+        assert deep_post(client, t, stream).status_code == 500
+    rec, = rows(s.db_path, "type = 'inference'")
+    assert json.loads(rec["rule_hits"]) == ["upstream_error"] and json.loads(rec["ext"])["cost_micro"] == 50000

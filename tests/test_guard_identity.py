@@ -338,3 +338,115 @@ def test_github_oidc_failures_are_a_clean_refusal(monkeypatch, answer):
     monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-bearer")
     with pytest.raises(ValueError, match="GitHub Actions OIDC token request failed"):
         identity.github_token("n", httpx.Client(transport=httpx.MockTransport(lambda r: answer)))
+
+
+def test_identity_init_registers_under_principal_oidc_with_the_principal_token(tmp_path, capsys, monkeypatch):
+    """register_policy: principal_oidc takes registered_by from the human's token, sent in the guard's principal
+    header from --principal-token-env (default SIJIL_PRINCIPAL_TOKEN), as task start does."""
+    from test_principals import HUMAN, POLICY, node, officer
+    cfg_path = guard_yaml(tmp_path)
+    client, s = node(tmp_path, POLICY.replace("register_policy: open", "register_policy: principal_oidc"))
+    with client:
+        args = ["identity", "init", "--config", str(cfg_path), "--repo", str(tmp_path / "repo")]
+        monkeypatch.delenv("SIJIL_PRINCIPAL_TOKEN", raising=False)
+        assert run(args, client, capsys)[0] == 1
+        monkeypatch.setenv("SIJIL_PRINCIPAL_TOKEN", officer())
+        code, out = run(args, client, capsys)
+        assert code == 0 and out.startswith(f"registered {AGENT} "), run.err
+    rec = rows(s.db_path)[-1]
+    assert (rec["type"], rec["principal"], json.loads(rec["ext"])["principal_auth"]) == ("agent_register", HUMAN, "oidc")
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_a_task_the_ledger_already_closed_leaves_the_stack(tmp_path, capsys, monkeypatch):
+    """A task the ledger closed (timeout, or ended elsewhere) is taken off the state file when `task end` is refused
+    for it, so the guards stop sending its seq; a transient refusal (an approval pending) keeps it."""
+    cfg_path = guard_yaml(tmp_path)
+    client, s = ledger_node(tmp_path)
+    state_file = tmp_path / "run" / "case-agent.json"
+    with client:
+        args = ["--config", str(cfg_path), "--repo", str(tmp_path / "repo")]
+        run(["identity", "init", *args], client, capsys)
+        first = int(run(["task", "start", *args], client, capsys)[1])
+        real = Ledger.call
+
+        def pending(self, method, path, *a, **kw):
+            if path == "/api/agent/task/end":
+                raise Refused(409, "approval pending in this task")
+            return real(self, method, path, *a, **kw)
+        monkeypatch.setattr(Ledger, "call", pending)
+        assert run(["task", "end", *args], client, capsys)[0] == 1
+        assert task.load(state_file, AGENT).tasks == [first]                     # transient: kept
+        monkeypatch.setattr(Ledger, "call", real)
+        st = task.load(state_file, AGENT)
+        assert task.end_task(ledger_of(client), st.agent_session, first, "timeout")["seq"]   # closed meanwhile
+        assert run(["task", "end", *args], client, capsys)[0] == 1 and "409" in run.err
+        assert task.load(state_file, AGENT).tasks == []                          # closed: dropped
+        second = int(run(["task", "start", *args], client, capsys)[1])
+        assert task.load(state_file, AGENT).tasks == [second]
+    assert [json.loads(r["ext"])["outcome"] for r in rows(s.db_path, "type = 'task_end'")] == ["timeout"]
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_limits_set_the_rule_engines_size_caps(tmp_path):
+    from guard import rules
+    cfg = config.load(write_yaml(tmp_path, ""))
+    assert (cfg.max_command, cfg.max_args) == (rules.MAX_COMMAND, rules.MAX_ARGS) == (2048, 32768)
+    cfg = config.load(write_yaml(tmp_path, "limits: {max_command: 4096, max_args: 65536}"))
+    assert (cfg.max_command, cfg.max_args) == (4096, 65536)
+    for bad in ("limits: {max_args: 0}", "limits: {max_command: '4096'}", "limits: {max_command: true}",
+                "limits: {max_body: 1}", "limits: {max_command: 4097}", "limits: {max_args: 65537}"):
+        with pytest.raises(ValueError, match="limits"):
+            config.load(write_yaml(tmp_path, bad))
+
+
+def test_a_closed_task_keeps_the_ledgers_detail_for_the_adapter(monkeypatch):
+    """Review minor 6: the adapter answers e.detail, so it stays the ledger's exact string; the CLI's message adds
+    that the task left the state file."""
+    monkeypatch.setattr(task, "end_task", lambda *a: (_ for _ in ()).throw(Refused(409, "task already ended")))
+    st = task.State("as_1", AGENT, "p", "2099-01-01T00:00:00.000Z", tasks=[7])
+    with pytest.raises(task.Closed) as e:
+        task.end(None, st, "completed")
+    assert e.value.detail == "task already ended" and st.tasks == []
+    assert str(e.value) == "409: task already ended: task 7 is taken off the state file"
+
+
+@pytest.mark.parametrize("text", ["version: 2\n", "version: 1\nsijil: [unclosed\n"], ids=["invalid", "not-yaml"])
+def test_a_bad_config_is_a_one_line_error_and_exit_1(tmp_path, capsys, text):
+    path = tmp_path / "guard.yaml"
+    path.write_text(text)
+    assert main(["session", "open", "--config", str(path)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("sijil-guard: ") and "Traceback" not in err
+
+
+def no_user(monkeypatch):
+    """A container UID with no passwd entry and no USER or LOGNAME: getpass has no name to give."""
+    import getpass
+
+    def getuser():
+        raise KeyError("getpwuid(): uid not found: 1000750000")
+    monkeypatch.setattr(getpass, "getuser", getuser)
+
+
+def test_identity_init_with_no_user_name_asks_for_registered_by(tmp_path, capsys, monkeypatch):
+    cfg_path = guard_yaml(tmp_path)
+    cfg_path.write_text(cfg_path.read_text().replace(f'  registered_by: local:{"a" * 64}\n', ""))
+    no_user(monkeypatch)
+    client, s = ledger_node(tmp_path)
+    with client:
+        code, _ = run(["identity", "init", "--config", str(cfg_path), "--repo", str(tmp_path / "repo")], client, capsys)
+    assert code == 1 and "identity.registered_by" in run.err and "unexpected reply" not in run.err
+
+
+def test_identity_init_under_principal_oidc_needs_no_user_name(tmp_path, capsys, monkeypatch):
+    """The ledger names registered_by from the principal token, so no local principal is derived."""
+    from test_principals import POLICY, node, officer
+    cfg_path = guard_yaml(tmp_path)
+    cfg_path.write_text(cfg_path.read_text().replace(f'  registered_by: local:{"a" * 64}\n', ""))
+    no_user(monkeypatch)
+    monkeypatch.setenv("SIJIL_PRINCIPAL_TOKEN", officer())
+    client, s = node(tmp_path, POLICY.replace("register_policy: open", "register_policy: principal_oidc"))
+    with client:
+        code, out = run(["identity", "init", "--config", str(cfg_path), "--repo", str(tmp_path / "repo")], client, capsys)
+    assert code == 0 and out.startswith(f"registered {AGENT} "), run.err

@@ -54,3 +54,10 @@ def test_canonical_json_matches_the_ledger():
         assert canon.canonical_json(obj) == record.canonical_json(obj)
         assert canon.args_hash(obj) == record.sha256_hex(record.canonical_json(obj))
     assert canon.args_hash({"x": "\ud800"})          # a lone surrogate hashes instead of raising
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_canonical_json_refuses_nan_and_infinities_like_the_ledger(value):
+    """§2.2: NaN and infinities are not JSON; the ledger raises, and so does the guard."""
+    with pytest.raises(ValueError):
+        canon.canonical_json({"x": [value]})

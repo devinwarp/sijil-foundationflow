@@ -1,6 +1,7 @@
 """sijil-guard command line: `python -m guard <command> --config .sijil/guard.yaml`.
 
-  identity init [--repo DIR]        create the agent key (outside DIR) and register it
+  identity init [--repo DIR]        create the agent key (outside DIR) and register it (principal_oidc:
+                                    the human's token from --principal-token-env)
   session open                      prove the key (or present the OIDC token); write the state file
   task start --intent TEXT [--delegate] [--session-id ID]   print the task_seq
   task end --outcome OUTCOME
@@ -41,14 +42,15 @@ def main(argv: list[str] | None = None, ledger: Ledger | None = None) -> int:
     ap.add_argument("--server")
     ap.add_argument("--http", default="")
     a = ap.parse_args(argv)
-    cfg = config.load(a.config)
-    ledger = ledger or ledger_for(cfg)
     cmd = " ".join(a.command)
     try:
+        cfg = config.load(a.config)
+        ledger = ledger or ledger_for(cfg)
         if cmd == "identity init":
             key = identity.ensure_key(cfg.key_path, a.repo)
-            seq = identity.register(ledger, cfg.agent_id, key, cfg.registered_by or identity.local_principal(),
-                                    cfg.display_name, os.environ.get(a.admin_token_env, ""))
+            seq = identity.register(ledger, cfg.agent_id, key, cfg.registered_by,
+                                    cfg.display_name, os.environ.get(a.admin_token_env, ""),
+                                    os.environ.get(a.principal_token_env, ""), cfg.principal_header)
             print(f"registered {cfg.agent_id} pubkey={identity.pubkey(key)} seq={seq}")
         elif cmd == "session open":
             state = update(cfg, ledger, lambda st: st)

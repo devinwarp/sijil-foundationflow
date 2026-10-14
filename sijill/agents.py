@@ -344,7 +344,12 @@ def router(require_admin) -> APIRouter:
             raise HTTPException(400, f"purpose must be one of {PURPOSES}")
         if not n.agents.id_ok(b.get("agent_id")):
             raise HTTPException(422, "agent_id must be spiffe://<trust-domain>/agent/<name> or declared on the chain")
-        return n.agents.challenge(b["agent_id"], purpose)
+        principal = {}
+        if purpose == "register" and n.policy.agents.register_policy == "principal_oidc" and \
+                oidc.token_of(n.policy.principals, request.headers) is not None:
+            # the principal the registration will be sealed under, which its self-proof must sign (§5.6)
+            principal = {"registered_by": (await principal_or_refuse(n, request, required=True))["principal"]}
+        return {**n.agents.challenge(b["agent_id"], purpose), **principal}
 
     @r.post("/api/agent/session", dependencies=[Depends(require_token)])
     async def session(request: Request):

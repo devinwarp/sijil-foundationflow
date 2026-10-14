@@ -22,6 +22,18 @@ from .canon import sha256_hex
 from .ledger import Ledger, Refused
 
 EXPIRY_MARGIN = timedelta(seconds=30)    # a session about to lapse is not handed out
+# the ledger's 409 details for a task_end on a task that is no longer open (timed out, or ended elsewhere); any
+# other refusal (an approval pending, a bad outcome) may pass, so the task stays on the stack
+CLOSED = ("task not open in this agent session", "task already ended")
+
+
+class Closed(Refused):
+    """task end was refused because the ledger has already closed the task: it is off the stack, and the state
+    file is saved without it. `detail` stays the ledger's (the adapter answers it); the message says so."""
+
+    def __init__(self, status: int, detail, seq: int):
+        super().__init__(status, detail)
+        self.args = (f"{status}: {detail}: task {seq} is taken off the state file",)
 
 
 @dataclass
@@ -107,6 +119,8 @@ def update(path: Path, agent_id: str, open_session, fn):
                 result = fn(state)
                 break
             except Refused as e:
+                if isinstance(e, Closed):
+                    save(state, path)
                 if e.status != 401 or attempt == 2:
                     raise
                 state = None
@@ -159,7 +173,13 @@ def end(ledger: Ledger, state: State, outcome: str, task_seq: int | None = None)
     seq = state.task_seq if task_seq is None else task_seq
     if seq is None:
         raise ValueError("no open task in this state file")
-    r = end_task(ledger, state.agent_session, seq, outcome)
+    try:
+        r = end_task(ledger, state.agent_session, seq, outcome)
+    except Refused as e:
+        if e.status != 409 or e.detail not in CLOSED:
+            raise
+        drop(state, seq)
+        raise Closed(e.status, e.detail, seq) from e
     drop(state, seq)
     return r
 

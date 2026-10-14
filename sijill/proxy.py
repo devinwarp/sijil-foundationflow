@@ -39,6 +39,14 @@ UPSTREAM_ERROR_TYPE = "upstream_error"
 DASHBOARD = ROOT / "dashboard" / "index.html"
 
 
+def error_content(raw: bytes):
+    """A model runtime's error answer, relayed as it parsed; one that does not parse is relayed as text."""
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError):
+        return {"error": {"message": raw.decode(errors="replace")}}
+
+
 @dataclass
 class Settings:
     db_path: str = "sijill.db"
@@ -268,8 +276,9 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
     @app.exception_handler(record.NotCanonical)
     @app.exception_handler(UnicodeEncodeError)      # a lone surrogate, which strict UTF-8 cannot encode
     async def not_canonical(request: Request, e: ValueError):
-        """Input no record can hash (§2.2) is refused, wherever it surfaces: a request body, a model's tool
-        arguments or answer, an agent's ext. Any other encoding failure is the ledger's fault, and stays a 500."""
+        """Input no record can hash (§2.2) is refused, wherever it surfaces: a request body, an agent's ext. (A model's
+        answer is not input: the model doors seal it as an upstream_error.) Any other encoding failure is the
+        ledger's fault, and stays a 500."""
         if isinstance(e, UnicodeEncodeError) and e.reason != "surrogates not allowed":
             raise e
         return JSONResponse(status_code=400, content={"detail": f"not canonical JSON: {e}"})
@@ -419,6 +428,19 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                                         "ext": ext(**budgets.cost(n.rulepack, digest, None))}))
             return JSONResponse(status_code=status, headers=headers(rec, upstream_ms), content=content)
 
+        def unhashable(spent, response_hash: str, post=None) -> dict:
+            """An answer carrying a value no record can hash (§2.2: NaN, an infinity, a lone surrogate) was forwarded
+            and billed: sealed as an upstream_error, priced, with only its raw bytes hashed and nothing parsed from it.
+            An allowlist block of the answering model stands, under the requested digest."""
+            x = json.loads(ext(**budgets.cost(n.rulepack, digest, spent)) or "{}")   # weights mode drops response_hash
+            decided = {"decision": "block", "mode": post[0]["mode"], "rule_hits": policy.rule_hits_json(
+                post[1] + [policy.UPSTREAM_ERROR_HIT])} if post and post[0]["decision"] == "block" else {}
+            return {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]), **decided,
+                    "ext": record.canonical_json({**x, "response_hash": response_hash}).decode()}
+
+        UNHASHABLE = {"error": {"message": "model runtime returned an answer no record can hash (NaN, an infinity "
+                                           "or a lone surrogate)", "type": UPSTREAM_ERROR_TYPE}}
+
         t1 = perf_counter()
         if payload.get("stream"):
             forward = {**payload, "model": model_id}
@@ -434,15 +456,12 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             if resp.status_code != 200:
                 raw = await resp.aread()
                 await resp.aclose()
-                try:
-                    content = json.loads(raw)
-                except ValueError:
-                    content = {"error": {"message": raw.decode(errors="replace")}}
-                return await upstream_failed(resp.status_code, content, (perf_counter() - t1) * 1000)
+                return await upstream_failed(resp.status_code, error_content(raw), (perf_counter() - t1) * 1000)
 
             async def relay():
                 parts, calls, relayed = [], chat.StreamCalls(), hashlib.sha256()
                 done, errored, refused, post, finish, rec, spent = False, False, False, None, "", None, None
+                bad = False
                 try:
                     async for line in resp.aiter_lines():
                         if n.halted:  # operator halt lands mid-stream: stop relaying now
@@ -453,7 +472,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                         if line.startswith("data: "):
                             try:
                                 event = json.loads(line[6:])
-                            except ValueError:
+                            except (ValueError, RecursionError):
                                 event = None
                             if isinstance(event, dict) and "error" in event:
                                 errored = True  # in-stream failure (vLLM), even if [DONE] follows
@@ -488,30 +507,38 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                     # Read the halt flag here, with no await before the seal: a halt that has flipped
                     # it has its `halted` record sealed or queued ahead of ours on the lock.
                     halted = n.halted
-                    uses = calls.tool_uses()
 
                     def delivered_cost() -> dict:
                         """The stream was forwarded and ended badly: charged like any forwarded request."""
                         by = post[0]["model_digest"] if post else digest
                         return {"ext": ext(**budgets.cost(n.rulepack, by, spent))}
                     ok = done and not errored and not halted and not (api and post is None)
-                    if ok:
-                        answered_by = post[0]["model_digest"] if post else digest
-                        sealed = {**body, "output_hash": record.output_hash("".join(parts)), **(post[0] if post else {}),
-                                  "ext": ext(response_hash=relayed.hexdigest(), stop_reason=str(finish),
-                                             tool_uses=uses, **budgets.cost(n.rulepack, answered_by, spent))}
-                    elif halted:
-                        # The halt is checked before each line is relayed, so `parts` is exactly the content
-                        # already delivered. Hash it like a completed stream; nothing delivered keeps "".
-                        sealed = {**body, "decision": "block", "mode": "enforce", "rule_hits": policy.rule_hits_json(
-                            hits + [policy.HALT_HIT, policy.UPSTREAM_ERROR_HIT]),
-                            "output_hash": record.output_hash("".join(parts)) if parts else "",
-                            **delivered_cost()}
-                    elif refused:     # the provider answered (and billed) with an unapproved model: withheld, priced
-                        sealed = {**body, **post[0], **delivered_cost()}
-                    else:
-                        sealed = {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]),
-                                  **delivered_cost()}
+                    try:
+                        uses = calls.tool_uses()
+                        if ok:
+                            answered_by = post[0]["model_digest"] if post else digest
+                            sealed = {**body, "output_hash": record.output_hash("".join(parts)), **(post[0] if post else {}),
+                                      "ext": ext(response_hash=relayed.hexdigest(), stop_reason=str(finish),
+                                                 tool_uses=uses, **budgets.cost(n.rulepack, answered_by, spent))}
+                        elif halted:
+                            # The halt is checked before each line is relayed, so `parts` is exactly the content
+                            # already delivered. Hash it like a completed stream; nothing delivered keeps "".
+                            sealed = {**body, "decision": "block", "mode": "enforce", "rule_hits": policy.rule_hits_json(
+                                hits + [policy.HALT_HIT, policy.UPSTREAM_ERROR_HIT]),
+                                "output_hash": record.output_hash("".join(parts)) if parts else "",
+                                **delivered_cost()}
+                        elif refused:     # the provider answered (and billed) with an unapproved model: withheld, priced
+                            sealed = {**body, **post[0], **delivered_cost()}
+                        else:
+                            sealed = {**body, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]),
+                                      **delivered_cost()}
+                        record.canonical_json(sealed)      # every field the seal will hash, model_digest included
+                    except (record.NotCanonical, UnicodeEncodeError):
+                        ok, bad = False, True
+                        sealed = unhashable(spent, relayed.hexdigest(), post)
+                        if halted:
+                            sealed = {**sealed, "decision": "block", "mode": "enforce", "rule_hits":
+                                      policy.rule_hits_json(hits + [policy.HALT_HIT, policy.UPSTREAM_ERROR_HIT])}
                     # Shielded: a client hang-up cancels this task (anyio, level-triggered), but the call
                     # must still be sealed. Seal first; closing the upstream may itself yield. The close
                     # runs even if the seal raises, so a signer outage does not leak the connection.
@@ -522,9 +549,11 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                                 n.store.index_tool_uses(rec["seq"], uses)
                         finally:
                             await resp.aclose()
+                if bad:      # relayed already, so the client is told the answer is void
+                    yield f"data: {json.dumps(UNHASHABLE)}\n\n".encode()
                 yield (f": sijill seq={rec['seq']} decision={rec['decision']} "
                        f"record_hash={rec['record_hash']}\n\n").encode()
-                if done and not halted:
+                if done and not halted and not bad:
                     yield b"data: [DONE]\n\n"
 
             return StreamingResponse(relay(), media_type="text/event-stream",
@@ -541,7 +570,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         if resp.status_code != 200:
             return await upstream_failed(
                 resp.status_code,
-                resp.json() if resp.headers.get("content-type", "").startswith("application/json")
+                error_content(resp.content) if resp.headers.get("content-type", "").startswith("application/json")
                 else {"error": {"message": resp.text}},
                 upstream_ms)
 
@@ -559,18 +588,23 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             post = answered(data.get("model")) if api else None
             if api and post is None:
                 raise TypeError("api attestation needs the response's model")
-        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError, RecursionError):
             return await upstream_failed(
                 502, {"error": {"message": "model runtime returned a malformed response",
                                 "type": UPSTREAM_ERROR_TYPE}}, upstream_ms)
 
-        uses = chat.tool_uses(message)
-        answered_by = post[0]["model_digest"] if post else digest
-        sealed = {**body, "output_hash": record.output_hash(text), **(post[0] if post else {}),
-                  "ext": ext(response_hash=record.sha256_hex(resp.content),
-                             provider_request_id=resp.headers.get("x-request-id", ""),
-                             stop_reason=str(choice.get("finish_reason") or ""), tool_uses=uses,
-                             **budgets.cost(n.rulepack, answered_by, usage(data.get("usage"))))}
+        try:
+            uses = chat.tool_uses(message)
+            answered_by = post[0]["model_digest"] if post else digest
+            sealed = {**body, "output_hash": record.output_hash(text), **(post[0] if post else {}),
+                      "ext": ext(response_hash=record.sha256_hex(resp.content),
+                                 provider_request_id=resp.headers.get("x-request-id", ""),
+                                 stop_reason=str(choice.get("finish_reason") or ""), tool_uses=uses,
+                                 **budgets.cost(n.rulepack, answered_by, usage(data.get("usage"))))}
+            record.canonical_json(sealed)          # every field the seal will hash, model_digest included
+        except (record.NotCanonical, UnicodeEncodeError):
+            rec = await n.seal(settled(unhashable(usage(data.get("usage")), record.sha256_hex(resp.content), post)))
+            return JSONResponse(status_code=502, headers=headers(rec, upstream_ms), content=UNHASHABLE)
         if post and post[0]["decision"] == "block":
             # The provider answered, but not with an approved model: the answer is withheld.
             return blocked(await n.seal(settled({**sealed, "output_hash": ""})), post[1], upstream_ms)

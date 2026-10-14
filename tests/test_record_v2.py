@@ -118,6 +118,14 @@ def test_rejects_nan_in_ext(word):
         record.canonical_json({"x": float(word.lower().replace("infinity", "inf"))})
 
 
+def test_nesting_past_the_encoders_limit_is_not_canonical():
+    deep = []
+    for _ in range(100000):
+        deep = [deep]
+    with pytest.raises(record.NotCanonical):
+        record.canonical_json(deep)
+
+
 def test_tool_call_without_parent_needs_correlation_none():
     with pytest.raises(ValueError, match="requires parent_seq"):
         seal({**TOOL_CALL, "parent_seq": ""})

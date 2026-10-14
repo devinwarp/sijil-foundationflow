@@ -391,6 +391,9 @@ class Adapter:
         return Response(out, status, media_type=out_type or None, headers=seq)
 
 
+HEALTHZ = ("GET", "/_sijil/healthz")       # unauthenticated, for an orchestrator's probe
+
+
 def app(adapter: Adapter) -> FastAPI:
     api = FastAPI()
 
@@ -408,13 +411,18 @@ def app(adapter: Adapter) -> FastAPI:
                 bad = None
                 if origin is not None and not origin_ok(origin, adapter.cfg.allowed_origins):      # a browser page cannot drive the adapter
                     bad = JSONResponse({"error": "Origin not allowed"}, 403)
-                elif not adapter.authorised(request):        # before anything is sealed (spec §17.3.2)
+                elif not adapter.authorised(request) and (request.method, request.url.path) != HEALTHZ:
+                    # before anything is sealed (spec §17.3.2); only the probe is open
                     bad = JSONResponse({"error": "X-Sijil-Tools-Token required"}, 401)
                 if bad:
                     return await bad(scope, receive, send)
             await self.app(scope, receive, send)
 
     api.add_middleware(Inbound)
+
+    @api.get(HEALTHZ[1])
+    async def healthz():           # the sidecar's liveness and readiness probe: no ledger call, nothing to learn
+        return {"ok": True}
 
     api.post("/_sijil/task/start")(adapter.task_start)
     api.post("/_sijil/task/end")(adapter.task_end)
