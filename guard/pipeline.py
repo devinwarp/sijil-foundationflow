@@ -148,7 +148,10 @@ class Pipeline:
             return self._check(call, confirm, forced)
 
     def _check(self, call: Call, confirm, forced) -> Sealed:
-        h = args_hash(call.args)
+        try:
+            h = args_hash(call.args)
+        except ValueError:
+            raise Refusal("Sijil: the arguments carry NaN or an infinity, which no record can hash") from None
         parent, correlation, tool_use_id, name = self._parent(call, h)
         if not parent and self.cfg.require_parent:
             raise Refusal("Sijil: no parent inference requested this call (correlation.require_parent)")

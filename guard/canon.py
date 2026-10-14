@@ -6,8 +6,10 @@ import json
 
 
 def canonical_json(obj) -> bytes:
-    # surrogatepass: a lone surrogate (a JSON "\ud800" escape) hashes instead of raising.
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8", "surrogatepass")
+    """ValueError on NaN or an infinity, as the ledger (§2.2): callers fail closed.
+    surrogatepass: a lone surrogate (a JSON "\ud800" escape) hashes instead of raising."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False).encode("utf-8", "surrogatepass")
 
 
 def sha256_hex(data: bytes) -> str:
