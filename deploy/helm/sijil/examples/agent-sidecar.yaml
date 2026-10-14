@@ -1,0 +1,54 @@
+# The sijil-guard HTTP tool adapter as a sidecar of YOUR agent's pod. Merge into the agent Deployment's
+# spec.template. Why a sidecar: the ledger binds each agent session to the address that opened it (spec §12
+# item 47). The adapter opens the session; the agent then sends the same session on its model calls. Both must
+# leave from the same pod IP, and both must reach the ledger's Service directly (no Route/Ingress in between).
+#
+# Needs, in the agent's namespace (copy them if the agent runs outside the release namespace):
+#   ConfigMap <release>-sijil-guard     guard.yaml (+ OpenAPI specs)       chart value guard.config / guard.files
+#   ConfigMap <release>-sijil-rulepack  rulepack.yaml, the ledger's bytes  chart value rulepack
+#   Secret    <release>-sijil-tokens    agent-token, tools-token           chart value secrets
+#   Secret    sijil-agent-key           agent.key, registered with `identity init` (OPERATOR_GUIDE_M2.md §5)
+# Replace sijil-sijil with your release's full name and the image tags with your release.
+metadata:
+  labels:
+    sijil.io/agent: "true"                    # admitted by the chart's NetworkPolicy when it is on
+spec:
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile: {type: RuntimeDefault}
+  initContainers:
+    - name: agent-key                         # the guard refuses a key it does not own; Secret files are root's
+      image: ghcr.io/devinwarp/sijil-guard:<tag>
+      command: [sh, -c, "cp /agent-key/agent.key /state/agent.key && chmod 600 /state/agent.key"]
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      volumeMounts:
+        - {name: agent-key, mountPath: /agent-key, readOnly: true}
+        - {name: guard-state, mountPath: /state}
+  containers:
+    - name: agent                             # your agent, unchanged except two base URLs and two headers
+      env:
+        - {name: OPENAI_BASE_URL, value: "http://sijil-sijil-ledger:8000/v1"}   # model calls: the ledger
+        - {name: SIJIL_ADAPTER_URL, value: "http://127.0.0.1:8090"}             # tool calls: the sidecar
+        - name: SIJIL_TOOLS_TOKEN                                               # sent as X-Sijil-Tools-Token
+          valueFrom: {secretKeyRef: {name: sijil-sijil-tokens, key: tools-token}}
+    - name: sijil-adapter
+      image: ghcr.io/devinwarp/sijil-guard:<tag>
+      args: [http]                            # listens on http_tools.listen, 127.0.0.1:8090: pod-local only
+      env:
+        - name: SIJIL_TOKEN
+          valueFrom: {secretKeyRef: {name: sijil-sijil-tokens, key: agent-token}}
+        - name: SIJIL_TOOLS_TOKEN
+          valueFrom: {secretKeyRef: {name: sijil-sijil-tokens, key: tools-token}}
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      resources: {requests: {cpu: 50m, memory: 96Mi}, limits: {memory: 256Mi}}
+      volumeMounts:
+        - {name: guard-config, mountPath: /config, readOnly: true}
+        - {name: rulepack, mountPath: /rulepack, readOnly: true}
+        - {name: guard-state, mountPath: /state}
+    # One more sidecar per MCP server the agent uses over HTTP (same image, env and mounts):
+    #   args: [serve, --server, document-intake, --http, "127.0.0.1:8091"]
+  volumes:
+    - {name: guard-config, configMap: {name: sijil-sijil-guard}}
+    - {name: rulepack, configMap: {name: sijil-sijil-rulepack}}
+    - {name: agent-key, secret: {secretName: sijil-agent-key, defaultMode: 0444}}   # root-owned files; the pod is non-root
+    - {name: guard-state, emptyDir: {medium: Memory}}     # the session state file: shared by the sidecars only

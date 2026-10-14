@@ -1,0 +1,7 @@
+apiVersion: v2
+name: sijil
+description: Sijil ledger, and the sijil-guard HTTP tool adapter as a sidecar of an agent's pod
+type: application
+version: 0.1.0
+appVersion: "m2"
+home: https://sijil.infinitebarakah.com

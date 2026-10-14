@@ -1,0 +1,100 @@
+# Sijil Helm chart. The ledger runs as one pod (one worker, SQLite on a PVC). The guard's HTTP tool adapter
+# runs as a sidecar in the agent's pod: agent sessions are bound to the address that opened them, so the
+# adapter must share the agent's network namespace (spec §12 item 47). See docs/OPERATOR_GUIDE_M2.md.
+
+image:
+  ledger: {repository: ghcr.io/devinwarp/sijil, tag: ""}          # tag defaults to .Chart.AppVersion
+  guard: {repository: ghcr.io/devinwarp/sijil-guard, tag: ""}
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Tokens, from a Secret you create (recommended). Keys: admin-token (SIJILL_ADMIN_TOKEN), agent-token
+# (SIJILL_TOKEN on the ledger, SIJIL_TOKEN on the guard), tools-token (SIJIL_TOOLS_TOKEN: the agent sends it to
+# the adapter as X-Sijil-Tools-Token). With existingSecret empty the chart creates one from `values` below:
+# for rehearsals only, the tokens then sit in your values file.
+secrets:
+  existingSecret: ""
+  values: {adminToken: "", agentToken: "", toolsToken: ""}
+
+# Pod and container security contexts for every pod of the chart. No runAsUser: OpenShift assigns one from the
+# namespace range and the images run as any UID in group 0. On clusters whose volumes are not group-writable,
+# add fsGroup (e.g. 1001) to podSecurityContext.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile: {type: RuntimeDefault}
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: {drop: [ALL]}
+
+ledger:
+  enabled: true
+  # policy.yaml, verbatim. Keep agents.register_policy closed (the default) on a pilot: registrations then need
+  # the admin token. Add principals: for Entra ID (OPERATOR_GUIDE_M2.md §4).
+  policy: ""
+  # Extra files next to policy.yaml in /config (e.g. a pinned JWKS: jwks.json: '{"keys": [...]}').
+  configFiles: {}
+  # Name of a Secret holding the node signing key as `node.key` (PEM, Ed25519). Empty: the ledger creates its
+  # key on the volume at first start. Either way the public key is /data/node.pub.
+  nodeKeySecret: ""
+  publicUrl: ""                     # SIJILL_PUBLIC_URL: the ledger as approvers reach it (approval links)
+  env: {}                           # more environment, e.g. LMSTUDIO_BASE_URL, SIJILL_MODEL, SIJILL_ENTITY
+  extraEnv: []                      # raw env entries (valueFrom secrets: LM_API_TOKEN, SIJILL_PKCS11_PIN)
+  models:
+    existingClaim: ""               # a PVC holding the model weights, mounted read-only at /models
+  persistence:
+    size: 5Gi
+    storageClass: ""
+  service: {type: ClusterIP, port: 8000}
+  resources:
+    requests: {cpu: 250m, memory: 512Mi}
+    limits: {memory: 2Gi}
+  extraVolumes: []
+  extraVolumeMounts: []
+
+# The rule pack, verbatim. The ledger (SIJILL_RULEPACK_PATH) and every guard must load the same bytes: one
+# ConfigMap, mounted in both. Empty: the ledger runs without a rule pack, and the guard cannot run.
+rulepack: ""
+
+guard:
+  # guard.yaml, rendered with tpl (so {{ include "sijil.ledgerUrl" . }} works). Mounted at /config/guard.yaml.
+  # Keep key_path and state_path under /state, and rulepack at /rulepack/rulepack.yaml.
+  config: |
+    version: 1
+    sijil: {url: "{{ include "sijil.ledgerUrl" . }}"}
+    identity:
+      agent_id: spiffe://example.gov.ae/agent/case-agent
+      key_path: /state/agent.key
+      registered_by: local:0000000000000000000000000000000000000000000000000000000000000000
+    state_path: /state/session.json
+    rulepack: /rulepack/rulepack.yaml
+    http_tools:
+      listen: 127.0.0.1:8090
+      inbound_auth: {mode: bearer_env}
+      servers: []
+  files: {}                         # OpenAPI specs and other files, next to guard.yaml in /config
+  # Name of a Secret holding the agent's registered key as `agent.key`. An init container copies it to /state
+  # with mode 0600 and the pod's UID (the guard refuses a key it does not own).
+  agentKeySecret: ""
+  resources:
+    requests: {cpu: 50m, memory: 96Mi}
+    limits: {memory: 256Mi}
+
+# An agent Deployment with the adapter as its sidecar. Off by default: it shows the wiring and serves
+# rehearsals. For your own agent copy examples/agent-sidecar.yaml into its pod spec.
+agent:
+  enabled: false
+  image: ""
+  command: []
+  args: []
+  env: []
+  # MCP guards for wrapped servers, each `serve --server NAME --http 127.0.0.1:PORT` in its own sidecar
+  mcpGuards: []                     # - {server: document-intake, port: 8091}
+  resources: {}
+  securityContext: {}               # empty: the chart's securityContext
+
+# Off by default. On: the ledger accepts traffic only from pods labelled sijil.io/agent=true (agents and their
+# adapters) and from the namespaces/pods listed in `from` (the SSO reverse proxy, the SIEM forwarder).
+networkPolicy:
+  enabled: false
+  from: []

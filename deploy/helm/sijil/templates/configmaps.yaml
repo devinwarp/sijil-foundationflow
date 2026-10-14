@@ -1,0 +1,33 @@
+{{- if .Values.ledger.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sijil.fullname" . }}-policy
+  labels: {{- include "sijil.labels" . | nindent 4 }}
+data:
+  policy.yaml: {{ required "ledger.policy (policy.yaml) is required" .Values.ledger.policy | toYaml | indent 2 }}
+  {{- range $k, $v := .Values.ledger.configFiles }}
+  {{ $k }}: {{ $v | toYaml | indent 2 }}
+  {{- end }}
+---
+{{- end }}
+{{- if .Values.rulepack }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sijil.fullname" . }}-rulepack
+  labels: {{- include "sijil.labels" . | nindent 4 }}
+data:
+  rulepack.yaml: {{ .Values.rulepack | toYaml | indent 2 }}
+---
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sijil.fullname" . }}-guard
+  labels: {{- include "sijil.labels" . | nindent 4 }}
+data:
+  guard.yaml: {{ tpl .Values.guard.config . | toYaml | indent 2 }}
+  {{- range $k, $v := .Values.guard.files }}
+  {{ $k }}: {{ $v | toYaml | indent 2 }}
+  {{- end }}
