@@ -1,0 +1,21 @@
+name: ci
+on:
+  pull_request:
+  workflow_call:          # release.yml runs the same tests before it builds anything
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: System libraries (WeasyPrint, sqlite3 CLI)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpango-1.0-0 libpangoft2-1.0-0 sqlite3
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q -p no:cacheprovider
