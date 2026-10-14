@@ -523,10 +523,14 @@ def token_check(st, principal, c):
         times = ts_of(payload.get("nbf", payload.get("iat"))) == c["nbf"] and ts_of(payload["exp"]) == c["exp"]
     except (KeyError, TypeError, ValueError, OverflowError, OSError):
         times = False
+    try:        # a subject no record can hash (NaN, an infinity, a lone surrogate: §2.2) is not the principal's
+        subject_hash = sha256(canonical_json({"iss": payload.get("iss"), "sub": subject})).hexdigest()
+    except (ValueError, RecursionError):
+        raise mismatch
     human = HUMAN.fullmatch(principal)
     if (payload.get("iss") != c["iss"] or not (aud == c["aud"] or (isinstance(aud, list) and c["aud"] in aud))
             or (c["profile"] == "entra" and payload.get("tid") != c["tenant"]) or not times or not human
-            or sha256(canonical_json({"iss": payload.get("iss"), "sub": subject})).hexdigest() != human.group(2)):
+            or subject_hash != human.group(2)):
         raise mismatch
     st.principal_tokens["verified"] += 1
 
