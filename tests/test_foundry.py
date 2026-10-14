@@ -212,6 +212,26 @@ def test_relay_inferences_are_priced_and_the_chain_verifies_with_the_rulepack(tm
         assert code == 0, line
 
 
+def test_a_failed_upstream_is_priced_under_the_agent_name_and_the_chain_verifies(tmp_path, monkeypatch):
+    """§17.4.3: model_digest is api:azure-foundry:<model_id>, and model_id falls back to the agent name, so an
+    upstream_error priced for that digest carries it too."""
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    pack = PACK + """pricing:
+  - {id: foundry-any, model: "api:azure-foundry:*", input_per_mtok_micro: 1, output_per_mtok_micro: 1,
+     missing_usage_cost_micro: 555}
+"""
+    client, s, _ = gov_node(tmp_path, pack=pack, handler=lambda r: httpx.Response(500, json={"error": "down"}),
+                            policy=FOUNDRY_POLICY)
+    with client:
+        assert portal(client).status_code == 502
+    failed = rows(s.db_path, "type = 'inference'")[-1]
+    assert (failed["model_id"], failed["model_digest"]) == ("case-agent", "api:azure-foundry:case-agent")
+    assert (json.loads(failed["ext"])["price_rule"], json.loads(failed["ext"])["cost_micro"]) == ("foundry-any", 555)
+    for flags in ((), ("--rulepack", str(tmp_path / "starter.yaml"))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
+
+
 def test_a_refused_approval_at_the_gate_is_denied_and_the_chain_verifies(relay):
     client, s, foundry = relay
     out = []

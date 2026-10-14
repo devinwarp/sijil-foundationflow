@@ -124,7 +124,9 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
     # a refreshed token in the conversation is sealed once, as on the model door (§17.2.8)
     claims = {} if n.store.token_in_force(task["seq"]) == human["claims"]["token_hash"] else \
         {"principal_claims": human["claims"]}
-    base = in_task(n, task, "inference", model_id=cfg.agent_name, mode=mode, decision=decision,
+    # until Foundry reports a valid model id, model_id is the agent name and model_digest follows it (§17.4.3)
+    base = in_task(n, task, "inference", model_id=cfg.agent_name, model_digest=f"api:azure-foundry:{cfg.agent_name}",
+                   mode=mode, decision=decision,
                    rule_hits=policy.rule_hits_json(hits), input_hash=record.sha256_hex(record.canonical_json(given)),
                    ext=cj({"api": API, "session_id": conv_hash, **claims}))
 
@@ -139,7 +141,7 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
         return refused(await seal_in(n, task, settled(base)), 403, "policy_block"), None
     # forwarded, so priced like any forwarded request: no usage reported means missing_usage_cost_micro
     failed = {**base, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]),
-              "ext": cj({**json.loads(base["ext"]), **budgets.cost(n.rulepack, f"api:azure-foundry:{cfg.agent_name}", None)})}
+              "ext": cj({**json.loads(base["ext"]), **budgets.cost(n.rulepack, base["model_digest"], None)})}
     try:
         resp = await n.foundry.post("/responses", json=req, headers={"Authorization": f"Bearer {token}"})
         status, data = resp.status_code, resp.json() if resp.status_code == 200 else None
