@@ -392,9 +392,9 @@ def test_limits_set_the_rule_engines_size_caps(tmp_path):
     from guard import rules
     cfg = config.load(write_yaml(tmp_path, ""))
     assert (cfg.max_command, cfg.max_args) == (rules.MAX_COMMAND, rules.MAX_ARGS) == (2048, 32768)
-    cfg = config.load(write_yaml(tmp_path, "limits: {max_command: 1024, max_args: 1048576}"))
-    assert (cfg.max_command, cfg.max_args) == (1024, 1048576)
+    cfg = config.load(write_yaml(tmp_path, "limits: {max_command: 4096, max_args: 65536}"))
+    assert (cfg.max_command, cfg.max_args) == (4096, 65536)
     for bad in ("limits: {max_args: 0}", "limits: {max_command: '4096'}", "limits: {max_command: true}",
-                "limits: {max_body: 1}"):
+                "limits: {max_body: 1}", "limits: {max_command: 4097}", "limits: {max_args: 65537}"):
         with pytest.raises(ValueError, match="limits"):
             config.load(write_yaml(tmp_path, bad))

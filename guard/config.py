@@ -326,8 +326,11 @@ def load(path: str) -> Config:
         _section(doc, n, path) for n in ("sijil", "identity", "task", "egress", "correlation", "results", "mcp",
                                          "integrity", "limits"))
     caps = {k: limits.get(k, getattr(rules, k.upper())) for k in ("max_command", "max_args")}
-    if any(type(v) is not int or v < 1 for v in caps.values()):
-        raise ValueError(f"{path}: limits.max_command and limits.max_args must be positive integers")
+    # at most twice the default: the rules' regexes grow quadratically, about 0.25 s a call at twice the default and
+    # 1 s at four times, holding the guard's GIL
+    if any(type(v) is not int or not 1 <= v <= 2 * getattr(rules, k.upper()) for k, v in caps.items()):
+        raise ValueError(f"{path}: limits.max_command and limits.max_args must be integers from 1 to "
+                         f"{2 * rules.MAX_COMMAND} and {2 * rules.MAX_ARGS}")
     recheck = integ.get("recheck_seconds", 30)
     if type(recheck) not in (int, float) or not 0 <= recheck <= 86400:
         raise ValueError(f"{path}: integrity.recheck_seconds must be a number from 0 to 86400")
