@@ -356,3 +356,33 @@ def test_identity_init_registers_under_principal_oidc_with_the_principal_token(t
     rec = rows(s.db_path)[-1]
     assert (rec["type"], rec["principal"], json.loads(rec["ext"])["principal_auth"]) == ("agent_register", HUMAN, "oidc")
     assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_a_task_the_ledger_already_closed_leaves_the_stack(tmp_path, capsys, monkeypatch):
+    """A task the ledger closed (timeout, or ended elsewhere) is taken off the state file when `task end` is refused
+    for it, so the guards stop sending its seq; a transient refusal (an approval pending) keeps it."""
+    cfg_path = guard_yaml(tmp_path)
+    client, s = ledger_node(tmp_path)
+    state_file = tmp_path / "run" / "case-agent.json"
+    with client:
+        args = ["--config", str(cfg_path), "--repo", str(tmp_path / "repo")]
+        run(["identity", "init", *args], client, capsys)
+        first = int(run(["task", "start", *args], client, capsys)[1])
+        real = Ledger.call
+
+        def pending(self, method, path, *a, **kw):
+            if path == "/api/agent/task/end":
+                raise Refused(409, "approval pending in this task")
+            return real(self, method, path, *a, **kw)
+        monkeypatch.setattr(Ledger, "call", pending)
+        assert run(["task", "end", *args], client, capsys)[0] == 1
+        assert task.load(state_file, AGENT).tasks == [first]                     # transient: kept
+        monkeypatch.setattr(Ledger, "call", real)
+        st = task.load(state_file, AGENT)
+        assert task.end_task(ledger_of(client), st.agent_session, first, "timeout")["seq"]   # closed meanwhile
+        assert run(["task", "end", *args], client, capsys)[0] == 1 and "409" in run.err
+        assert task.load(state_file, AGENT).tasks == []                          # closed: dropped
+        second = int(run(["task", "start", *args], client, capsys)[1])
+        assert task.load(state_file, AGENT).tasks == [second]
+    assert [json.loads(r["ext"])["outcome"] for r in rows(s.db_path, "type = 'task_end'")] == ["timeout"]
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
