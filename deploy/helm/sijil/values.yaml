@@ -87,7 +87,8 @@ guard:
     limits: {memory: 256Mi}
   # Exec readiness/liveness probes on the adapter sidecar: GET http://127.0.0.1:8090/_sijil/healthz from inside the
   # container (it listens on loopback, out of the kubelet's reach). Needs a guard image whose adapter serves
-  # /_sijil/healthz; older images would fail the probe and restart. MCP guard sidecars have no probe.
+  # /_sijil/healthz; older images would fail the probe and restart. Assumes guard.yaml's http_tools.listen is
+  # 127.0.0.1:8090 (the default). MCP guard sidecars have no probe.
   probes:
     enabled: false
 
