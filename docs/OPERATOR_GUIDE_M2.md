@@ -62,22 +62,29 @@ Each release tag (`v*`) publishes, from `.github/workflows/release.yml`:
 
 | Image | Holds |
 | --- | --- |
-| `ghcr.io/devinwarp/sijil:<tag>` | the ledger (BSL-1.1), the verifier and trace tool (Apache-2.0), the report |
+| `ghcr.io/devinwarp/sijil:<tag>` | the ledger (BSL-1.1, `/app/LICENSE`); the verifier, trace tool and guard rule engine (Apache-2.0, each with its LICENSE); the report |
 | `ghcr.io/devinwarp/sijil-guard:<tag>` | the guard and adapter (Apache-2.0) and the starter rule pack, nothing else |
 
-Both are signed with cosign keyless (GitHub OIDC) and carry an SPDX SBOM attestation; the SBOMs are also attached
-to the GitHub release. Check before you load them:
+Both are signed with cosign keyless (GitHub OIDC) and carry an SPDX SBOM attestation. The GitHub release holds,
+per image, the SBOM (`<image>-<tag>.spdx.json`) and the exact pushed reference (`<image>-<tag>.digest`,
+`ghcr.io/...@sha256:...`). Verify and deploy **by digest**, not by tag: a tag can be moved, a digest cannot. The
+release signs with cosign v3.0.6: verify with cosign v3. Check before you load them (`TAG` is the release tag; without
+`gh`, download the `.digest` files from the release page):
 
 ```bash
+TAG=v1.2.0
+ID="^https://github.com/devinwarp/sijil-foundationflow/\.github/workflows/release\.yml@refs/tags/${TAG//./\\.}\$"
 for img in sijil sijil-guard; do
-  cosign verify ghcr.io/devinwarp/$img:<tag> \
-    --certificate-identity-regexp '^https://github.com/devinwarp/sijil-foundationflow/\.github/workflows/release\.yml@refs/tags/' \
-    --certificate-oidc-issuer https://token.actions.githubusercontent.com
-  cosign verify-attestation --type spdxjson ghcr.io/devinwarp/$img:<tag> \
-    --certificate-identity-regexp '^https://github.com/devinwarp/sijil-foundationflow/' \
+  gh release download "$TAG" -R devinwarp/sijil-foundationflow -p "$img-$TAG.digest" --clobber
+  REF=$(cat "$img-$TAG.digest")
+  cosign verify "$REF" --certificate-identity-regexp "$ID" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null && echo "$img signed"
+  cosign verify-attestation --type spdxjson "$REF" --certificate-identity-regexp "$ID" \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null && echo "$img SBOM attested"
 done
 ```
+
+Both checks accept only a signature made by `release.yml` running for that tag, not by another workflow or branch.
 
 Offline sites: `docker pull` both on a connected machine, `docker save` them, carry the tarballs in, `docker load`.
 
@@ -85,7 +92,7 @@ To build from a checkout instead: `docker build -t sijil:<tag> .` and `docker bu
 sijil-guard:<tag> .`, then `scripts/smoke_container.sh sijil:<tag>` and `scripts/smoke_guard.sh sijil-guard:<tag>
 sijil:<tag>`.
 
-Below, `$SIJIL_IMAGE` and `$GUARD_IMAGE` are the two image references you use.
+Below, `$SIJIL_IMAGE` and `$GUARD_IMAGE` are the two image references you use (the `REF`s above).
 
 ## 3. Before you start
 
@@ -219,6 +226,9 @@ file's bytes: any edit, comments included, is a new rule pack, sealed as a `rule
 ## 6. Configure the guard
 
 One `guard.yaml` per agent. In the image it is `/config/guard.yaml`; paths in it are relative to its directory.
+Keep it, its OpenAPI documents and the agent key in an operator directory **outside the repository checkout**
+(the commands below use `OPS=~/sijil-ops`: `$OPS/guard/guard.yaml`, `$OPS/guard/case-api.json`), so a key never
+lands in a source tree or an image build context.
 The guard refuses unknown keys, so a setting it does not honour is never silently ignored. The case agent's file:
 
 ```yaml
@@ -260,9 +270,9 @@ Once per agent, by an operator: create the agent's Ed25519 key and seal an `agen
 operator workstation that reaches the ledger (for Kubernetes, through `kubectl port-forward`).
 
 ```bash
-mkdir -p agent-key && chmod 700 agent-key
+OPS=~/sijil-ops && mkdir -p "$OPS/agent-key" && chmod 700 "$OPS/agent-key"
 docker run --rm --user "$(id -u):0" --network sijil-net \
-  -v "$PWD/guard:/config:ro" -v "$PWD/agent-key:/state" \
+  -v "$OPS/guard:/config:ro" -v "$OPS/agent-key:/state" \
   -e SIJIL_TOKEN="$AGENT_TOKEN" -e SIJILL_ADMIN_TOKEN="$ADMIN_TOKEN" -e SIJIL_TOOLS_TOKEN="$TOOLS_TOKEN" \
   "$GUARD_IMAGE" identity init
 # registered spiffe://moi.gov.ae/agent/case-agent pubkey=<hex> seq=<n>
@@ -271,9 +281,15 @@ docker run --rm --user "$(id -u):0" --network sijil-net \
 Every command loads the whole guard.yaml, so the variables it names (here `SIJIL_TOOLS_TOKEN`, for
 `inbound_auth: bearer_env`) must be set for `identity init` too.
 
-`agent-key/agent.key` is now the agent's identity: store it in the secret store. `identity init` is safe to
-repeat (it never overwrites a key), but each run seals another registration. To retire a key:
-`curl -X POST $S/api/agent/revoke -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"agent_id": "...", "reason": "..."}'`.
+`$OPS/agent-key/agent.key` is now the agent's identity: store it in the secret store. `identity init` is safe to
+repeat (it never overwrites a key), but each run seals another registration. To retire a key (a compromised
+agent, say), name the operator who revokes it as a principal, as for `registered_by`:
+
+```bash
+curl -s -X POST "$S/api/agent/revoke" -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"agent_id": "spiffe://moi.gov.ae/agent/case-agent", "revoked_by": "human:entra-moi:<hash>", "reason": "key exposed"}'
+# {"seq": N, "record_hash": "..."}: an agent_revoke record; the guard's next session answers 401 agent revoked
+```
 
 `identity.auth: oidc` instead of a key: the guard presents a workload token (from the variable named by
 `identity.oidc_token_env`, default `SIJIL_OIDC_TOKEN`, or GitHub Actions OIDC) and the ledger checks it against
@@ -299,7 +315,8 @@ docker run -d --name case-agent --network sijil-net -e SIJIL_TOOLS_TOKEN="$TOOLS
 
 # its sidecars: same network namespace, same state directory (the registered key from section 7)
 G=(--restart unless-stopped --network container:case-agent --user "$(id -u):0"
-   -v "$PWD/guard:/config:ro" -v /etc/sijil-rulepack:/rulepack:ro -v "$PWD/agent-key:/state"
+   --read-only --cap-drop ALL --security-opt no-new-privileges
+   -v "$OPS/guard:/config:ro" -v /etc/sijil-rulepack:/rulepack:ro -v "$OPS/agent-key:/state"
    -e SIJIL_TOKEN="$AGENT_TOKEN" -e SIJIL_TOOLS_TOKEN="$TOOLS_TOKEN")
 docker run -d --name case-agent-adapter "${G[@]}" "$GUARD_IMAGE"                       # http (the default)
 docker run -d --name case-agent-mcp "${G[@]}" "$GUARD_IMAGE" serve --server document-intake --http 127.0.0.1:8091
@@ -315,7 +332,11 @@ docker run -d --name case-agent-mcp "${G[@]}" "$GUARD_IMAGE" serve --server docu
 The chart is `deploy/helm/sijil`. It runs the ledger as a one-replica StatefulSet with a PVC, the policy and rule
 pack from ConfigMaps, the tokens from a Secret; and it renders the guard's config and, optionally, an agent
 Deployment with the adapter and MCP guards as sidecars. Pods set no `runAsUser` (OpenShift assigns one), run
-non-root with a read-only root filesystem, and drop all capabilities.
+non-root with a read-only root filesystem, drop all capabilities, and mount no service account token.
+
+Resource names start with the chart's full name: the release name if it contains `sijil`, else `<release>-sijil`.
+For `helm install sijil` below that is `sijil`: Service `sijil-ledger`, pod `sijil-ledger-0`, ConfigMaps
+`sijil-guard` and `sijil-rulepack`.
 
 ```bash
 kubectl create namespace sijil
@@ -328,9 +349,9 @@ helm install sijil deploy/helm/sijil -n sijil -f my-values.yaml
 `my-values.yaml`:
 
 ```yaml
-image:
-  ledger: {repository: ghcr.io/devinwarp/sijil, tag: <tag>}
-  guard: {repository: ghcr.io/devinwarp/sijil-guard, tag: <tag>}
+image:                                # required: a tag or, better, the digest from the release's .digest asset
+  ledger: {repository: ghcr.io/devinwarp/sijil, digest: "sha256:<from sijil-<tag>.digest>"}
+  guard: {repository: ghcr.io/devinwarp/sijil-guard, digest: "sha256:<from sijil-guard-<tag>.digest>"}
 secrets: {existingSecret: sijil-tokens}
 ledger:
   policy: |
@@ -354,31 +375,50 @@ Then register the agent (section 7) through a port-forward, and store its key:
 
 ```bash
 kubectl -n sijil port-forward svc/sijil-ledger 8000:8000 &      # any free local port
-mkdir -p reg agent-key && chmod 700 agent-key && cp case-api.json reg/
+OPS=~/sijil-ops && mkdir -p "$OPS/reg" "$OPS/agent-key" && chmod 700 "$OPS/agent-key" && cp "$OPS/guard/case-api.json" "$OPS/reg/"
 # guard.yaml with the forwarded URL: host.docker.internal on Docker Desktop; on Linux add --network host
 # to the docker run below and use http://127.0.0.1:8000
-sed 's|^sijil:.*|sijil: {url: "http://host.docker.internal:8000"}|' guard.yaml > reg/guard.yaml
-docker run --rm --user "$(id -u):0" -v "$PWD/reg:/config:ro" -v "$PWD/agent-key:/state" \
+sed 's|^sijil:.*|sijil: {url: "http://host.docker.internal:8000"}|' "$OPS/guard/guard.yaml" > "$OPS/reg/guard.yaml"
+docker run --rm --user "$(id -u):0" -v "$OPS/reg:/config:ro" -v "$OPS/agent-key:/state" \
   -e SIJIL_TOKEN="$AGENT_TOKEN" -e SIJILL_ADMIN_TOKEN="$ADMIN_TOKEN" -e SIJIL_TOOLS_TOKEN="$TOOLS_TOKEN" \
   "$GUARD_IMAGE" identity init
-kubectl -n sijil create secret generic sijil-agent-key --from-file=agent.key=agent-key/agent.key
+kubectl -n sijil create secret generic sijil-agent-key --from-file=agent.key="$OPS/agent-key/agent.key"
 ```
 
-(`guard.yaml` and `case-api.json` here are your local copies of `guard.config` and `guard.files`, with `sijil:` on
-one line.) The agent pod starts once the Secret exists.
+(`$OPS/guard/guard.yaml` and `case-api.json` are your local copies of `guard.config` and `guard.files`, with `sijil:`
+on one line.) The agent pod starts once the Secret exists.
 
 **The adapter as a sidecar of your agent.** Either set `agent.enabled: true` with your agent's `image` (and
 `agent.mcpGuards: [{server: document-intake, port: 8091}]`), or merge `deploy/helm/sijil/examples/agent-sidecar.yaml`
 into your agent's own Deployment. An init container copies the key from the Secret into a memory `emptyDir` with
-mode 0600 and the pod's UID. Agents must reach the ledger through its Service (`http://<release>-sijil-ledger:8000`),
+mode 0600 and the pod's UID. Agents must reach the ledger through its Service (`http://<fullname>-ledger:8000`,
+`http://sijil-ledger:8000` for `helm install sijil`; from another namespace `http://sijil-ledger.sijil:8000`),
 never a Route: the router rewrites the source address and the ledger answers `401 agent session bound to another
 address`.
 
-Other values: `networkPolicy.enabled` (off by default; admits only pods labelled `sijil.io/agent: "true"` plus
-`networkPolicy.from`), `ledger.nodeKeySecret` (a Secret with `node.key`, instead of a key created on the volume),
+Key Secrets (`agentKeySecret`, `nodeKeySecret`) mount with mode 0440: owned by root, read through the pod's group.
+That is GID 0 when `runAsGroup` is unset (the images' convention), and the injected `fsGroup` on OpenShift. If you
+set `runAsGroup` to a non-zero GID, set `fsGroup` to it as well, or the init container cannot read the key.
+
+Other values:
+
+* `networkPolicy.enabled` (off by default) admits only pods labelled `sijil.io/agent: "true"` **in the release
+  namespace**, plus `networkPolicy.from`. Agents in other namespaces need a `from` entry with a `namespaceSelector`
+  (and the `podSelector`); on OpenShift, approvers coming through the Router need
+  `{namespaceSelector: {matchLabels: {policy-group.network.openshift.io/ingress: ""}}}`. `values.yaml` has both.
+* `guard.probes.enabled` (off by default) adds exec readiness and liveness probes to the adapter sidecar: they call
+  `http://127.0.0.1:8090/_sijil/healthz` from inside the container, since the adapter listens on loopback only.
+  Turn it on only with a guard release whose adapter serves that path; MCP guard sidecars have no probe.
+* Resources: requests and memory limits are set, CPU limits are not. If a namespace ResourceQuota requires CPU
+  limits, add `cpu` under `ledger.resources.limits` and `guard.resources.limits` (the latter also covers the
+  key-copy init container) and `agent.resources`.
+* Tokens are read at pod start. After changing them in the Secret, `kubectl -n sijil rollout restart
+  statefulset/sijil-ledger deployment/<agent>`.
+* `ledger.nodeKeySecret` (a Secret with `node.key`, instead of a key created on the volume),
 `ledger.extraEnv`/`extraVolumes` (HSM settings), `podSecurityContext` (add `fsGroup` on clusters whose volumes are
-not group-writable; OpenShift sets it). `helm lint deploy/helm/sijil -f deploy/helm/sijil/ci/lint-values.yaml`
-renders every template.
+not group-writable; OpenShift sets it).
+
+`helm lint deploy/helm/sijil -f deploy/helm/sijil/ci/lint-values.yaml` renders every template.
 
 ## 10. Point the agent at Sijil
 
@@ -451,7 +491,7 @@ signatures and links, not principal tokens.
 
 | Item | Where |
 | --- | --- |
-| a consistent copy of the records | `docker exec sijil sqlite3 /data/sijill.db ".backup /data/export.db"` (Helm: `kubectl exec <release>-sijil-ledger-0 -- ...`), then copy `/data/export.db` out |
+| a consistent copy of the records | `docker exec sijil sqlite3 /data/sijill.db ".backup /data/export.db"` (Helm: `kubectl exec <fullname>-ledger-0 -- ...`, `sijil-ledger-0` for `helm install sijil`), then copy `/data/export.db` out |
 | the node public key | `/data/node.pub` |
 | the JWKS snapshots | `/data/jwks/` (every key set any sealed token was checked against, by hash) |
 | the rule pack(s) in force | your `rulepack.yaml`, each version that was adopted |
@@ -475,9 +515,10 @@ Without `--token-dir` the tokens are counted as unverified; without `--rulepack`
 an older ledger refuses, while a newer ledger keeps serving older guards.
 
 1. Read the release notes for record-format or policy changes; back up the data volume (M1 guide).
-2. Ledger: `docker pull`, `docker rm -f sijil`, `docker run` as before (Helm: bump `image.ledger.tag`, `helm upgrade`).
+2. Ledger: `docker pull`, `docker rm -f sijil`, `docker run` as before (Helm: set `image.ledger` to the new digest or tag, `helm upgrade`).
    Check `/api/verify`.
-3. Guards: replace the sidecars (Helm: bump `image.guard.tag`; the agent pods roll).
+3. Guards: replace the sidecars (Helm: set `image.guard` to the new digest or tag, `helm upgrade`; the agent pods
+   roll). The two images are pinned separately so these are two upgrades.
 4. Agent keys and the chain survive both: keys are in the Secret/state directory, records in `/data`.
 
 ## 15. Troubleshooting
@@ -488,6 +529,7 @@ an older ledger refuses, while a newer ledger keeps serving older guards.
 | `sijil-guard: Sijil ledger unreachable: ... Name or service not known` | `sijil.url` is wrong, or the ledger is not on the container's network |
 | `identity init` prints `unexpected reply from the Sijil ledger: KeyError('getpwuid(): uid not found: ...')` | The container's UID has no passwd entry and `identity.registered_by` is unset. Set `registered_by` |
 | `... the agent key is not owned by you` / `readable by other users` | Run the sidecar as the UID that owns `agent.key` (Docker `--user`), or copy it in with mode 0600 (the chart's init container does) |
+| Agent pod init container `cp: cannot open '/agent-key/agent.key': Permission denied` | The key Secret mounts 0440 (read through the group); the pod set a non-zero `runAsGroup` without `fsGroup`. Set `fsGroup` to the same GID |
 | Adapter answers `401 X-Sijil-Tools-Token required` | The agent did not send `SIJIL_TOOLS_TOKEN`, or the values differ |
 | Agent's model call answers `401 agent session bound to another address` | The agent and the adapter reach the ledger from different addresses: run the adapter as a sidecar, and call the ledger's Service directly (no Route/Ingress/NAT) |
 | Tool call `403 ... no parent inference requested this call` | The tool call's name or arguments differ from the model call that asked for it, or the model call lacked `X-Sijil-Agent-Session`/`X-Sijil-Task-Seq`. Send exactly the model's arguments |
