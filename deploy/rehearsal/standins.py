@@ -6,8 +6,8 @@
 
 They mirror the fixtures of tests/test_m2_gate.py. Run them from the sijil-guard image (it has fastapi and uvicorn).
 """
-import hashlib
 import json
+import secrets
 import sys
 
 import uvicorn
@@ -40,7 +40,7 @@ def model() -> FastAPI:
         message = {"role": "assistant", "content": "Done."}
         if name:
             message = {"role": "assistant", "content": None, "tool_calls": [{
-                "id": "call_" + hashlib.sha256(prompt.encode()).hexdigest()[:12], "type": "function",
+                "id": f"call_{secrets.token_hex(6)}", "type": "function",      # unique, as real models' ids are
                 "function": {"name": name, "arguments": json.dumps(args)}}]}
         return {"id": "c", "model": body.get("model", "m"), "usage": {"prompt_tokens": 900, "completion_tokens": 60},
                 "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]}

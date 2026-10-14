@@ -263,10 +263,13 @@ operator workstation that reaches the ledger (for Kubernetes, through `kubectl p
 mkdir -p agent-key && chmod 700 agent-key
 docker run --rm --user "$(id -u):0" --network sijil-net \
   -v "$PWD/guard:/config:ro" -v "$PWD/agent-key:/state" \
-  -e SIJIL_TOKEN="$AGENT_TOKEN" -e SIJILL_ADMIN_TOKEN="$ADMIN_TOKEN" \
+  -e SIJIL_TOKEN="$AGENT_TOKEN" -e SIJILL_ADMIN_TOKEN="$ADMIN_TOKEN" -e SIJIL_TOOLS_TOKEN="$TOOLS_TOKEN" \
   "$GUARD_IMAGE" identity init
 # registered spiffe://moi.gov.ae/agent/case-agent pubkey=<hex> seq=<n>
 ```
+
+Every command loads the whole guard.yaml, so the variables it names (here `SIJIL_TOOLS_TOKEN`, for
+`inbound_auth: bearer_env`) must be set for `identity init` too.
 
 `agent-key/agent.key` is now the agent's identity: store it in the secret store. `identity init` is safe to
 repeat (it never overwrites a key), but each run seals another registration. To retire a key:
@@ -350,11 +353,19 @@ guard:
 Then register the agent (section 7) through a port-forward, and store its key:
 
 ```bash
-kubectl -n sijil port-forward svc/sijil-ledger 8000:8000 &
-# section 7, with sijil.url: http://host.docker.internal:8000 (Docker Desktop) or --network host and
-# http://127.0.0.1:8000 (Linux) in a copy of guard.yaml
+kubectl -n sijil port-forward svc/sijil-ledger 8000:8000 &      # any free local port
+mkdir -p reg agent-key && chmod 700 agent-key && cp case-api.json reg/
+# guard.yaml with the forwarded URL: host.docker.internal on Docker Desktop; on Linux add --network host
+# to the docker run below and use http://127.0.0.1:8000
+sed 's|^sijil:.*|sijil: {url: "http://host.docker.internal:8000"}|' guard.yaml > reg/guard.yaml
+docker run --rm --user "$(id -u):0" -v "$PWD/reg:/config:ro" -v "$PWD/agent-key:/state" \
+  -e SIJIL_TOKEN="$AGENT_TOKEN" -e SIJILL_ADMIN_TOKEN="$ADMIN_TOKEN" -e SIJIL_TOOLS_TOKEN="$TOOLS_TOKEN" \
+  "$GUARD_IMAGE" identity init
 kubectl -n sijil create secret generic sijil-agent-key --from-file=agent.key=agent-key/agent.key
 ```
+
+(`guard.yaml` and `case-api.json` here are your local copies of `guard.config` and `guard.files`, with `sijil:` on
+one line.) The agent pod starts once the Secret exists.
 
 **The adapter as a sidecar of your agent.** Either set `agent.enabled: true` with your agent's `image` (and
 `agent.mcpGuards: [{server: document-intake, port: 8091}]`), or merge `deploy/helm/sijil/examples/agent-sidecar.yaml`
@@ -412,8 +423,9 @@ request open and the ledger seals an `approval` request record.
      -d "{\"decision\": \"grant\", \"token\": \"$SUPERVISOR_TOKEN\", \"reason\": \"Certificate checked.\"}"
    ```
 3. The ledger checks the token (audience `hitl.entra.audience`), the route's role or object ids, `min_assurance`,
-   separation of duties and the deadline before sealing the decision. A refused check seals nothing and answers
-   401/403 with `approval_error`. The held call then proceeds (grant) or is refused (refuse, timeout).
+   separation of duties and the deadline before sealing the decision. A failed check seals nothing and answers
+   401/403 with `{"detail": {"approval_error": "<code>"}}` (`audience`: a token for another app, such as the
+   officer's; `assurance`, `role`, ...). The held call then proceeds (grant) or is refused (refuse, timeout).
 
 ## 12. Adopt or change a rule pack
 
@@ -480,9 +492,10 @@ an older ledger refuses, while a newer ledger keeps serving older guards.
 | Agent's model call answers `401 agent session bound to another address` | The agent and the adapter reach the ledger from different addresses: run the adapter as a sidecar, and call the ledger's Service directly (no Route/Ingress/NAT) |
 | Tool call `403 ... no parent inference requested this call` | The tool call's name or arguments differ from the model call that asked for it, or the model call lacked `X-Sijil-Agent-Session`/`X-Sijil-Task-Seq`. Send exactly the model's arguments |
 | `409 rulepack mismatch` / `Sijil ledger refused the record: rulepack mismatch` | Guard and ledger hold different pack bytes: section 12 |
-| `401 {"principal_error": "kid"}` | The token's signing key is not in the key set: pinned JWKS out of date (Microsoft rolled keys), or no egress to fetch it |
+| `principal_error` `kid` (in the 401 `detail` of an `/api/agent/*` answer, or the `ext` of a sealed block) | The token's signing key is not in the key set: pinned JWKS out of date (Microsoft rolled keys), or no egress to fetch it |
 | `principal_error` `issuer`, `tenant`, `audience` | v1.0 token (set `accessTokenAcceptedVersion: 2`), another tenant, or a token for another app |
-| `403 principal_error assurance` | The sign-in did not meet `min_assurance` (MFA, or the `c3` authentication context for approvals) |
+| `principal_error` `assurance` (403) | The sign-in did not meet `min_assurance` (MFA, or the `c3` authentication context for approvals) |
+| Every tool call refused `no parent inference` although the model asked for it | The model server repeats tool call ids (e.g. `call_0`) across conversations: the ledger keys ids globally and keeps the first. Use a server that issues unique ids |
 | Approval never notified | `SIJILL_PUBLIC_URL` empty (logged at startup) or the webhook variable unset |
 | Off-loopback adapter refuses to start | `http_tools off loopback needs tls.cert, tls.key and inbound_auth`: keep it on loopback in a sidecar |
 | Verifier `FAIL seq=N tool_call without parent inference` | A guard ran with `correlation.require_parent: false`; pass `--allow-orphan-tool-calls` if that was intended |
@@ -499,6 +512,7 @@ You need Docker, the two images, and a checkout of the repository (for `deploy/r
 ```bash
 export SIJIL_IMAGE=<ledger image> GUARD_IMAGE=<guard image> REPO=<path to the checkout>
 export ADMIN_TOKEN=rehearsal-admin AGENT_TOKEN=rehearsal-agent TOOLS_TOKEN=rehearsal-tools
+PORT=8000                     # the ledger's port on this host: pick a free one
 R=$(mktemp -d) && cd "$R" && mkdir config rulepack guard agent-key models kit && chmod 700 agent-key
 cp "$REPO"/deploy/rehearsal/*.py .
 RUN=(docker run --rm --user "$(id -u):0" -v "$R:/w" -w /w --entrypoint python "$GUARD_IMAGE")
@@ -572,16 +586,16 @@ EOF
 
 ```bash
 docker network create sijil-net
-docker run -d --name sijil --network sijil-net -p 8000:8000 \
+docker run -d --name sijil --network sijil-net -p "127.0.0.1:$PORT:8000" \
   -v "$R/config:/config:ro" -v "$R/rulepack:/rulepack:ro" -v "$R/models:/models:ro" -v sijil-rehearsal-data:/data \
   -e SIJILL_ADMIN_TOKEN="$ADMIN_TOKEN" -e SIJILL_TOKEN="$AGENT_TOKEN" -e SIJILL_RULEPACK_PATH=/rulepack/rulepack.yaml \
-  -e SIJILL_PUBLIC_URL=http://localhost:8000 -e LMSTUDIO_BASE_URL=http://model:9001/v1 -e SIJILL_MODEL=case-model \
+  -e SIJILL_PUBLIC_URL="http://localhost:$PORT" -e LMSTUDIO_BASE_URL=http://model:9001/v1 -e SIJILL_MODEL=case-model \
   "$SIJIL_IMAGE"
-for s in "model 9001" "case-api 9000" "document-intake 9002"; do set -- $s
-  docker run -d --name "$1" --network sijil-net -v "$R:/w:ro" --entrypoint python "$GUARD_IMAGE" \
-    /w/standins.py "${1/document-intake/docs}" "$2"
-done
-sleep 3 && curl -s localhost:8000/api/policy | python3 -m json.tool | head -5     # "policy_id": "moi-case-rehearsal"
+S=(--network sijil-net -v "$R:/w:ro" --entrypoint python "$GUARD_IMAGE" /w/standins.py)
+docker run -d --name model "${S[@]}" model 9001
+docker run -d --name case-api "${S[@]}" case-api 9000
+docker run -d --name document-intake "${S[@]}" docs 9002
+sleep 3 && curl -s localhost:$PORT/api/policy | python3 -m json.tool | head -5     # "policy_id": "moi-case-rehearsal"
 ```
 
 **5. Guard config.**
@@ -613,7 +627,8 @@ EOF
 
 ```bash
 docker run --rm --user "$(id -u):0" --network sijil-net -v "$R/guard:/config:ro" -v "$R/agent-key:/state" \
-  -e SIJIL_TOKEN="$AGENT_TOKEN" -e SIJILL_ADMIN_TOKEN="$ADMIN_TOKEN" "$GUARD_IMAGE" identity init
+  -e SIJIL_TOKEN="$AGENT_TOKEN" -e SIJILL_ADMIN_TOKEN="$ADMIN_TOKEN" -e SIJIL_TOOLS_TOKEN="$TOOLS_TOKEN" \
+  "$GUARD_IMAGE" identity init
 ```
 
 **7. The agent and its sidecars** (section 8; the agent stand-in is the guard image, idle):
@@ -635,13 +650,13 @@ docker exec -e OFFICER_TOKEN="$OFFICER" -e SIJIL_TOOLS_TOKEN="$TOOLS_TOKEN" case
 
 Expected: the export `403` with `no-export-after-citizen-upload`; the first note `201`, the second `403` with
 `budget:case-agent:tool_calls_by:http:case-api:addCaseNote`; then it waits on `closeCase`. In terminal B (same
-`R`, `RUN` and `cd`), the supervisor grants it (section 11):
+`R`, `RUN`, `PORT` and `cd`), the supervisor grants it (section 11):
 
 ```bash
-AID=$(curl -s "localhost:8000/api/records?since=0" | python3 -c 'import json,sys
+AID=$(curl -s "localhost:$PORT/api/records?since=0" | python3 -c 'import json,sys
 print([json.loads(r["ext"])["approval_id"] for r in json.load(sys.stdin)["records"] if r["type"] == "approval"][0])')
 SUP=$("${RUN[@]}" test_issuer.py supervisor issuer)
-curl -s -X POST "localhost:8000/api/approval/$AID/decide" -H 'Content-Type: application/json' \
+curl -s -X POST "localhost:$PORT/api/approval/$AID/decide" -H 'Content-Type: application/json' \
   -d "{\"decision\": \"grant\", \"token\": \"$SUP\", \"reason\": \"Certificate checked.\"}"
 ```
 

@@ -34,7 +34,7 @@ def think(prompt: str) -> str:
     r = ledger.post("/v1/chat/completions", json={"model": E("SIJIL_MODEL", "case-model"), "messages": [
         {"role": "user", "content": prompt}]}, headers={**task, "X-Sijil-Agent-Session": t["agent_session"],
                                                          "X-Sijil-Principal-Token": officer})
-    print(f"model ({prompt!r}):", r.status_code, r.headers.get("x-sijil-decision"), "seq", r.headers.get("x-sijil-seq"))
+    print(f"model ({prompt!r}):", r.status_code, r.headers.get("x-sijill-decision"), "seq", r.headers.get("x-sijill-seq"))
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["tool_calls"][0]["id"]
 
