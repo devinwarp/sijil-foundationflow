@@ -334,6 +334,28 @@ def test_informational_items_still_pass(tmp_path, monkeypatch):
     assert rows(s.db_path, "type = 'inference'")[-1]["decision"] == "allow"
 
 
+@pytest.mark.parametrize("arguments", ['{"caseId": "\\ud800"}', '{"caseId": "\\udc00x"}'])
+def test_a_lone_surrogate_in_gated_arguments_is_400_not_500(tmp_path, monkeypatch, arguments):
+    """§2.2: the ledger cannot hash a lone surrogate, so the request is refused; Foundry's request is not answered."""
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    reply = {"id": "resp_s", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
+             "output": [{"type": "mcp_approval_request", "id": "mcpr_s", "server_label": "case-mcp",
+                         "name": "get_case", "arguments": arguments}]}
+    client, s, _ = gov_node(tmp_path, pack=PACK, handler=lambda r: httpx.Response(200, json=reply), policy=FOUNDRY_POLICY)
+    with client:
+        r = portal(client)
+    assert r.status_code == 400 and "mcpr_s" not in r.text
+    assert rows(s.db_path, "type = 'tool_call'") == [] and rows(s.db_path, "type = 'inference'") == []
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_a_lone_surrogate_in_the_conversation_id_is_400(relay):
+    client, s, foundry = relay
+    r = client.post("/v1/responses", headers={"X-Sijil-Principal-Token": officer(), "Content-Type": "application/json"},
+                    content=json.dumps({"conversation": "conv_\ud800", "input": "hello"}))
+    assert r.status_code == 400 and foundry.seen == []
+
+
 def test_a_function_call_is_correlated_by_its_call_id(tmp_path, monkeypatch):
     monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
     reply = {"id": "resp_f", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",

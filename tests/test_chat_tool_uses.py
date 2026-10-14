@@ -225,3 +225,21 @@ def test_api_mode_stream_leading_empty_model_chunk_then_unapproved_model_is_refu
     [rec] = rows(s.db_path)
     assert rec["model_digest"] == "api:azure-openai:gpt-5" and (rec["decision"], rec["output_hash"]) == ("block", "")
     assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+@pytest.mark.parametrize("arguments,content", [
+    ('{"note": "\\ud800"}', None),                  # JSON arguments whose string escapes a lone surrogate
+    ("{not json \ud800", None),                      # raw arguments carrying one
+    ("{}", "lone \udfff"),                           # the answer text carrying one
+])
+def test_a_lone_surrogate_from_the_model_is_400_and_seals_nothing(tmp_path, arguments, content):
+    """§2.2: a record never contains a lone surrogate; the ledger refuses the request rather than failing with 500."""
+    calls = [{"id": "call_S", "type": "function", "function": {"name": "addCaseNote", "arguments": arguments}}]
+    body = json.dumps({"id": "chatcmpl-1", "object": "chat.completion", "model": DATED, "choices": [{          # \uXXXX
+        "index": 0, "finish_reason": "tool_calls", "message": {"role": "assistant", "content": content, "tool_calls": calls}}]})
+    client, s = make_node(tmp_path, lambda request: httpx.Response(200, content=body,
+                                                                    headers={"content-type": "application/json"}))
+    with client:
+        r = ask(client)
+    assert r.status_code == 400
+    assert rows(s.db_path) == []
