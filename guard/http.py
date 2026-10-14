@@ -11,7 +11,7 @@ The result's output_hash and bytes commit to the upstream's bytes as they arrive
 definition both doors share). The relayed body is those
 bytes with invisible Unicode stripped (re-serialised JSON, or text) and never exceeds results.max_result_bytes:
 over the budget a text body is cut at a UTF-8 boundary (sealed truncated); a JSON or binary body is replaced by
-a short notice (nothing in the record marks it, ext has no key for it). The upstream status is always relayed.
+a short notice (sealed withheld, §2.4.2). The upstream status is always relayed.
 """
 
 import asyncio

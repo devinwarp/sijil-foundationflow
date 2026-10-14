@@ -1,6 +1,8 @@
 """Record schema, canonicalisation, hashing and signing. Schema v2.
 
 FROZEN at H1, thawed once for v2 (spec §2, §17.1; §11 rows 1 and 1g), and frozen again at v2.4.
+tool_result's ext.withheld was added under v2.4 with no version bump: an optional key, so no record and no golden
+vector changes.
 Any change here changes every hash; the independent verifier in verifier/sijill_verify.py must keep
 agreeing with this module. Hashing rule v2 (§2.2): an EXT_FIELDS member whose value is "" is left out of the
 canonical object, so every record written before v2 keeps its hash.

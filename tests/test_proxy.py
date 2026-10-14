@@ -265,13 +265,19 @@ def test_null_content_is_valid_and_hashed_empty(node_with):
     assert UPSTREAM_ERROR_HIT not in rec["rule_hits"]
 
 
-def test_a_request_no_record_can_hash_is_400_and_seals_nothing(node):
+def test_a_request_no_record_can_hash_is_400_and_seals_nothing(node_with):
     """§2.2: NaN is not JSON. The request hash would fail, so the ledger refuses before anything is forwarded."""
-    client, s = node
+    calls = []
+
+    def upstream(request):
+        calls.append(1)
+        return stub_model(request)
+    client, s = node_with(upstream)
     body = json.dumps({"model": MODEL, "messages": [{"role": "user", "content": "hi"}], "temperature": float("nan")})
-    r = client.post("/v1/chat/completions", content=body, headers={"Content-Type": "application/json"})
+    with client:
+        r = client.post("/v1/chat/completions", content=body, headers={"Content-Type": "application/json"})
     assert r.status_code == 400 and "not canonical" in r.json()["detail"]
-    assert rows(s.db_path) == []
+    assert rows(s.db_path) == [] and calls == []
 
 
 def test_only_a_lone_surrogate_is_mapped_to_400(node, monkeypatch):
