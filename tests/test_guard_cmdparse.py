@@ -272,3 +272,12 @@ def test_for_select_and_case_are_not_commands_but_their_words_are_seen(roots):
     assert seen("case $x in a|b) npx evil;; *) ls;; esac", roots) == ["", "", "npx", "", "ls"]
     assert "~/.ssh/id_rsa" in segment_paths("case ~/.ssh/id_rsa in a) ls;; esac", roots)[0]
     assert "for" not in seen("for ((i=0;i<3;i++)); do npx x; done", roots)
+
+
+def test_a_host_longer_than_dns_allows_is_one_short_name_no_pin_matches():
+    """Review minor 4: hosts pulled from uncapped content arguments can be 1 MB long; a rule's regex never reads
+    one. Past 253 characters a name cannot resolve, so it becomes a fixed .invalid host: visible, never pinned."""
+    from guard.cmdparse import TOO_LONG_HOST, host_of
+    assert host_of("https://" + "a" * 254) == TOO_LONG_HOST == "host-too-long.invalid"
+    assert host_of("https://pinned.example.com." + "a" * 300) == TOO_LONG_HOST
+    assert host_of("https://" + "a" * 253) == "a" * 253
