@@ -335,6 +335,7 @@ ASK = {"type": "mcp_approval_request", "id": "mcpr_r1", "server_label": "case-mc
     ([[FUNCTION, UNKNOWN]], "mcpr_x"),                     # next to a function_call the portal would answer
     ([[ASK], [UNKNOWN]], "mcpr_x"),                        # in a later round trip
     ([[ASK], [COMPUTER]], "cu_01"),
+    ([["not an item", FUNCTION]], "call_fc"),              # a non-object entry
 ])
 def test_unrecognised_and_client_executed_items_fail_closed(tmp_path, monkeypatch, rounds, leak):
     """§12 item 42: a pending item the relay cannot answer, or one the client would execute, is never relayed and

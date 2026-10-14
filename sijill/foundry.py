@@ -71,8 +71,9 @@ def ran(kind: str) -> bool:
 
 
 def output_text(data: dict) -> str:
-    return "".join(c.get("text", "") for item in data.get("output", []) if item.get("type") == "message"
-                   for c in item.get("content") or [] if c.get("type") == "output_text" and isinstance(c.get("text"), str))
+    return "".join(c.get("text", "") for item in data.get("output", []) if isinstance(item, dict) and
+                   item.get("type") == "message" for c in item.get("content") or []
+                   if isinstance(c, dict) and c.get("type") == "output_text" and isinstance(c.get("text"), str))
 
 
 def guard_pack(n):
@@ -167,7 +168,8 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
     digest = f"api:azure-foundry:{model}"
     post = policy.evaluate(pol, n.region, digest, messages)
     items = [i for i in data["output"] if isinstance(i, dict)]
-    if any(str(i.get("type")) not in KNOWN and not ran(str(i.get("type"))) for i in items):
+    if any(not isinstance(i, dict) or str(i.get("type")) not in KNOWN and not ran(str(i.get("type")))
+           for i in data["output"]):
         post = ("block", "enforce", [*post[2], UNKNOWN_HIT])
     uses = []
     for i in items:
