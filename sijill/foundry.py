@@ -318,6 +318,7 @@ def router() -> APIRouter:
             refused.append(f"input: a string or a list of items of type {list(ITEMS)}")
         if refused:
             raise HTTPException(400, f"not accepted by the relay (only the ledger's gate answers approvals): {refused}")
+        input_hash = record.sha256_hex(record.canonical_json(given))   # NaN or a lone surrogate: 400, before any task
         conv_hash = record.sha256_hex(conv.encode())
         sid = "fr_" + conv_hash[:32]                 # the relay's agent session for this conversation (not evidence)
         sess = n.store.session(sid)
@@ -332,7 +333,7 @@ def router() -> APIRouter:
             hit = oidc.hit(e.code)
             rec = await n.seal(n.body(n.policy, "inference", model_id=cfg.agent_name, mode="enforce", decision="block",
                                       rule_hits=policy.rule_hits_json([hit]), agent_id=cfg.agent_id, principal=e.principal,
-                                      input_hash=record.sha256_hex(record.canonical_json(payload["input"])),
+                                      input_hash=input_hash,
                                       ext=cj({"principal_error": e.code})))
             return JSONResponse(status_code=e.status, headers={"X-Sijill-Seq": str(rec["seq"])}, content={
                 "error": {"type": "principal_refused", "code": hit}, "sijill": {"seq": rec["seq"], "rule_hits": [hit]}})

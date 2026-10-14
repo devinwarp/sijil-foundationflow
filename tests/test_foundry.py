@@ -11,6 +11,7 @@ import pytest
 
 from conftest import rows, verify
 from govkit import CLOSER, OFFICER, POLICY, gov_node, human, officer, supervisor
+from sijill import record
 
 ENDPOINT = "https://moi-pilot.services.ai.azure.com/api/projects/case-agents"
 FOUNDRY_AGENT = "spiffe://moi.gov.ae/agent/foundry-case-agent"
@@ -395,6 +396,18 @@ def test_a_lone_surrogate_in_the_conversation_id_is_400(relay):
     r = client.post("/v1/responses", headers={"X-Sijil-Principal-Token": officer(), "Content-Type": "application/json"},
                     content=json.dumps({"conversation": "conv_\ud800", "input": "hello"}))
     assert r.status_code == 400 and foundry.seen == []
+
+
+@pytest.mark.parametrize("given", ['"hello \\ud800"', '[{"type": "message", "role": "user", "content": NaN}]'])
+@pytest.mark.parametrize("token", [officer, lambda: "not-a-token"])
+def test_input_no_record_can_hash_is_400_before_any_task_or_refusal(relay, given, token):
+    """§2.2: input is hashed once, right after the shape check: no session, no task_start, no principal refusal."""
+    client, s, foundry = relay
+    r = client.post("/v1/responses", headers={"X-Sijil-Principal-Token": token(), "Content-Type": "application/json"},
+                    content='{"conversation": "conv_nan", "input": %s}' % given)
+    assert r.status_code == 400 and "not canonical" in r.json()["detail"] and foundry.seen == []
+    assert rows(s.db_path, "type IN ('task_start', 'inference')") == []
+    assert client.app.state.node.store.session("fr_" + record.sha256_hex(b"conv_nan")[:32]) is None
 
 
 def test_a_function_call_is_correlated_by_its_call_id(tmp_path, monkeypatch):
