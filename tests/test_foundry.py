@@ -296,6 +296,44 @@ def test_the_round_limit_denies_what_is_pending_and_never_relays_it(tmp_path, mo
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
 
+def test_an_unrecognised_item_is_denied_sealed_block_and_never_relayed(tmp_path, monkeypatch):
+    """Fail closed: an item type the relay does not know may be a renamed approval request waiting for an answer,
+    so the turn is sealed block with foundry-item-unknown and nothing reaches the portal."""
+    from sijill import policy
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    reply = {"id": "resp_u", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
+             "output": [{"type": "reasoning", "id": "rs_01", "summary": []},
+                        {"type": "mcp_approval_request_v2", "id": "mcpr_x", "server_label": "case-mcp",
+                         "name": "delete_case", "arguments": CASE_ARGS},
+                        {"type": "message", "id": "msg_u", "role": "assistant",
+                         "content": [{"type": "output_text", "text": "Waiting for approval."}]}]}
+    client, s, _ = gov_node(tmp_path, pack=PACK, handler=lambda r: httpx.Response(200, json=reply), policy=FOUNDRY_POLICY)
+    with client:
+        r = portal(client)
+    assert r.status_code == 403 and r.json()["error"]["type"] == "policy_block" and "mcpr_x" not in r.text
+    rec = rows(s.db_path, "type = 'inference'")[-1]
+    assert (rec["decision"], rec["mode"], rec["output_hash"]) == ("block", "enforce", "")
+    assert "foundry-item-unknown" in json.loads(rec["rule_hits"])
+    assert "foundry-item-unknown" in policy.RESERVED_IDS
+    for flags in ((), ("--rulepack", str(s.rulepack_path))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
+
+
+def test_informational_items_still_pass(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    reply = {"id": "resp_i", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
+             "output": [{"type": "mcp_list_tools", "id": "mcpl_01", "server_label": "case-mcp", "tools": []},
+                        {"type": "reasoning", "id": "rs_01", "summary": []},
+                        {"type": "message", "id": "msg_i", "role": "assistant",
+                         "content": [{"type": "output_text", "text": "Hello."}]}]}
+    client, s, _ = gov_node(tmp_path, pack=PACK, handler=lambda r: httpx.Response(200, json=reply), policy=FOUNDRY_POLICY)
+    with client:
+        r = portal(client)
+    assert r.status_code == 200 and r.json() == reply
+    assert rows(s.db_path, "type = 'inference'")[-1]["decision"] == "allow"
+
+
 def test_a_function_call_is_correlated_by_its_call_id(tmp_path, monkeypatch):
     monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
     reply = {"id": "resp_f", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",

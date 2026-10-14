@@ -24,7 +24,7 @@ RULE_ID = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 RESERVED_IDS = ("upstream_error", "halted", "resumed", "principal-missing", "principal-invalid",
                 "principal-expired", "principal-assurance-low", "principal-task-mismatch",
                 "principal-jwks-unavailable", "http-operation-unknown", "http-task-ambiguous", "approval-timeout",
-                "command-too-long")
+                "command-too-long", "foundry-item-unknown")
 RESERVED_PREFIXES = ("budget:",)
 NOT_ALLOWLISTED = "tool-not-allowlisted"       # written by the guard's tools.allow/deny filter (spec §5.2)
 RULE_KEYS = {"id", "on", "action", "match", "description", "incident"}

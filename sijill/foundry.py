@@ -28,6 +28,11 @@ from . import agents, approvals, budgets, chat, oidc, policy, record
 API = "foundry_responses"
 ALLOWED = ("agent", "conversation", "input", "previous_response_id", "metadata")   # the client fields forwarded
 ITEMS = ("message", "function_call_output")   # the input item types a client may send, spelled exactly
+# output item types the relay recognises, besides any *_call: pending ones (function_call, answered by the portal;
+# mcp_approval_request, answered by the gate) and informational ones. Any other type may be a renamed request
+# waiting for an answer, so the turn fails closed (§12 item 42).
+KNOWN = ("message", "reasoning", "mcp_list_tools", "function_call", "mcp_approval_request")
+UNKNOWN_HIT = "foundry-item-unknown"
 ROUNDS = 8                                   # approval round trips per user turn
 GRACE_S = 60                                 # past the deadline, as the guard: the timer has failed, do not hang
 ROOTS = Roots("/", "/", "/")                 # a relay has no workspace: path rules see absolute paths only
@@ -154,6 +159,8 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
     digest = f"api:azure-foundry:{model}"
     post = policy.evaluate(pol, n.region, digest, messages)
     items = [i for i in data["output"] if isinstance(i, dict)]
+    if any(str(i.get("type")) not in KNOWN and not str(i.get("type")).endswith("_call") for i in items):
+        post = ("block", "enforce", [*post[2], UNKNOWN_HIT])
     uses = []
     for i in items:
         kind = str(i.get("type"))
