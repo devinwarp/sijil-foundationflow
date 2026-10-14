@@ -347,13 +347,13 @@ out[60] = seal({**BASE, **IN_TASK, "type": "inference", "ts": "2026-10-01T08:20:
                                    "issuer": "https://sharedeus.eus.attest.azure.net", "verified": True}}).decode()},
                60, "d5e6" + "8" * 60)
 
-# ---- §15: epoch Merkle root over seq 40..45 (RFC 6962 style) and a COSE_Sign1 receipt
+# ---- §15: epoch Merkle root over seq 40..45 (RFC 9162 §2.1.1 Merkle Tree Hash) and a COSE_Sign1 receipt
 def merkle(leaves):
-    nodes = [hashlib.sha256(b"\x00" + bytes.fromhex(x)).digest() for x in leaves]
-    while len(nodes) > 1:
-        if len(nodes) % 2: nodes.append(nodes[-1])
-        nodes = [hashlib.sha256(b"\x01" + nodes[i] + nodes[i + 1]).digest() for i in range(0, len(nodes), 2)]
-    return nodes[0].hex()
+    def mth(d):
+        if len(d) == 1: return hashlib.sha256(b"\x00" + bytes.fromhex(d[0])).digest()
+        k = 1 << ((len(d) - 1).bit_length() - 1)   # largest power of two < n
+        return hashlib.sha256(b"\x01" + mth(d[:k]) + mth(d[k:])).digest()
+    return mth(leaves).hex()
 EPOCH = [out[k]["record_hash"] for k in (40, 41, 42, 43, 44, 45)]
 ROOT = merkle(EPOCH)
 
@@ -367,7 +367,7 @@ RECEIPT_B64 = base64.urlsafe_b64encode(receipt).decode().rstrip("=")
 out[200] = seal({**BASE, "type": "scitt_receipt", "ts": "2026-10-01T09:00:00.000Z",
                  "mode": "record", "decision": "allow", "rule_hits": "[]",
                  "input_hash": ROOT, "output_hash": h(receipt),
-                 "ext": cj({"epoch_from": 40, "epoch_to": 45, "leaves": 6, "tree": "rfc6962-sha256",
+                 "ext": cj({"epoch_from": 40, "epoch_to": 45, "leaves": 6, "tree": "rfc9162-sha256",
                             "ts": "sijil-ts://dev-mbp-01", "ts_kind": "self", "statement_subject": AGENT,
                             "receipt": RECEIPT_B64, "receipt_hash": h(receipt), "cose_alg": "EdDSA",
                             "ts_kid": "dev-mbp-01-ts"}).decode()}, 200, "f6a7" + "9" * 60)
