@@ -5,8 +5,9 @@ import statistics
 from pathlib import Path
 
 import httpx
+import pytest
 
-from conftest import ask, rows, stub_model, tamper, verify
+from conftest import MODEL, ask, rows, stub_model, tamper, verify
 from sijill import policy, record
 from sijill.policy import UPSTREAM_ERROR_HIT
 from sijill.proxy import UPSTREAM_ERROR_TYPE
@@ -262,3 +263,29 @@ def test_null_content_is_valid_and_hashed_empty(node_with):
     [rec] = rows(s.db_path)
     assert rec["output_hash"] == record.output_hash("")
     assert UPSTREAM_ERROR_HIT not in rec["rule_hits"]
+
+
+def test_a_request_no_record_can_hash_is_400_and_seals_nothing(node_with):
+    """§2.2: NaN is not JSON. The request hash would fail, so the ledger refuses before anything is forwarded."""
+    calls = []
+
+    def upstream(request):
+        calls.append(1)
+        return stub_model(request)
+    client, s = node_with(upstream)
+    body = json.dumps({"model": MODEL, "messages": [{"role": "user", "content": "hi"}], "temperature": float("nan")})
+    with client:
+        r = client.post("/v1/chat/completions", content=body, headers={"Content-Type": "application/json"})
+    assert r.status_code == 400 and "not canonical" in r.json()["detail"]
+    assert rows(s.db_path) == [] and calls == []
+
+
+def test_only_a_lone_surrogate_is_mapped_to_400(node, monkeypatch):
+    """Any other encoding failure is a server fault: it stays a 500, not a client error."""
+    client, _ = node
+
+    def broken():
+        raise UnicodeEncodeError("ascii", "é", 0, 1, "ordinal not in range(128)")
+    monkeypatch.setattr(client.app.state.node.store, "count", broken)
+    with pytest.raises(UnicodeEncodeError):
+        client.get("/api/records")

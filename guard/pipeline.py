@@ -238,9 +238,10 @@ class Pipeline:
 
     def result(self, call: Call, sealed: Sealed, text: str, status: str, content_types: list[str],
                source_label: str, raw: bytes | None = None, http_status: int | None = None,
-               truncate: bool = True, size: int | None = None, cut: bool = False) -> Result:
+               truncate: bool = True, size: int | None = None, cut: bool = False, withheld: bool = False) -> Result:
         """Seal the tool_result. `text` is what is scanned (invisible Unicode, exec hints); `cut` says the caller
-        cut or replaced part of the result for the budget, so it is recorded as truncated.
+        cut or replaced part of the result for the budget, so it is recorded as truncated; `withheld` says the
+        HTTP adapter replaced a JSON or binary body with its notice (§2.4.2).
 
         output_hash, one definition for both doors: sha256 of the result as it arrived from the tool, before the
         guard strips, cuts or replaces anything (§2.4.2, §17.3.3); ext.bytes is the length of that input (`size`
@@ -253,10 +254,10 @@ class Pipeline:
             process): the guard's own note, sealed with status error. It is the only case a note is hashed."""
         with _refusals():
             return self._result(call, sealed, text, status, content_types, source_label, raw, http_status, truncate,
-                                size, cut)
+                                size, cut, withheld)
 
     def _result(self, call, sealed, text, status, content_types, source_label, raw, http_status, truncate,
-                size, cut) -> Result:
+                size, cut, withheld) -> Result:
         data = raw if raw is not None else text.encode("utf-8", "surrogatepass")
         scan = unicode.scan(text)
         mode_u = self.cfg.invisible_unicode if scan["found"] else "none"
@@ -273,7 +274,8 @@ class Pipeline:
         ext = {"tool": call.tool, "server": call.server, "status": status, "bytes": len(data) if size is None else size,
                "content_types": sorted(set(content_types)), "invisible_unicode": iu,
                **({"exec_hints": hints} if hints else {}), **({"truncated": True} if truncated or cut else {}),
-               **({"http_status": http_status} if http_status is not None else {})}
+               **({"http_status": http_status} if http_status is not None else {}),
+               **({"withheld": True} if withheld else {})}
         body = {}
 
         def build() -> dict:

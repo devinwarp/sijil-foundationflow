@@ -264,7 +264,7 @@ def test_oversized_text_is_cut_at_a_character_boundary_and_sealed_truncated(env)
     r = tools.get("/case-api/cases?limit=10&open=true", headers={"X-Sijil-Task-Seq": str(t["task_seq"])})
     assert r.status_code == 200 and r.content == b"a" * (limit - 1)
     x = json.loads(rows(s.db_path, "type = 'tool_result'")[0]["ext"])
-    assert x["truncated"] is True and x["bytes"] == len(big) and x["http_status"] == 200
+    assert x["truncated"] is True and x["bytes"] == len(big) and x["http_status"] == 200 and "withheld" not in x
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
 
@@ -278,7 +278,7 @@ def test_oversized_json_is_withheld_with_the_upstream_status(env):
     assert r.status_code == 201 and r.json() == {"sijil": "result withheld: over max_result_bytes"}
     result = rows(s.db_path, "type = 'tool_result'")[0]
     x = json.loads(result["ext"])
-    assert "truncated" not in x and x["bytes"] == len(big) and x["http_status"] == 201
+    assert "truncated" not in x and x["bytes"] == len(big) and x["http_status"] == 201 and x["withheld"] is True
     assert result["output_hash"] == record.sha256_hex(big) and r.headers["x-sijil-seq"] == str(result["seq"])
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
@@ -475,3 +475,18 @@ def test_the_task_is_resolved_once_per_request(env, monkeypatch):
     sealed = rows(s.db_path, "type IN ('tool_call', 'egress', 'tool_result')")
     assert [r["task_seq"] for r in sealed] == [str(t["task_seq"])] * 3
     assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+@pytest.mark.parametrize("value,kind,typed", [
+    ("5", "integer", 5), ("-0", "integer", 0), ("-12", "number", -12), ("1.5", "number", 1.5),
+    ("1e3", "number", 1000.0), ("-0.25E-2", "number", -0.0025), ("true", "boolean", True),
+    # not strict JSON numbers: they stay strings (§17.3.3)
+    (" 5", "integer", " 5"), ("5_000", "integer", "5_000"), ("+5", "integer", "+5"), ("05", "integer", "05"),
+    ("1.5", "integer", "1.5"), ("٥", "integer", "٥"), ("nan", "number", "nan"), ("inf", "number", "inf"),
+    ("Infinity", "number", "Infinity"), ("1e400", "number", "1e400"), (".5", "number", ".5"), ("5.", "number", "5."),
+    ("+1.5", "number", "+1.5"), ("1_0.5", "number", "1_0.5"), ("5\n", "integer", "5\n"), ("True", "boolean", "True"),
+    ("9" * 5000, "integer", "9" * 5000),                     # past Python's int-from-string digit limit
+])
+def test_typed_parameters_accept_only_strict_json_numbers(value, kind, typed):
+    got = http._typed(value, kind)
+    assert got == typed and type(got) is type(typed)

@@ -28,6 +28,14 @@ from . import agents, approvals, budgets, chat, oidc, policy, record
 API = "foundry_responses"
 ALLOWED = ("agent", "conversation", "input", "previous_response_id", "metadata")   # the client fields forwarded
 ITEMS = ("message", "function_call_output")   # the input item types a client may send, spelled exactly
+# output item types the relay recognises, besides any *_call Foundry ran itself: pending ones (function_call,
+# answered by the portal; mcp_approval_request, answered by the gate) and informational ones. Any other type may be
+# a renamed request waiting for an answer, so the turn fails closed (§12 item 42).
+KNOWN = ("message", "reasoning", "mcp_list_tools", "function_call", "mcp_approval_request")
+# *_call items the client executes and answers, as it answers function_call: not run by Foundry, and the relay has
+# no gate for them, so they fail closed like an unknown type
+CLIENT_CALLS = ("computer_call", "local_shell_call", "custom_tool_call", "shell_call", "apply_patch_call")
+UNKNOWN_HIT = "foundry-item-unknown"
 ROUNDS = 8                                   # approval round trips per user turn
 GRACE_S = 60                                 # past the deadline, as the guard: the timer has failed, do not hang
 ROOTS = Roots("/", "/", "/")                 # a relay has no workspace: path rules see absolute paths only
@@ -57,9 +65,15 @@ def tool_of(item: dict) -> tuple[str, str, str, str, dict]:
     return kind, "foundry", f"foundry:{kind}", "web" if kind == "web_search_call" else "mcp:foundry", action
 
 
+def ran(kind: str) -> bool:
+    """A server-side call Foundry ran: any *_call but function_call and the client-executed ones."""
+    return kind.endswith("_call") and kind not in CLIENT_CALLS and kind != "function_call"
+
+
 def output_text(data: dict) -> str:
-    return "".join(c.get("text", "") for item in data.get("output", []) if item.get("type") == "message"
-                   for c in item.get("content") or [] if c.get("type") == "output_text" and isinstance(c.get("text"), str))
+    return "".join(c.get("text", "") for item in data.get("output", []) if isinstance(item, dict) and
+                   item.get("type") == "message" for c in item.get("content") or []
+                   if isinstance(c, dict) and c.get("type") == "output_text" and isinstance(c.get("text"), str))
 
 
 def guard_pack(n):
@@ -124,7 +138,9 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
     # a refreshed token in the conversation is sealed once, as on the model door (§17.2.8)
     claims = {} if n.store.token_in_force(task["seq"]) == human["claims"]["token_hash"] else \
         {"principal_claims": human["claims"]}
-    base = in_task(n, task, "inference", model_id=cfg.agent_name, mode=mode, decision=decision,
+    # until Foundry reports a valid model id, model_id is the agent name and model_digest follows it (§17.4.3)
+    base = in_task(n, task, "inference", model_id=cfg.agent_name, model_digest=f"api:azure-foundry:{cfg.agent_name}",
+                   mode=mode, decision=decision,
                    rule_hits=policy.rule_hits_json(hits), input_hash=record.sha256_hex(record.canonical_json(given)),
                    ext=cj({"api": API, "session_id": conv_hash, **claims}))
 
@@ -139,7 +155,7 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
         return refused(await seal_in(n, task, settled(base)), 403, "policy_block"), None
     # forwarded, so priced like any forwarded request: no usage reported means missing_usage_cost_micro
     failed = {**base, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]),
-              "ext": cj({**json.loads(base["ext"]), **budgets.cost(n.rulepack, f"api:azure-foundry:{cfg.agent_name}", None)})}
+              "ext": cj({**json.loads(base["ext"]), **budgets.cost(n.rulepack, base["model_digest"], None)})}
     try:
         resp = await n.foundry.post("/responses", json=req, headers={"Authorization": f"Bearer {token}"})
         status, data = resp.status_code, resp.json() if resp.status_code == 200 else None
@@ -152,12 +168,15 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
     digest = f"api:azure-foundry:{model}"
     post = policy.evaluate(pol, n.region, digest, messages)
     items = [i for i in data["output"] if isinstance(i, dict)]
+    if any(not isinstance(i, dict) or str(i.get("type")) not in KNOWN and not ran(str(i.get("type")))
+           for i in data["output"]):
+        post = ("block", "enforce", [*post[2], UNKNOWN_HIT])
     uses = []
     for i in items:
         kind = str(i.get("type"))
         if kind == "function_call":              # executed by the portal; its call_id is what it sends back
             uses.append(chat.tool_use(i.get("call_id"), i.get("name"), i.get("arguments", "")))
-        elif kind == "mcp_approval_request" or (kind.endswith("_call") and kind != "mcp_call") or \
+        elif kind == "mcp_approval_request" or (ran(kind) and kind != "mcp_call") or \
                 (kind == "mcp_call" and i.get("approval_request_id") not in gated):
             # a gated request, or a call Foundry ran without asking: the parent of its tool_call (Ruling)
             tool, _, qualified, _, args = tool_of(i)
@@ -299,6 +318,7 @@ def router() -> APIRouter:
             refused.append(f"input: a string or a list of items of type {list(ITEMS)}")
         if refused:
             raise HTTPException(400, f"not accepted by the relay (only the ledger's gate answers approvals): {refused}")
+        input_hash = record.sha256_hex(record.canonical_json(given))   # NaN or a lone surrogate: 400, before any task
         conv_hash = record.sha256_hex(conv.encode())
         sid = "fr_" + conv_hash[:32]                 # the relay's agent session for this conversation (not evidence)
         sess = n.store.session(sid)
@@ -313,7 +333,7 @@ def router() -> APIRouter:
             hit = oidc.hit(e.code)
             rec = await n.seal(n.body(n.policy, "inference", model_id=cfg.agent_name, mode="enforce", decision="block",
                                       rule_hits=policy.rule_hits_json([hit]), agent_id=cfg.agent_id, principal=e.principal,
-                                      input_hash=record.sha256_hex(record.canonical_json(payload["input"])),
+                                      input_hash=input_hash,
                                       ext=cj({"principal_error": e.code})))
             return JSONResponse(status_code=e.status, headers={"X-Sijill-Seq": str(rec["seq"])}, content={
                 "error": {"type": "principal_refused", "code": hit}, "sijill": {"seq": rec["seq"], "rule_hits": [hit]}})
@@ -356,7 +376,7 @@ def router() -> APIRouter:
                     gated[item.get("id")] = seq
                     answers.append({"type": "mcp_approval_response", "approve": approve,
                                     "approval_request_id": item.get("id")})
-                elif kind not in ("message", "reasoning", "function_call") and kind.endswith("_call"):
+                elif ran(kind):
                     await after_the_fact(n, task, rec, item, conv_hash)
             if not answers:
                 break

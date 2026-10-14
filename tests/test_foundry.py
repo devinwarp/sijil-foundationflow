@@ -11,6 +11,7 @@ import pytest
 
 from conftest import rows, verify
 from govkit import CLOSER, OFFICER, POLICY, gov_node, human, officer, supervisor
+from sijill import record
 
 ENDPOINT = "https://moi-pilot.services.ai.azure.com/api/projects/case-agents"
 FOUNDRY_AGENT = "spiffe://moi.gov.ae/agent/foundry-case-agent"
@@ -212,6 +213,26 @@ def test_relay_inferences_are_priced_and_the_chain_verifies_with_the_rulepack(tm
         assert code == 0, line
 
 
+def test_a_failed_upstream_is_priced_under_the_agent_name_and_the_chain_verifies(tmp_path, monkeypatch):
+    """§17.4.3: model_digest is api:azure-foundry:<model_id>, and model_id falls back to the agent name, so an
+    upstream_error priced for that digest carries it too."""
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    pack = PACK + """pricing:
+  - {id: foundry-any, model: "api:azure-foundry:*", input_per_mtok_micro: 1, output_per_mtok_micro: 1,
+     missing_usage_cost_micro: 555}
+"""
+    client, s, _ = gov_node(tmp_path, pack=pack, handler=lambda r: httpx.Response(500, json={"error": "down"}),
+                            policy=FOUNDRY_POLICY)
+    with client:
+        assert portal(client).status_code == 502
+    failed = rows(s.db_path, "type = 'inference'")[-1]
+    assert (failed["model_id"], failed["model_digest"]) == ("case-agent", "api:azure-foundry:case-agent")
+    assert (json.loads(failed["ext"])["price_rule"], json.loads(failed["ext"])["cost_micro"]) == ("foundry-any", 555)
+    for flags in ((), ("--rulepack", str(tmp_path / "starter.yaml"))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
+
+
 def test_a_refused_approval_at_the_gate_is_denied_and_the_chain_verifies(relay):
     client, s, foundry = relay
     out = []
@@ -274,6 +295,119 @@ def test_the_round_limit_denies_what_is_pending_and_never_relays_it(tmp_path, mo
     last = rows(s.db_path, "type = 'tool_call'")[-1]
     assert (json.loads(last["ext"])["foundry_item_id"], last["decision"]) == ("mcpr_8", "block")
     assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_an_unrecognised_item_is_denied_sealed_block_and_never_relayed(tmp_path, monkeypatch):
+    """Fail closed: an item type the relay does not know may be a renamed approval request waiting for an answer,
+    so the turn is sealed block with foundry-item-unknown and nothing reaches the portal."""
+    from sijill import policy
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    reply = {"id": "resp_u", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
+             "output": [{"type": "reasoning", "id": "rs_01", "summary": []},
+                        {"type": "mcp_approval_request_v2", "id": "mcpr_x", "server_label": "case-mcp",
+                         "name": "delete_case", "arguments": CASE_ARGS},
+                        {"type": "message", "id": "msg_u", "role": "assistant",
+                         "content": [{"type": "output_text", "text": "Waiting for approval."}]}]}
+    client, s, _ = gov_node(tmp_path, pack=PACK, handler=lambda r: httpx.Response(200, json=reply), policy=FOUNDRY_POLICY)
+    with client:
+        r = portal(client)
+    assert r.status_code == 403 and r.json()["error"]["type"] == "policy_block" and "mcpr_x" not in r.text
+    rec = rows(s.db_path, "type = 'inference'")[-1]
+    assert (rec["decision"], rec["mode"], rec["output_hash"]) == ("block", "enforce", "")
+    assert "foundry-item-unknown" in json.loads(rec["rule_hits"])
+    assert "foundry-item-unknown" in policy.RESERVED_IDS
+    for flags in ((), ("--rulepack", str(s.rulepack_path))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
+
+
+COMPUTER = {"type": "computer_call", "id": "cu_01", "call_id": "call_cu", "status": "completed",
+            "action": {"type": "click", "x": 10, "y": 20}, "pending_safety_checks": []}
+UNKNOWN = {"type": "mcp_approval_request_v2", "id": "mcpr_x", "server_label": "case-mcp", "name": "delete_case",
+           "arguments": CASE_ARGS}
+FUNCTION = {"type": "function_call", "id": "fc_01", "call_id": "call_fc", "name": "lookup", "arguments": "{}"}
+ASK = {"type": "mcp_approval_request", "id": "mcpr_r1", "server_label": "case-mcp", "name": "get_case",
+       "arguments": CASE_ARGS}
+
+
+@pytest.mark.parametrize("rounds,leak", [
+    ([[COMPUTER]], "cu_01"),                               # a client-executed call: the portal would run it
+    ([[{**COMPUTER, "type": "local_shell_call"}]], "cu_01"),
+    ([[FUNCTION, UNKNOWN]], "mcpr_x"),                     # next to a function_call the portal would answer
+    ([[ASK], [UNKNOWN]], "mcpr_x"),                        # in a later round trip
+    ([[ASK], [COMPUTER]], "cu_01"),
+    ([["not an item", FUNCTION]], "call_fc"),              # a non-object entry
+])
+def test_unrecognised_and_client_executed_items_fail_closed(tmp_path, monkeypatch, rounds, leak):
+    """§12 item 42: a pending item the relay cannot answer, or one the client would execute, is never relayed and
+    never sealed as a call Foundry ran: the round trip is sealed block with foundry-item-unknown."""
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(200, json={"id": f"resp_{len(calls)}", "object": "response", "model": "gpt-4.1-2025-04-14",
+                                         "status": "completed", "output": rounds[len(calls) - 1]})
+    client, s, _ = gov_node(tmp_path, pack=PACK, handler=handler, policy=FOUNDRY_POLICY)
+    with client:
+        r = portal(client)
+    assert r.status_code == 403 and r.json()["error"]["type"] == "policy_block" and leak not in r.text
+    assert len(calls) == len(rounds)
+    rec = rows(s.db_path, "type = 'inference'")[-1]
+    assert (rec["decision"], rec["mode"], rec["output_hash"]) == ("block", "enforce", "")
+    assert "foundry-item-unknown" in json.loads(rec["rule_hits"])
+    assert not any(json.loads(c["ext"]).get("after_the_fact") for c in rows(s.db_path, "type = 'tool_call'"))
+    for flags in ((), ("--rulepack", str(s.rulepack_path))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
+
+
+def test_informational_items_still_pass(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    reply = {"id": "resp_i", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
+             "output": [{"type": "mcp_list_tools", "id": "mcpl_01", "server_label": "case-mcp", "tools": []},
+                        {"type": "reasoning", "id": "rs_01", "summary": []},
+                        {"type": "message", "id": "msg_i", "role": "assistant",
+                         "content": [{"type": "output_text", "text": "Hello."}]}]}
+    client, s, _ = gov_node(tmp_path, pack=PACK, handler=lambda r: httpx.Response(200, json=reply), policy=FOUNDRY_POLICY)
+    with client:
+        r = portal(client)
+    assert r.status_code == 200 and r.json() == reply
+    assert rows(s.db_path, "type = 'inference'")[-1]["decision"] == "allow"
+
+
+@pytest.mark.parametrize("arguments", ['{"caseId": "\\ud800"}', '{"caseId": "\\udc00x"}'])
+def test_a_lone_surrogate_in_gated_arguments_is_400_not_500(tmp_path, monkeypatch, arguments):
+    """§2.2: the ledger cannot hash a lone surrogate, so the request is refused; Foundry's request is not answered."""
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    reply = {"id": "resp_s", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
+             "output": [{"type": "mcp_approval_request", "id": "mcpr_s", "server_label": "case-mcp",
+                         "name": "get_case", "arguments": arguments}]}
+    client, s, _ = gov_node(tmp_path, pack=PACK, handler=lambda r: httpx.Response(200, json=reply), policy=FOUNDRY_POLICY)
+    with client:
+        r = portal(client)
+    assert r.status_code == 400 and "mcpr_s" not in r.text
+    assert rows(s.db_path, "type = 'tool_call'") == [] and rows(s.db_path, "type = 'inference'") == []
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_a_lone_surrogate_in_the_conversation_id_is_400(relay):
+    client, s, foundry = relay
+    r = client.post("/v1/responses", headers={"X-Sijil-Principal-Token": officer(), "Content-Type": "application/json"},
+                    content=json.dumps({"conversation": "conv_\ud800", "input": "hello"}))
+    assert r.status_code == 400 and foundry.seen == []
+
+
+@pytest.mark.parametrize("given", ['"hello \\ud800"', '[{"type": "message", "role": "user", "content": NaN}]'])
+@pytest.mark.parametrize("token", [officer, lambda: "not-a-token"])
+def test_input_no_record_can_hash_is_400_before_any_task_or_refusal(relay, given, token):
+    """§2.2: input is hashed once, right after the shape check: no session, no task_start, no principal refusal."""
+    client, s, foundry = relay
+    r = client.post("/v1/responses", headers={"X-Sijil-Principal-Token": token(), "Content-Type": "application/json"},
+                    content='{"conversation": "conv_nan", "input": %s}' % given)
+    assert r.status_code == 400 and "not canonical" in r.json()["detail"] and foundry.seen == []
+    assert rows(s.db_path, "type IN ('task_start', 'inference')") == []
+    assert client.app.state.node.store.session("fr_" + record.sha256_hex(b"conv_nan")[:32]) is None
 
 
 def test_a_function_call_is_correlated_by_its_call_id(tmp_path, monkeypatch):

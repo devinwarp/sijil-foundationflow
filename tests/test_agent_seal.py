@@ -220,6 +220,16 @@ def test_task_end_between_check_and_seal_seals_nothing_into_the_task(flow):
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
 
+def test_nan_in_ext_is_400_and_seals_nothing(flow):
+    client, s, sess, task, h = flow
+    before = len(rows(s.db_path))
+    body = {**TOOL_CALL, "parent_seq": str(task + 1),
+            "ext": {**TOOL_CALL["ext"], "summary": {**TOOL_CALL["ext"]["summary"], "n": float("nan")}}}
+    r = client.post("/api/agent/seal", content=json.dumps(body), headers={**h, "Content-Type": "application/json"})
+    assert r.status_code == 400
+    assert len(rows(s.db_path)) == before
+
+
 @pytest.mark.parametrize("change", [
     {"mode": 1}, {"parent_seq": None}, {"output_hash": [1]}, {"ext": {"x": "\\ud800"}},   # JSON-escaped lone surrogate, sent as raw bytes
     {"type": "integrity_baseline", "parent_seq": "2"},

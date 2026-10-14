@@ -1,6 +1,8 @@
 """Record schema, canonicalisation, hashing and signing. Schema v2.
 
 FROZEN at H1, thawed once for v2 (spec §2, §17.1; §11 rows 1 and 1g), and frozen again at v2.4.
+tool_result's ext.withheld was added under v2.4 with no version bump: an optional key, so no record and no golden
+vector changes.
 Any change here changes every hash; the independent verifier in verifier/sijill_verify.py must keep
 agreeing with this module. Hashing rule v2 (§2.2): an EXT_FIELDS member whose value is "" is left out of the
 canonical object, so every record written before v2 keeps its hash.
@@ -73,7 +75,7 @@ EXT_KEYS = {
                   {"tool_use_id", "summary", "context_labels", "context_seqs", "confirmation", "aip", "aip_meta",
                    "approval_seq", "budget", "foundry_item_id", "after_the_fact"}),
     "tool_result": ({"tool", "server", "status", "bytes", "content_types", "invisible_unicode"},
-                    {"exec_hints", "truncated", "http_status"}),
+                    {"exec_hints", "truncated", "http_status", "withheld"}),
     "egress": ({"host", "port", "proto", "observed_by", "allowed_by"},
                {"method", "bytes_out", "bytes_in", "pin_source", "budget"}),
     "integrity_baseline": ({"lockfile", "lockfile_hash", "entries", "files", "mcp_tools", "roots", "tool",
@@ -109,8 +111,16 @@ _TYPED = {"approval_seq": int, "after_the_fact": bool, "foundry_item_id": str, "
           "timeout_ms": int, "sod": bool, "relay_binding": dict, "approver_set": dict}
 
 
+class NotCanonical(ValueError):
+    """A value canonical JSON cannot carry (§2.2): NaN, an infinity or a lone surrogate. The ledger answers 400."""
+
+
 def canonical_json(obj) -> bytes:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    try:
+        return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                          allow_nan=False).encode("utf-8")
+    except ValueError as e:        # NaN or an infinity; a lone surrogate's UnicodeEncodeError is a ValueError too
+        raise NotCanonical(str(e)) from e
 
 
 def sha256_hex(data: bytes) -> str:
@@ -154,9 +164,10 @@ def _ext(body: dict) -> dict:
         return {}
     try:
         obj = json.loads(ext)
+        canonical = isinstance(obj, dict) and canonical_json(obj).decode("utf-8") == ext
     except ValueError:
-        obj = None
-    if not isinstance(obj, dict) or canonical_json(obj).decode("utf-8") != ext:
+        canonical = False
+    if not canonical:
         raise ValueError("ext must be a canonical JSON object serialised to a string")
     if _has_null(obj):
         raise ValueError("ext must not contain null")
@@ -188,6 +199,8 @@ def _check_ext(t: str, x: dict) -> None:
         raise ValueError(f"ext.observed_by {x['observed_by']!r} not in {OBSERVED_BY}")
     if t == "egress" and x["observed_by"] not in (*OBSERVED_BY, "static"):
         raise ValueError(f"ext.observed_by {x['observed_by']!r} not allowed on egress")
+    if x.get("withheld", True) is not True:                            # §2.4.2: true, or absent
+        raise ValueError("ext.withheld must be true when present")
     if "principal_auth" in x and x["principal_auth"] not in PRINCIPAL_AUTH:
         raise ValueError(f"ext.principal_auth {x['principal_auth']!r} not in {PRINCIPAL_AUTH}")
     if t == "task_start" and x["agent_auth"] not in AGENT_AUTH:

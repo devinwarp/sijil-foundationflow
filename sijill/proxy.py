@@ -265,6 +265,15 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
     app = FastAPI(title="Sijill", lifespan=lifespan)
 
+    @app.exception_handler(record.NotCanonical)
+    @app.exception_handler(UnicodeEncodeError)      # a lone surrogate, which strict UTF-8 cannot encode
+    async def not_canonical(request: Request, e: ValueError):
+        """Input no record can hash (§2.2) is refused, wherever it surfaces: a request body, a model's tool
+        arguments or answer, an agent's ext. Any other encoding failure is the ledger's fault, and stays a 500."""
+        if isinstance(e, UnicodeEncodeError) and e.reason != "surrogates not allowed":
+            raise e
+        return JSONResponse(status_code=400, content={"detail": f"not canonical JSON: {e}"})
+
     def node(request: Request) -> Node:
         return request.app.state.node
 

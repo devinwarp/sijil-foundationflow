@@ -455,8 +455,8 @@ def router(require_admin) -> APIRouter:
             raise HTTPException(400, "parent_seq, source_label, mode, decision, input_hash and output_hash must be strings")
         try:
             ext_json = cj(x) if x else ""
-        except UnicodeEncodeError:
-            raise HTTPException(400, "ext is not valid unicode")
+        except record.NotCanonical:
+            raise HTTPException(400, "ext is not canonical JSON: NaN, an infinity or a lone surrogate")
         # agent_id and principal come from the task (or the session), never from the body (check I).
         body = n.body(n.policy, t, rule_hits=policy.rule_hits_json(hits), ext=ext_json,
                       rulepack_hash=b["rulepack_hash"], **fields, **identity(sess, task))

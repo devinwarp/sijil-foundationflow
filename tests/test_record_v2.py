@@ -109,6 +109,15 @@ def test_rejects_malformed_tool_call(change):
         seal({**TOOL_CALL, **change})
 
 
+@pytest.mark.parametrize("word", ["NaN", "Infinity", "-Infinity"])
+def test_rejects_nan_in_ext(word):
+    ext = TOOL_CALL["ext"].replace('"tool":', f'"summary":{{"n":{word}}},"tool":')    # sorted: before tool
+    with pytest.raises(ValueError):
+        seal({**TOOL_CALL, "ext": ext})
+    with pytest.raises(ValueError):
+        record.canonical_json({"x": float(word.lower().replace("infinity", "inf"))})
+
+
 def test_tool_call_without_parent_needs_correlation_none():
     with pytest.raises(ValueError, match="requires parent_seq"):
         seal({**TOOL_CALL, "parent_seq": ""})
@@ -129,6 +138,21 @@ def test_tool_call_without_parent_needs_correlation_none():
 def test_rejects_bad_identity_payloads(type_, ext, match):
     with pytest.raises(ValueError, match=match):
         seal({**BASE, "type": type_, "agent_id": AGENT, "principal": PRINCIPAL, "ext": cj(ext)})
+
+
+RESULT = {**BASE, "type": "tool_result", "parent_seq": "6", "task_seq": "4", "source_label": "http:case-api",
+          "agent_id": AGENT, "principal": HUMAN, "output_hash": "e" * 64}
+RESULT_EXT = {"tool": "listCases", "server": "case-api", "status": "ok", "bytes": 3,
+              "content_types": ["application/json"], "http_status": 200,
+              "invisible_unicode": {"found": False, "count": 0, "action": "none"}}
+
+
+def test_withheld_is_an_optional_true_only_tool_result_key():
+    """§2.4.2, §17.1: the HTTP adapter marks a withheld JSON or binary body; absent otherwise."""
+    seal({**RESULT, "ext": cj({**RESULT_EXT, "withheld": True})})
+    for bad in (False, 1, "true"):
+        with pytest.raises(ValueError, match="withheld"):
+            seal({**RESULT, "ext": cj({**RESULT_EXT, "withheld": bad})})
 
 
 @pytest.mark.parametrize("ext", [

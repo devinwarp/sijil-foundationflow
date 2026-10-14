@@ -11,12 +11,13 @@ The result's output_hash and bytes commit to the upstream's bytes as they arrive
 definition both doors share). The relayed body is those
 bytes with invisible Unicode stripped (re-serialised JSON, or text) and never exceeds results.max_result_bytes:
 over the budget a text body is cut at a UTF-8 boundary (sealed truncated); a JSON or binary body is replaced by
-a short notice (nothing in the record marks it, ext has no key for it). The upstream status is always relayed.
+a short notice (sealed withheld, §2.4.2). The upstream status is always relayed.
 """
 
 import asyncio
 import hmac
 import json
+import math
 import re
 import ssl
 from dataclasses import dataclass
@@ -110,18 +111,23 @@ def match(ops: list[Operation], method: str, path: str) -> tuple[Operation, dict
     return None
 
 
+_INTEGER = re.compile(r"-?(0|[1-9][0-9]*)")
+_NUMBER = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?")      # the JSON number grammar
+
+
 def _typed(value: str, kind: str):
     """Query and path values arrive as text; the model's function arguments are typed. Coerce by schema so
-    args_hash can match (spec §17.3.3, §12 item 41)."""
+    args_hash can match (spec §17.3.3, §12 item 41). Only strict JSON number syntax converts; anything else
+    (" 5", "+5", "5_000", "nan", "inf", an overflow to infinity) stays a string."""
     try:
-        if kind == "integer":
+        if kind in ("integer", "number") and _INTEGER.fullmatch(value):
             return int(value)
-        if kind == "number":
-            return int(value) if re.fullmatch(r"-?\d+", value) else float(value)
-        if kind == "boolean" and value in ("true", "false"):
-            return value == "true"
-    except ValueError:
+        if kind == "number" and _NUMBER.fullmatch(value) and math.isfinite(float(value)):
+            return float(value)
+    except ValueError:                  # an integer past Python's int-from-string digit limit
         pass
+    if kind == "boolean" and value in ("true", "false"):
+        return value == "true"
     return value
 
 
@@ -372,7 +378,7 @@ class Adapter:
         try:
             r = await asyncio.to_thread(p.result, call, sealed, text, "ok" if status and 200 <= status < 300 else "error",
                                         [media] if media else [], server.label, raw=data, http_status=status,
-                                        truncate=False, cut=cut)
+                                        truncate=False, cut=cut, withheld=withheld)
         except (Refusal, Refused, Unreachable) as e:
             return JSONResponse({"error": "Sijil ledger unreachable or refused the result"
                                  if isinstance(e, Unreachable) else f"Sijil ledger refused the record: {getattr(e, 'detail', e)}"},
