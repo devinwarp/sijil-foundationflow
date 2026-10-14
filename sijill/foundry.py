@@ -28,10 +28,13 @@ from . import agents, approvals, budgets, chat, oidc, policy, record
 API = "foundry_responses"
 ALLOWED = ("agent", "conversation", "input", "previous_response_id", "metadata")   # the client fields forwarded
 ITEMS = ("message", "function_call_output")   # the input item types a client may send, spelled exactly
-# output item types the relay recognises, besides any *_call: pending ones (function_call, answered by the portal;
-# mcp_approval_request, answered by the gate) and informational ones. Any other type may be a renamed request
-# waiting for an answer, so the turn fails closed (§12 item 42).
+# output item types the relay recognises, besides any *_call Foundry ran itself: pending ones (function_call,
+# answered by the portal; mcp_approval_request, answered by the gate) and informational ones. Any other type may be
+# a renamed request waiting for an answer, so the turn fails closed (§12 item 42).
 KNOWN = ("message", "reasoning", "mcp_list_tools", "function_call", "mcp_approval_request")
+# *_call items the client executes and answers, as it answers function_call: not run by Foundry, and the relay has
+# no gate for them, so they fail closed like an unknown type
+CLIENT_CALLS = ("computer_call", "local_shell_call", "custom_tool_call", "shell_call", "apply_patch_call")
 UNKNOWN_HIT = "foundry-item-unknown"
 ROUNDS = 8                                   # approval round trips per user turn
 GRACE_S = 60                                 # past the deadline, as the guard: the timer has failed, do not hang
@@ -60,6 +63,11 @@ def tool_of(item: dict) -> tuple[str, str, str, str, dict]:
     kind = str(item.get("type"))
     action = item.get("action") if isinstance(item.get("action"), dict) else {}
     return kind, "foundry", f"foundry:{kind}", "web" if kind == "web_search_call" else "mcp:foundry", action
+
+
+def ran(kind: str) -> bool:
+    """A server-side call Foundry ran: any *_call but function_call and the client-executed ones."""
+    return kind.endswith("_call") and kind not in CLIENT_CALLS and kind != "function_call"
 
 
 def output_text(data: dict) -> str:
@@ -159,14 +167,14 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
     digest = f"api:azure-foundry:{model}"
     post = policy.evaluate(pol, n.region, digest, messages)
     items = [i for i in data["output"] if isinstance(i, dict)]
-    if any(str(i.get("type")) not in KNOWN and not str(i.get("type")).endswith("_call") for i in items):
+    if any(str(i.get("type")) not in KNOWN and not ran(str(i.get("type"))) for i in items):
         post = ("block", "enforce", [*post[2], UNKNOWN_HIT])
     uses = []
     for i in items:
         kind = str(i.get("type"))
         if kind == "function_call":              # executed by the portal; its call_id is what it sends back
             uses.append(chat.tool_use(i.get("call_id"), i.get("name"), i.get("arguments", "")))
-        elif kind == "mcp_approval_request" or (kind.endswith("_call") and kind != "mcp_call") or \
+        elif kind == "mcp_approval_request" or (ran(kind) and kind != "mcp_call") or \
                 (kind == "mcp_call" and i.get("approval_request_id") not in gated):
             # a gated request, or a call Foundry ran without asking: the parent of its tool_call (Ruling)
             tool, _, qualified, _, args = tool_of(i)
@@ -365,7 +373,7 @@ def router() -> APIRouter:
                     gated[item.get("id")] = seq
                     answers.append({"type": "mcp_approval_response", "approve": approve,
                                     "approval_request_id": item.get("id")})
-                elif kind not in ("message", "reasoning", "function_call") and kind.endswith("_call"):
+                elif ran(kind):
                     await after_the_fact(n, task, rec, item, conv_hash)
             if not answers:
                 break

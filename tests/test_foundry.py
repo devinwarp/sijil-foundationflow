@@ -320,6 +320,46 @@ def test_an_unrecognised_item_is_denied_sealed_block_and_never_relayed(tmp_path,
         assert code == 0, line
 
 
+COMPUTER = {"type": "computer_call", "id": "cu_01", "call_id": "call_cu", "status": "completed",
+            "action": {"type": "click", "x": 10, "y": 20}, "pending_safety_checks": []}
+UNKNOWN = {"type": "mcp_approval_request_v2", "id": "mcpr_x", "server_label": "case-mcp", "name": "delete_case",
+           "arguments": CASE_ARGS}
+FUNCTION = {"type": "function_call", "id": "fc_01", "call_id": "call_fc", "name": "lookup", "arguments": "{}"}
+ASK = {"type": "mcp_approval_request", "id": "mcpr_r1", "server_label": "case-mcp", "name": "get_case",
+       "arguments": CASE_ARGS}
+
+
+@pytest.mark.parametrize("rounds,leak", [
+    ([[COMPUTER]], "cu_01"),                               # a client-executed call: the portal would run it
+    ([[{**COMPUTER, "type": "local_shell_call"}]], "cu_01"),
+    ([[FUNCTION, UNKNOWN]], "mcpr_x"),                     # next to a function_call the portal would answer
+    ([[ASK], [UNKNOWN]], "mcpr_x"),                        # in a later round trip
+    ([[ASK], [COMPUTER]], "cu_01"),
+])
+def test_unrecognised_and_client_executed_items_fail_closed(tmp_path, monkeypatch, rounds, leak):
+    """§12 item 42: a pending item the relay cannot answer, or one the client would execute, is never relayed and
+    never sealed as a call Foundry ran: the round trip is sealed block with foundry-item-unknown."""
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(200, json={"id": f"resp_{len(calls)}", "object": "response", "model": "gpt-4.1-2025-04-14",
+                                         "status": "completed", "output": rounds[len(calls) - 1]})
+    client, s, _ = gov_node(tmp_path, pack=PACK, handler=handler, policy=FOUNDRY_POLICY)
+    with client:
+        r = portal(client)
+    assert r.status_code == 403 and r.json()["error"]["type"] == "policy_block" and leak not in r.text
+    assert len(calls) == len(rounds)
+    rec = rows(s.db_path, "type = 'inference'")[-1]
+    assert (rec["decision"], rec["mode"], rec["output_hash"]) == ("block", "enforce", "")
+    assert "foundry-item-unknown" in json.loads(rec["rule_hits"])
+    assert not any(json.loads(c["ext"]).get("after_the_fact") for c in rows(s.db_path, "type = 'tool_call'"))
+    for flags in ((), ("--rulepack", str(s.rulepack_path))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
+
+
 def test_informational_items_still_pass(tmp_path, monkeypatch):
     monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
     reply = {"id": "resp_i", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
