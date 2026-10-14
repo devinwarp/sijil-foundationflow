@@ -65,6 +65,11 @@ def tool_of(item: dict) -> tuple[str, str, str, str, dict]:
     return kind, "foundry", f"foundry:{kind}", "web" if kind == "web_search_call" else "mcp:foundry", action
 
 
+def answers_gate(item: dict, gated) -> bool:
+    """An mcp_call reporting a request the gate answered; an id that is not a string answers none."""
+    return isinstance(item.get("approval_request_id"), str) and item["approval_request_id"] in gated
+
+
 def ran(kind: str) -> bool:
     """A server-side call Foundry ran: any *_call but function_call and the client-executed ones."""
     return kind.endswith("_call") and kind not in CLIENT_CALLS and kind != "function_call"
@@ -181,7 +186,9 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
             if kind == "function_call":              # executed by the portal; its call_id is what it sends back
                 uses.append(chat.tool_use(i.get("call_id"), i.get("name"), i.get("arguments", "")))
             elif kind == "mcp_approval_request" or (ran(kind) and kind != "mcp_call") or \
-                    (kind == "mcp_call" and i.get("approval_request_id") not in gated):
+                    (kind == "mcp_call" and not answers_gate(i, gated)):
+                if kind == "mcp_approval_request" and not isinstance(i.get("id"), str):
+                    raise TypeError("an approval request id that no approval response can answer")
                 # a gated request, or a call Foundry ran without asking: the parent of its tool_call (Ruling)
                 tool, _, qualified, _, args = tool_of(i)
                 uses.append({"id": str(i.get("id", "")), "name": qualified.split(":", 1)[1] if kind.startswith("mcp")
@@ -198,9 +205,10 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
                   "rule_hits": policy.rule_hits_json(post[2]), "output_hash": record.output_hash(output_text(data)),
                   "ext": cj(x)}
         cj(sealed)                       # every field the seal will hash, model_digest included
-    except (record.NotCanonical, UnicodeEncodeError):
-        # NaN, an infinity or a lone surrogate in what Foundry answered (§2.2): it was billed, so the round trip is
-        # sealed as a priced upstream_error with only its raw bytes hashed, and nothing in it is gated or relayed
+    except Exception:   # noqa: BLE001  anything in Foundry's answer the relay cannot read
+        # NaN, an infinity or a lone surrogate in what Foundry answered (§2.2), or an item of the wrong type: it was
+        # billed, so the round trip is sealed as a priced upstream_error with only its raw bytes hashed, and nothing
+        # in it is gated or relayed
         x = {**json.loads(failed["ext"]), "response_hash": record.sha256_hex(resp.content),
              **budgets.cost(n.rulepack, base["model_digest"], usage)}
         return refused(await seal_in(n, task, settled({**failed, "ext": cj(x)})), 502, "upstream_error"), None
@@ -377,7 +385,7 @@ def router() -> APIRouter:
             answers = []
             for item in (i for i in data["output"] if isinstance(i, dict)):
                 kind = str(item.get("type"))
-                if kind == "mcp_call" and item.get("approval_request_id") in gated:
+                if kind == "mcp_call" and answers_gate(item, gated):
                     tool, server, qualified, label, _ = tool_of(item)
                     await result(n, task, gated.pop(item["approval_request_id"]), item, qualified, tool, server, label)
                 elif kind == "mcp_approval_request":

@@ -614,3 +614,43 @@ def test_deeply_nested_arguments_are_sealed_raw_priced_and_counted(tmp_path, mon
     for flags in ((), ("--rulepack", str(tmp_path / "starter.yaml"))):
         code, line = verify(s.db_path, s.pubkey_path, *flags)
         assert code == 0, line
+
+
+def answer_once(tmp_path, monkeypatch, output):
+    """One portal turn whose Foundry answer carries `output` then a message; returns (response, store, reply)."""
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    reply = json.dumps({**DONE, "output": output + DONE["output"]}).encode()
+    client, s, _ = gov_node(tmp_path, pack=PACK + SPEND, handler=lambda r: httpx.Response(
+        200, content=reply, headers={"content-type": "application/json"}), policy=FOUNDRY_POLICY)
+    with client:
+        return portal(client), s, reply
+
+
+@pytest.mark.parametrize("item", [
+    {"type": "mcp_approval_request", "id": "mcpr_t", "server_label": "case-mcp", "name": "get_case",
+     "arguments": {"caseId": 1}},                                    # arguments not a string
+    {"type": "mcp_approval_request", "id": ["mcpr_t"], "server_label": "case-mcp", "name": "get_case",
+     "arguments": "{}"},                                             # an id no approval response can answer
+], ids=["arguments-object", "id-list"])
+def test_an_answer_item_of_the_wrong_type_is_a_priced_upstream_error(tmp_path, monkeypatch, item):
+    """Foundry answered and billed, but an item cannot be read: sealed as a priced upstream_error, nothing gated."""
+    r, s, reply = answer_once(tmp_path, monkeypatch, [item])
+    assert r.status_code == 502 and r.json()["error"]["type"] == "upstream_error"
+    rec, = rows(s.db_path, "type = 'inference'")
+    x = json.loads(rec["ext"])
+    assert json.loads(rec["rule_hits"]) == ["upstream_error"] and x["cost_micro"] == 1000000
+    assert x["response_hash"] == record.sha256_hex(reply) and rows(s.db_path, "type = 'tool_call'") == []
+    code, line = verify(s.db_path, s.pubkey_path)
+    assert code == 0, line
+
+
+def test_an_mcp_call_naming_no_string_request_is_sealed_after_the_fact(tmp_path, monkeypatch):
+    """An approval_request_id that is not a string answers no gated request: the call is recorded as run unasked."""
+    r, s, _ = answer_once(tmp_path, monkeypatch, [
+        {"type": "mcp_call", "id": "mcp_t", "server_label": "case-mcp", "name": "get_case", "arguments": "{}",
+         "approval_request_id": [1], "output": "ok"}])
+    assert r.status_code == 200
+    call, = rows(s.db_path, "type = 'tool_call'")
+    assert json.loads(call["ext"])["after_the_fact"] is True and len(rows(s.db_path, "type = 'tool_result'")) == 1
+    code, line = verify(s.db_path, s.pubkey_path)
+    assert code == 0, line
