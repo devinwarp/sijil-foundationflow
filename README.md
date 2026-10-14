@@ -59,6 +59,10 @@ The first run creates `node.key` (Ed25519 private key, mode 0600), `node.pub` an
 | `SIJILL_PKCS11_KEY` | Label of the Ed25519 key object on the token |
 | `SIJILL_PKCS11_PIN` | User PIN for the token session |
 
+## Deploy
+
+Operator guides: [`docs/OPERATOR_GUIDE.html`](docs/OPERATOR_GUIDE.html) (Milestone 1: the ledger container, offline bundle, policy, emergency stop, SIEM, HSM) and [`docs/OPERATOR_GUIDE_M2.md`](docs/OPERATOR_GUIDE_M2.md) (Milestone 2: the `sijil-guard` image and its HTTP tool adapter as a sidecar, Entra ID, approvals, rule packs, the Helm chart in [`deploy/helm/sijil`](deploy/helm/sijil), the auditor kit, and a full rehearsal without Entra).
+
 ## Commands
 
 ```bash
