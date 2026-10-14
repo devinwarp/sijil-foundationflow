@@ -17,6 +17,7 @@ a short notice (nothing in the record marks it, ext has no key for it). The upst
 import asyncio
 import hmac
 import json
+import math
 import re
 import ssl
 from dataclasses import dataclass
@@ -110,18 +111,23 @@ def match(ops: list[Operation], method: str, path: str) -> tuple[Operation, dict
     return None
 
 
+_INTEGER = re.compile(r"-?(0|[1-9][0-9]*)")
+_NUMBER = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?")      # the JSON number grammar
+
+
 def _typed(value: str, kind: str):
     """Query and path values arrive as text; the model's function arguments are typed. Coerce by schema so
-    args_hash can match (spec §17.3.3, §12 item 41)."""
+    args_hash can match (spec §17.3.3, §12 item 41). Only strict JSON number syntax converts; anything else
+    (" 5", "+5", "5_000", "nan", "inf", an overflow to infinity) stays a string."""
     try:
-        if kind == "integer":
+        if kind in ("integer", "number") and _INTEGER.fullmatch(value):
             return int(value)
-        if kind == "number":
-            return int(value) if re.fullmatch(r"-?\d+", value) else float(value)
-        if kind == "boolean" and value in ("true", "false"):
-            return value == "true"
-    except ValueError:
+        if kind == "number" and _NUMBER.fullmatch(value) and math.isfinite(float(value)):
+            return float(value)
+    except ValueError:                  # an integer past Python's int-from-string digit limit
         pass
+    if kind == "boolean" and value in ("true", "false"):
+        return value == "true"
     return value
 
 
