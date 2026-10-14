@@ -696,3 +696,25 @@ def test_an_unhashable_forwarded_field_is_400_before_anything_is_sent(relay, ext
     r = client.post("/v1/responses", headers={"X-Sijil-Principal-Token": officer(), "Content-Type": "application/json"},
                     content='{"conversation": "conv_n", "input": "hello", ' + extra + "}")
     assert r.status_code == 400 and foundry.seen == [] and rows(s.db_path, "type = 'inference'") == []
+
+
+def test_a_round_trip_whose_task_ended_in_flight_is_sealed_outside_it(tmp_path, monkeypatch):
+    """Foundry answered and billed after the task ended: the inference is sealed outside the task, as on the model
+    door, keeping the validated human, rather than not at all."""
+    from sijill import agents
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    client, s, _ = gov_node(tmp_path, pack=PACK + SPEND, handler=lambda r: end_then(r), policy=FOUNDRY_POLICY)
+
+    async def end_then(request):
+        n, (start,) = client.app.state.node, rows(s.db_path, "type = 'task_start'")
+        await agents.end_task(n, n.store.get(start["seq"]), "timeout")
+        return httpx.Response(200, json=DONE)
+    with client:
+        assert portal(client).status_code == 200
+    inf, = rows(s.db_path, "type = 'inference'")
+    x = json.loads(inf["ext"])
+    assert (inf["task_seq"], inf["agent_id"], inf["principal"], x["session_id"]) == ("", FOUNDRY_AGENT, human(OFFICER), "")
+    assert x["principal_claims"]["token_hash"] and x["cost_micro"] == 1000000
+    for flags in ((), ("--rulepack", str(tmp_path / "starter.yaml"))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line

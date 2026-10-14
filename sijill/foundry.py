@@ -150,14 +150,22 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
                    ext=cj({"api": API, "session_id": conv_hash, **claims}))
 
     def settled(b: dict):
-        return lambda: b if policy.HALT_HIT in json.loads(b["rule_hits"]) else budgets.inference(n, task, b)
+        """Seal-time body. A task that ended while the round trip was in flight is not written into: the billed
+        inference is sealed outside it (task_seq and ext.session_id empty) with the validated human, as on the
+        model door."""
+        def build() -> dict:
+            if n.store.task_ended(task["seq"]):
+                x = {**json.loads(b["ext"]), "session_id": "", "principal_claims": human["claims"]}
+                return {**b, "task_seq": "", "principal": human["principal"], "ext": cj(x)}
+            return b if policy.HALT_HIT in json.loads(b["rule_hits"]) else budgets.inference(n, task, b)
+        return build
 
     def refused(rec: dict, status: int, kind: str) -> JSONResponse:
         return JSONResponse(status_code=status, headers={"X-Sijill-Seq": str(rec["seq"])}, content={
             "error": {"type": kind, "message": "Refused by Sijil"},
             "sijill": {"seq": rec["seq"], "decision": rec["decision"], "rule_hits": json.loads(rec["rule_hits"])}})
     if decision == "block":
-        return refused(await seal_in(n, task, settled(base)), 403, "policy_block"), None
+        return refused(await n.seal(settled(base)), 403, "policy_block"), None
     # forwarded, so priced like any forwarded request: no usage reported means missing_usage_cost_micro
     failed = {**base, "rule_hits": policy.rule_hits_json(hits + [policy.UPSTREAM_ERROR_HIT]),
               "ext": cj({**json.loads(base["ext"]), **budgets.cost(n.rulepack, base["model_digest"], None)})}
@@ -167,7 +175,7 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
     except (httpx.HTTPError, ValueError, RecursionError):
         status, data = 502, None
     if not isinstance(data, dict) or not isinstance(data.get("output"), list):
-        return refused(await seal_in(n, task, settled(failed)), 502, "upstream_error"), None
+        return refused(await n.seal(settled(failed)), 502, "upstream_error"), None
     u = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     usage = {k: u[k] for k in ("input_tokens", "output_tokens")} if all(type(u.get(k)) is int for k in
                                                                         ("input_tokens", "output_tokens")) else None
@@ -211,10 +219,10 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
         # in it is gated or relayed
         x = {**json.loads(failed["ext"]), "response_hash": record.sha256_hex(resp.content),
              **budgets.cost(n.rulepack, base["model_digest"], usage)}
-        return refused(await seal_in(n, task, settled({**failed, "ext": cj(x)})), 502, "upstream_error"), None
+        return refused(await n.seal(settled({**failed, "ext": cj(x)})), 502, "upstream_error"), None
     if post[0] == "block":         # Foundry answered, but not with an approved model: the answer is withheld
-        return refused(await seal_in(n, task, settled({**sealed, "output_hash": ""})), 403, "policy_block"), None
-    rec = await seal_in(n, task, settled(sealed))
+        return refused(await n.seal(settled({**sealed, "output_hash": ""})), 403, "policy_block"), None
+    rec = await n.seal(settled(sealed))
     if rec["decision"] == "block":
         return refused(rec, 403, "policy_block"), None
     n.store.index_tool_uses(rec["seq"], uses)
