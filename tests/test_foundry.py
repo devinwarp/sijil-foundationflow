@@ -376,19 +376,58 @@ def test_informational_items_still_pass(tmp_path, monkeypatch):
     assert rows(s.db_path, "type = 'inference'")[-1]["decision"] == "allow"
 
 
-@pytest.mark.parametrize("arguments", ['{"caseId": "\\ud800"}', '{"caseId": "\\udc00x"}'])
-def test_a_lone_surrogate_in_gated_arguments_is_400_not_500(tmp_path, monkeypatch, arguments):
-    """§2.2: the ledger cannot hash a lone surrogate, so the request is refused; Foundry's request is not answered."""
+UNHASHABLE = [                             # (output items, answer text) Foundry may send back
+    ([{"type": "mcp_approval_request", "id": "mcpr_s", "server_label": "case-mcp", "name": "get_case",
+       "arguments": '{"caseId": "\\ud800"}'}], ""),                       # gated arguments escaping a lone surrogate
+    ([{"type": "mcp_approval_request", "id": "mcpr_s", "server_label": "case-mcp", "name": "get_case",
+       "arguments": '{"caseId": NaN}'}], ""),                              # or carrying NaN
+    ([{"type": "function_call", "call_id": "call_s", "name": "lookup", "arguments": "{bad \udc00"}], ""),
+    ([], "lone \udfff"),                                                    # the answer text
+]
+SPEND = """pricing:
+  - {id: foundry-any, model: "api:azure-foundry:*", input_per_mtok_micro: 1000000000, output_per_mtok_micro: 0,
+     missing_usage_cost_micro: 555}
+budgets:
+  - id: relay
+    match: {harness: [foundry]}
+    limits: {model_spend_micro: 1500000}
+    currency: AED
+    on_exceed: block
+"""
+
+
+@pytest.mark.parametrize("items,text", UNHASHABLE)
+def test_an_unhashable_answer_is_sealed_priced_and_counts_toward_the_budget(tmp_path, monkeypatch, items, text):
+    """§2.2: the ledger cannot hash NaN or a lone surrogate, but Foundry answered and billed: the round trip is sealed
+    as a priced upstream_error with the raw bytes hashed, nothing is gated, and the spend counts (§17.6.2)."""
     monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
-    reply = {"id": "resp_s", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
-             "output": [{"type": "mcp_approval_request", "id": "mcpr_s", "server_label": "case-mcp",
-                         "name": "get_case", "arguments": arguments}]}
-    client, s, _ = gov_node(tmp_path, pack=PACK, handler=lambda r: httpx.Response(200, json=reply), policy=FOUNDRY_POLICY)
+    seen = []
+    message = [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}]
+    reply = json.dumps({"id": "resp_s", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
+                        "usage": {"input_tokens": 1000, "output_tokens": 7}, "output": items + message}).encode()
+
+    def handler(r):
+        seen.append(r)
+        return httpx.Response(200, content=reply, headers={"content-type": "application/json"})
+    client, s, _ = gov_node(tmp_path, pack=PACK + SPEND, handler=handler, policy=FOUNDRY_POLICY)
     with client:
+        for _ in range(2):
+            r = portal(client)
+            assert r.status_code == 502 and r.json()["error"]["type"] == "upstream_error" and "mcpr_s" not in r.text
         r = portal(client)
-    assert r.status_code == 400 and "mcpr_s" not in r.text
-    assert rows(s.db_path, "type = 'tool_call'") == [] and rows(s.db_path, "type = 'inference'") == []
-    assert verify(s.db_path, s.pubkey_path)[0] == 0
+        assert r.status_code == 403 and r.json()["sijill"]["rule_hits"] == ["budget:relay:model_spend_micro"]
+    assert len(seen) == 2 and rows(s.db_path, "type = 'tool_call'") == []
+    first, second, third = rows(s.db_path, "type = 'inference'")
+    for rec in (first, second):
+        x = json.loads(rec["ext"])
+        assert (rec["model_digest"], rec["output_hash"], json.loads(rec["rule_hits"])) == \
+            ("api:azure-foundry:case-agent", "", ["upstream_error"])
+        assert (x["usage"], x["cost_micro"], x["response_hash"]) == \
+            ({"input_tokens": 1000, "output_tokens": 7}, 1000000, record.sha256_hex(reply))
+    assert third["decision"] == "block"
+    for flags in ((), ("--rulepack", str(tmp_path / "starter.yaml"))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
 
 
 def test_a_lone_surrogate_in_the_conversation_id_is_400(relay):

@@ -227,19 +227,28 @@ def test_api_mode_stream_leading_empty_model_chunk_then_unapproved_model_is_refu
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
 
-@pytest.mark.parametrize("arguments,content", [
-    ('{"note": "\\ud800"}', None),                  # JSON arguments whose string escapes a lone surrogate
-    ("{not json \ud800", None),                      # raw arguments carrying one
-    ("{}", "lone \udfff"),                           # the answer text carrying one
+@pytest.mark.parametrize("arguments,content,model", [
+    ('{"note": "\\ud800"}', None, DATED),          # JSON arguments whose string escapes a lone surrogate
+    ("{not json \ud800", None, DATED),              # raw arguments carrying one
+    ("{}", "lone \udfff", DATED),                   # the answer text carrying one
+    ("{}", None, "gpt-4.1\ud800"),                  # the model the provider says answered
 ])
-def test_a_lone_surrogate_from_the_model_is_400_and_seals_nothing(tmp_path, arguments, content):
-    """§2.2: a record never contains a lone surrogate; the ledger refuses the request rather than failing with 500."""
+def test_a_lone_surrogate_from_the_model_is_sealed_as_an_upstream_error(tmp_path, arguments, content, model):
+    """§2.2: a record never contains a lone surrogate. The call was forwarded and billed, so it is sealed as an
+    upstream_error under the requested model, with the raw answer bytes hashed, and the client gets a 502."""
     calls = [{"id": "call_S", "type": "function", "function": {"name": "addCaseNote", "arguments": arguments}}]
-    body = json.dumps({"id": "chatcmpl-1", "object": "chat.completion", "model": DATED, "choices": [{          # \uXXXX
+    body = json.dumps({"id": "chatcmpl-1", "object": "chat.completion", "model": model, "choices": [{          # \uXXXX
         "index": 0, "finish_reason": "tool_calls", "message": {"role": "assistant", "content": content, "tool_calls": calls}}]})
     client, s = make_node(tmp_path, lambda request: httpx.Response(200, content=body,
-                                                                    headers={"content-type": "application/json"}))
+                                                                    headers={"content-type": "application/json"}),
+                          API_POLICY, **API)
     with client:
-        r = ask(client)
-    assert r.status_code == 400
-    assert rows(s.db_path) == []
+        r = ask(client, model=DATED)
+    assert r.status_code == 502 and "call_S" not in r.text
+    [rec] = rows(s.db_path)
+    x = ext(rec)
+    assert (rec["model_digest"], rec["output_hash"], json.loads(rec["rule_hits"])) == \
+        ("api:azure-openai:" + DATED, "", ["upstream_error"])
+    assert (x["response_hash"], x["tool_uses"]) == (record.sha256_hex(body.encode()), [])
+    assert sqlite(s.db_path, "SELECT count(*) FROM tool_use_index") == "0"
+    assert verify(s.db_path, s.pubkey_path)[0] == 0

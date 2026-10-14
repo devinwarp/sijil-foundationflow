@@ -163,39 +163,47 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
         status, data = 502, None
     if not isinstance(data, dict) or not isinstance(data.get("output"), list):
         return refused(await seal_in(n, task, settled(failed)), 502, "upstream_error"), None
-    model = data["model"] if isinstance(data.get("model"), str) and chat.MODEL.fullmatch(data["model"]) \
-        else cfg.agent_name
-    digest = f"api:azure-foundry:{model}"
-    post = policy.evaluate(pol, n.region, digest, messages)
-    items = [i for i in data["output"] if isinstance(i, dict)]
-    if any(not isinstance(i, dict) or str(i.get("type")) not in KNOWN and not ran(str(i.get("type")))
-           for i in data["output"]):
-        post = ("block", "enforce", [*post[2], UNKNOWN_HIT])
-    uses = []
-    for i in items:
-        kind = str(i.get("type"))
-        if kind == "function_call":              # executed by the portal; its call_id is what it sends back
-            uses.append(chat.tool_use(i.get("call_id"), i.get("name"), i.get("arguments", "")))
-        elif kind == "mcp_approval_request" or (ran(kind) and kind != "mcp_call") or \
-                (kind == "mcp_call" and i.get("approval_request_id") not in gated):
-            # a gated request, or a call Foundry ran without asking: the parent of its tool_call (Ruling)
-            tool, _, qualified, _, args = tool_of(i)
-            uses.append({"id": str(i.get("id", "")), "name": qualified.split(":", 1)[1] if kind.startswith("mcp")
-                         else tool, "args_hash": record.sha256_hex(record.canonical_json(args))})
     u = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     usage = {k: u[k] for k in ("input_tokens", "output_tokens")} if all(type(u.get(k)) is int for k in
                                                                         ("input_tokens", "output_tokens")) else None
-    x = {"api": API, "attestation": "api", "request_hash": record.sha256_hex(record.canonical_json(req)),
-         "system_hash": "", "response_hash": record.sha256_hex(resp.content), "provider_request_id": str(data.get("id", "")),
-         "stop_reason": str(data.get("status", "")), "tool_uses": uses, "session_id": conv_hash,
-         "foundry": {"endpoint_host": urlsplit(cfg.endpoint).hostname, "agent_name": cfg.agent_name,
-                     "agent_version": str((data.get("agent") or {}).get("version", "")) if isinstance(data.get("agent"), dict) else "",
-                     "response_id": str(data.get("id", "")), "previous_response_id": str(req.get("previous_response_id") or ""),
-                     "conversation_hash": conv_hash, "items": dict(Counter(str(i.get("type")) for i in items))},
-         **budgets.cost(n.rulepack, digest, usage)}
-    sealed = {**base, "model_id": model, "model_digest": digest, "decision": post[0], "mode": post[1],
-              "rule_hits": policy.rule_hits_json(post[2]), "output_hash": record.output_hash(output_text(data)),
-              "ext": cj(x)}
+    try:
+        model = data["model"] if isinstance(data.get("model"), str) and chat.MODEL.fullmatch(data["model"]) \
+            else cfg.agent_name
+        digest = f"api:azure-foundry:{model}"
+        post = policy.evaluate(pol, n.region, digest, messages)
+        items = [i for i in data["output"] if isinstance(i, dict)]
+        if any(not isinstance(i, dict) or str(i.get("type")) not in KNOWN and not ran(str(i.get("type")))
+               for i in data["output"]):
+            post = ("block", "enforce", [*post[2], UNKNOWN_HIT])
+        uses = []
+        for i in items:
+            kind = str(i.get("type"))
+            if kind == "function_call":              # executed by the portal; its call_id is what it sends back
+                uses.append(chat.tool_use(i.get("call_id"), i.get("name"), i.get("arguments", "")))
+            elif kind == "mcp_approval_request" or (ran(kind) and kind != "mcp_call") or \
+                    (kind == "mcp_call" and i.get("approval_request_id") not in gated):
+                # a gated request, or a call Foundry ran without asking: the parent of its tool_call (Ruling)
+                tool, _, qualified, _, args = tool_of(i)
+                uses.append({"id": str(i.get("id", "")), "name": qualified.split(":", 1)[1] if kind.startswith("mcp")
+                             else tool, "args_hash": record.sha256_hex(record.canonical_json(args))})
+        x = {"api": API, "attestation": "api", "request_hash": record.sha256_hex(record.canonical_json(req)),
+             "system_hash": "", "response_hash": record.sha256_hex(resp.content), "provider_request_id": str(data.get("id", "")),
+             "stop_reason": str(data.get("status", "")), "tool_uses": uses, "session_id": conv_hash,
+             "foundry": {"endpoint_host": urlsplit(cfg.endpoint).hostname, "agent_name": cfg.agent_name,
+                         "agent_version": str((data.get("agent") or {}).get("version", "")) if isinstance(data.get("agent"), dict) else "",
+                         "response_id": str(data.get("id", "")), "previous_response_id": str(req.get("previous_response_id") or ""),
+                         "conversation_hash": conv_hash, "items": dict(Counter(str(i.get("type")) for i in items))},
+             **budgets.cost(n.rulepack, digest, usage)}
+        sealed = {**base, "model_id": model, "model_digest": digest, "decision": post[0], "mode": post[1],
+                  "rule_hits": policy.rule_hits_json(post[2]), "output_hash": record.output_hash(output_text(data)),
+                  "ext": cj(x)}
+        cj(sealed)                       # every field the seal will hash, model_digest included
+    except (record.NotCanonical, UnicodeEncodeError):
+        # NaN, an infinity or a lone surrogate in what Foundry answered (§2.2): it was billed, so the round trip is
+        # sealed as a priced upstream_error with only its raw bytes hashed, and nothing in it is gated or relayed
+        x = {**json.loads(failed["ext"]), "response_hash": record.sha256_hex(resp.content),
+             **budgets.cost(n.rulepack, base["model_digest"], usage)}
+        return refused(await seal_in(n, task, settled({**failed, "ext": cj(x)})), 502, "upstream_error"), None
     if post[0] == "block":         # Foundry answered, but not with an approved model: the answer is withheld
         return refused(await seal_in(n, task, settled({**sealed, "output_hash": ""})), 403, "policy_block"), None
     rec = await seal_in(n, task, settled(sealed))
