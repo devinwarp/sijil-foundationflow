@@ -6,6 +6,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY sijill sijill
+# the Foundry relay runs the guard's rule engine (sijill/foundry.py imports guard)
+COPY guard guard
 COPY verifier verifier
 COPY report report
 COPY dashboard dashboard
