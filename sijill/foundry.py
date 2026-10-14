@@ -10,6 +10,7 @@ the fact (§17.4.4): recorded, never enforced.
 
 import asyncio
 import json
+import logging
 import os
 import re
 from collections import Counter
@@ -216,7 +217,8 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
     except Exception:   # noqa: BLE001  anything in Foundry's answer the relay cannot read
         # NaN, an infinity or a lone surrogate in what Foundry answered (§2.2), or an item of the wrong type: it was
         # billed, so the round trip is sealed as a priced upstream_error with only its raw bytes hashed, and nothing
-        # in it is gated or relayed
+        # in it is gated or relayed. Logged, so a bug in the relay itself is not mistaken for Foundry's
+        logging.getLogger(__name__).exception("foundry answer unreadable; sealed as upstream_error")
         x = {**json.loads(failed["ext"]), "response_hash": record.sha256_hex(resp.content),
              **budgets.cost(n.rulepack, base["model_digest"], usage)}
         return refused(await n.seal(settled({**failed, "ext": cj(x)})), 502, "upstream_error"), None
