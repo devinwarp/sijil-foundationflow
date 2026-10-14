@@ -654,3 +654,36 @@ def test_an_mcp_call_naming_no_string_request_is_sealed_after_the_fact(tmp_path,
     assert json.loads(call["ext"])["after_the_fact"] is True and len(rows(s.db_path, "type = 'tool_result'")) == 1
     code, line = verify(s.db_path, s.pubkey_path)
     assert code == 0, line
+
+
+def test_a_gated_call_reported_with_an_unhashable_name_still_has_its_result_sealed(tmp_path, monkeypatch):
+    """The ledger approved the call and Foundry ran it: the output is sealed under the approved tool_call even when
+    the reported name cannot be hashed, marked upstream_error; the answer carrying it is not relayed."""
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    ask = {**DONE, "id": "resp_g1", "output": [{"type": "mcp_approval_request", "id": "mcpr_g", "server_label": "case-mcp",
+                                               "name": "get_case", "arguments": CASE_ARGS}]}
+    ran_ = {**DONE, "output": [{"type": "mcp_call", "id": "mcp_g", "approval_request_id": "mcpr_g",
+                                "server_label": "case-mcp", "name": "get_case\ud800", "arguments": CASE_ARGS,
+                                "output": "open"}] + DONE["output"]}
+
+    def handler(r):
+        return httpx.Response(200, content=json.dumps(ran_ if json.loads(r.content).get("previous_response_id")
+                                                      else ask).encode(), headers={"content-type": "application/json"})
+    client, s, _ = gov_node(tmp_path, pack=PACK + SPEND, handler=handler, policy=FOUNDRY_POLICY)
+    with client:
+        r = portal(client)
+    assert r.status_code == 502 and r.json()["error"]["type"] == "upstream_error"
+    call, = rows(s.db_path, "type = 'tool_call'")
+    res, = rows(s.db_path, "type = 'tool_result'")
+    x = json.loads(res["ext"])
+    assert (res["parent_seq"], res["output_hash"], json.loads(res["rule_hits"])) == \
+        (str(call["seq"]), record.sha256_hex(b"open"), ["upstream_error"])
+    assert (x["tool"], x["server"], res["source_label"]) == ("", "", "mcp:case-mcp")
+    for flags in ((), ("--rulepack", str(tmp_path / "starter.yaml"))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
+
+
+def test_an_answer_the_seal_did_not_read_is_not_relayed_when_it_cannot_be_rendered(tmp_path, monkeypatch):
+    r, s, _ = answer_once(tmp_path, monkeypatch, [{"type": "reasoning", "id": "rs_1", "summary": [{"score": float("nan")}]}])
+    assert r.status_code == 502 and r.json()["sijill"]["seq"] == rows(s.db_path, "type = 'inference'")[0]["seq"]

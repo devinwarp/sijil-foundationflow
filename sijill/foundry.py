@@ -298,8 +298,15 @@ async def result(n, task: dict, call_seq: int, item: dict, qualified: str, tool:
            "invisible_unicode": {"found": scan["found"], "count": scan["count"], "action": "none",
                                  **({"codepoints": scan["codepoints"]} if scan["found"] else {})},
            **({"exec_hints": hints} if hints else {})}
+    hits = v.hits
+    try:
+        cj(ext)
+    except record.NotCanonical:
+        # a gated call Foundry ran, reported under a name no record can hash (§2.2): its output is still sealed
+        # under the approved tool_call, without the name, so the executed action keeps its result
+        ext, hits = {**ext, "tool": "", "server": ""}, [*v.hits, policy.UPSTREAM_ERROR_HIT]
     await seal_in(n, task, in_task(n, task, "tool_result", parent_seq=str(call_seq), source_label=label,
-                                   decision="flag" if v.hits else "allow", rule_hits=policy.rule_hits_json(v.hits),
+                                   decision="flag" if v.hits else "allow", rule_hits=policy.rule_hits_json(hits),
                                    output_hash=record.sha256_hex(text.encode("utf-8", "surrogatepass")), ext=cj(ext)))
 
 
@@ -403,6 +410,11 @@ def router() -> APIRouter:
                     "sijill": {"seq": rec["seq"]}})
             req = {**{k: v for k, v in req.items() if k not in ("input", "conversation")},
                    "previous_response_id": data.get("id"), "input": answers}
-        return JSONResponse(content=data, headers={"X-Sijill-Seq": str(rec["seq"])})
+        try:
+            return JSONResponse(content=data, headers={"X-Sijill-Seq": str(rec["seq"])})
+        except ValueError:      # NaN or a lone surrogate the seal did not read: sealed, but not relayed (§2.2)
+            return JSONResponse(status_code=502, headers={"X-Sijill-Seq": str(rec["seq"])}, content={
+                "error": {"type": "upstream_error", "message": "Foundry answered with a value no record can hash"},
+                "sijill": {"seq": rec["seq"]}})
 
     return r
