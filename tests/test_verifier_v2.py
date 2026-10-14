@@ -127,6 +127,14 @@ def test_ext_not_canonical(tmp_path):
     assert run(c, tmp_path) == (1, "FAIL seq=3 ext not canonical")
 
 
+@pytest.mark.parametrize("word", ["NaN", "Infinity", "-Infinity"])
+def test_nan_in_ext_is_a_fail_line_not_an_exception(tmp_path, word):
+    """§2.2: NaN and infinities are not JSON; the reference parser reads them, so check 6 must refuse them."""
+    c = v2chain.demo()
+    c[3]["ext"] = c[3]["ext"][:-1] + f',"zz":{word}}}'
+    assert run(c, tmp_path) == (1, "FAIL seq=3 ext not canonical")
+
+
 @pytest.mark.parametrize("value,line", [
     ("05", "FAIL seq=6 parent_seq malformed"),
     ("x", "FAIL seq=6 parent_seq malformed"),

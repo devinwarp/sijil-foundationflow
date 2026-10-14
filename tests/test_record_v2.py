@@ -109,6 +109,15 @@ def test_rejects_malformed_tool_call(change):
         seal({**TOOL_CALL, **change})
 
 
+@pytest.mark.parametrize("word", ["NaN", "Infinity", "-Infinity"])
+def test_rejects_nan_in_ext(word):
+    ext = TOOL_CALL["ext"].replace('"tool":', f'"summary":{{"n":{word}}},"tool":')    # sorted: before tool
+    with pytest.raises(ValueError):
+        seal({**TOOL_CALL, "ext": ext})
+    with pytest.raises(ValueError):
+        record.canonical_json({"x": float(word.lower().replace("infinity", "inf"))})
+
+
 def test_tool_call_without_parent_needs_correlation_none():
     with pytest.raises(ValueError, match="requires parent_seq"):
         seal({**TOOL_CALL, "parent_seq": ""})

@@ -101,7 +101,8 @@ class Fail(Exception):
 
 
 def canonical_json(obj):
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    """NaN and infinities are not JSON (spec §2.2): ValueError, which check 6 turns into a FAIL line."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
 def canonical_bytes(record):

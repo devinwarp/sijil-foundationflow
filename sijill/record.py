@@ -109,8 +109,16 @@ _TYPED = {"approval_seq": int, "after_the_fact": bool, "foundry_item_id": str, "
           "timeout_ms": int, "sod": bool, "relay_binding": dict, "approver_set": dict}
 
 
+class NotCanonical(ValueError):
+    """A value canonical JSON cannot carry (§2.2): NaN, an infinity or a lone surrogate. The ledger answers 400."""
+
+
 def canonical_json(obj) -> bytes:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    try:
+        return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                          allow_nan=False).encode("utf-8")
+    except ValueError as e:        # NaN or an infinity; a lone surrogate's UnicodeEncodeError is a ValueError too
+        raise NotCanonical(str(e)) from e
 
 
 def sha256_hex(data: bytes) -> str:
@@ -154,9 +162,10 @@ def _ext(body: dict) -> dict:
         return {}
     try:
         obj = json.loads(ext)
+        canonical = isinstance(obj, dict) and canonical_json(obj).decode("utf-8") == ext
     except ValueError:
-        obj = None
-    if not isinstance(obj, dict) or canonical_json(obj).decode("utf-8") != ext:
+        canonical = False
+    if not canonical:
         raise ValueError("ext must be a canonical JSON object serialised to a string")
     if _has_null(obj):
         raise ValueError("ext must not contain null")

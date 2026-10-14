@@ -265,6 +265,12 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
     app = FastAPI(title="Sijill", lifespan=lifespan)
 
+    @app.exception_handler(record.NotCanonical)
+    async def not_canonical(request: Request, e: record.NotCanonical):
+        """Input no record can hash (§2.2) is refused, wherever it surfaces: a request body, a model's tool
+        arguments, an agent's ext."""
+        return JSONResponse(status_code=400, content={"detail": f"not canonical JSON: {e}"})
+
     def node(request: Request) -> Node:
         return request.app.state.node
 
