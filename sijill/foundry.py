@@ -57,7 +57,7 @@ def tool_of(item: dict) -> tuple[str, str, str, str, dict]:
         label, name = server_label(item), str(item.get("name", ""))
         try:
             args = json.loads(item.get("arguments") or "{}")
-        except ValueError:
+        except (ValueError, RecursionError):
             args = {"_raw": item.get("arguments")}
         return name, label, f"mcp:{label}:{name}", f"mcp:{label}", args if isinstance(args, dict) else {"body": args}
     kind = str(item.get("type"))
@@ -159,7 +159,7 @@ async def round_trip(n, cfg, task: dict, req: dict, conv_hash: str, human: dict,
     try:
         resp = await n.foundry.post("/responses", json=req, headers={"Authorization": f"Bearer {token}"})
         status, data = resp.status_code, resp.json() if resp.status_code == 200 else None
-    except (httpx.HTTPError, ValueError):
+    except (httpx.HTTPError, ValueError, RecursionError):
         status, data = 502, None
     if not isinstance(data, dict) or not isinstance(data.get("output"), list):
         return refused(await seal_in(n, task, settled(failed)), 502, "upstream_error"), None

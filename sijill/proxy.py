@@ -39,6 +39,14 @@ UPSTREAM_ERROR_TYPE = "upstream_error"
 DASHBOARD = ROOT / "dashboard" / "index.html"
 
 
+def error_content(raw: bytes):
+    """A model runtime's error answer, relayed as it parsed; one that does not parse is relayed as text."""
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError):
+        return {"error": {"message": raw.decode(errors="replace")}}
+
+
 @dataclass
 class Settings:
     db_path: str = "sijill.db"
@@ -445,11 +453,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             if resp.status_code != 200:
                 raw = await resp.aread()
                 await resp.aclose()
-                try:
-                    content = json.loads(raw)
-                except ValueError:
-                    content = {"error": {"message": raw.decode(errors="replace")}}
-                return await upstream_failed(resp.status_code, content, (perf_counter() - t1) * 1000)
+                return await upstream_failed(resp.status_code, error_content(raw), (perf_counter() - t1) * 1000)
 
             async def relay():
                 parts, calls, relayed = [], chat.StreamCalls(), hashlib.sha256()
@@ -465,7 +469,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                         if line.startswith("data: "):
                             try:
                                 event = json.loads(line[6:])
-                            except ValueError:
+                            except (ValueError, RecursionError):
                                 event = None
                             if isinstance(event, dict) and "error" in event:
                                 errored = True  # in-stream failure (vLLM), even if [DONE] follows
@@ -563,7 +567,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         if resp.status_code != 200:
             return await upstream_failed(
                 resp.status_code,
-                resp.json() if resp.headers.get("content-type", "").startswith("application/json")
+                error_content(resp.content) if resp.headers.get("content-type", "").startswith("application/json")
                 else {"error": {"message": resp.text}},
                 upstream_ms)
 
@@ -581,7 +585,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
             post = answered(data.get("model")) if api else None
             if api and post is None:
                 raise TypeError("api attestation needs the response's model")
-        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError, RecursionError):
             return await upstream_failed(
                 502, {"error": {"message": "model runtime returned a malformed response",
                                 "type": UPSTREAM_ERROR_TYPE}}, upstream_ms)

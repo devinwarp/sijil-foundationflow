@@ -576,3 +576,41 @@ def test_a_confirm_rule_call_foundry_ran_unasked_is_flagged_and_verifies_with_th
     for flags in ((), ("--rulepack", str(s.rulepack_path))):
         code, line = verify(s.db_path, s.pubkey_path, *flags)
         assert code == 0, line
+
+
+DEEP = "[" * 100000 + "]" * 100000          # past the parser's recursion limit
+DONE = {"id": "resp_d2", "object": "response", "model": "gpt-4.1-2025-04-14", "status": "completed",
+        "usage": {"input_tokens": 1000, "output_tokens": 7},
+        "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]}]}
+
+
+@pytest.mark.parametrize("item", [
+    {"type": "function_call", "call_id": "call_d", "name": "lookup", "arguments": DEEP},
+    {"type": "mcp_approval_request", "id": "mcpr_d", "server_label": "case-mcp", "name": "get_case", "arguments": DEEP},
+], ids=["function_call", "mcp_approval_request"])
+def test_deeply_nested_arguments_are_sealed_raw_priced_and_counted(tmp_path, monkeypatch, item):
+    """Arguments nested past the parser's limit hash as their raw text: the round trip is sealed and priced, a gated
+    request is gated like any other, and the spend reaches the budget."""
+    monkeypatch.setenv("SIJIL_TEST_FOUNDRY_TOKEN", "ledger-entra-token")
+    ask = {**DONE, "id": "resp_d1", "output": [item]}
+
+    def handler(r):
+        return httpx.Response(200, json=DONE if json.loads(r.content).get("previous_response_id") else ask)
+    client, s, _ = gov_node(tmp_path, pack=PACK + SPEND, handler=handler, policy=FOUNDRY_POLICY)
+    with client:
+        statuses = [portal(client).status_code for _ in range(3)]
+    gated = item["type"] == "mcp_approval_request"
+    assert statuses == ([200, 403, 403] if gated else [200, 200, 403])
+    infs = rows(s.db_path, "type = 'inference'")
+    x = json.loads(infs[0]["ext"])
+    assert x["cost_micro"] == 1000000 and len(x["tool_uses"]) == 1
+    if gated:
+        assert x["tool_uses"][0]["args_hash"] == record.sha256_hex(record.canonical_json({"_raw": DEEP}))
+        call, = rows(s.db_path, "type = 'tool_call'")
+        assert call["input_hash"] == x["tool_uses"][0]["args_hash"]
+    else:
+        assert x["tool_uses"][0]["args_raw"] is True
+    assert json.loads(infs[-1]["rule_hits"]) == ["budget:relay:model_spend_micro"]
+    for flags in ((), ("--rulepack", str(tmp_path / "starter.yaml"))):
+        code, line = verify(s.db_path, s.pubkey_path, *flags)
+        assert code == 0, line
