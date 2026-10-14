@@ -165,6 +165,8 @@ def test_without_a_valid_user_token_nothing_reaches_foundry(relay):
     assert foundry.seen == []
     refusal = rows(s.db_path, "type = 'inference'")[0]
     assert (refusal["decision"], refusal["task_seq"], refusal["agent_id"]) == ("block", "", FOUNDRY_AGENT)
+    # §17.4.3: model_id is the agent name until Foundry reports one, and model_digest follows it
+    assert (refusal["model_id"], refusal["model_digest"]) == ("case-agent", "api:azure-foundry:case-agent")
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
 

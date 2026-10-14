@@ -340,6 +340,7 @@ def router() -> APIRouter:
         except oidc.OidcError as e:              # sealed outside any task, like the model door (§17.2.7)
             hit = oidc.hit(e.code)
             rec = await n.seal(n.body(n.policy, "inference", model_id=cfg.agent_name, mode="enforce", decision="block",
+                                      model_digest=f"api:azure-foundry:{cfg.agent_name}",      # as in round_trip
                                       rule_hits=policy.rule_hits_json([hit]), agent_id=cfg.agent_id, principal=e.principal,
                                       input_hash=input_hash,
                                       ext=cj({"principal_error": e.code})))
