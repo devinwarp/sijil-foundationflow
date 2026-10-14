@@ -55,3 +55,11 @@ with `halted` on a streamed call as "stopped mid-stream; partial output may have
 When the client disconnects or the model fails mid-stream, the record's `output_hash` is empty even if
 part of the answer was delivered: on a disconnect the last chunk may not have reached the client, so the
 sent bytes are not a reliable record of what was received.
+
+**Supply chain.** Both images start from `python:3.11-slim` pinned by digest. The guard image installs
+`deploy/guard-requirements.lock` with `pip --require-hashes`: every package, transitive ones included, is pinned
+and hashed at the versions the test suite ran with. The ledger image does not yet: `requirements.txt` pins the
+direct dependencies only, without hashes, so its transitive packages (pydantic, starlette, the WeasyPrint stack)
+resolve at build time and can differ from the tested set. The release's SBOM (`sijil-<tag>.spdx.json`) lists what
+was actually shipped; check it against the test run when this matters. `apt-get` packages in the ledger image are
+not pinned either.

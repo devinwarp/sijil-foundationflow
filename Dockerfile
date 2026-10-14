@@ -1,8 +1,11 @@
-FROM python:3.11-slim
+# python:3.11-slim, pinned by its multi-arch index digest (refresh: docker buildx imagetools inspect python:3.11-slim)
+FROM python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce
 # weasyprint needs pango for the PDF report; sqlite3 CLI takes consistent DB exports (INSTALL.txt step 6)
 RUN apt-get update && apt-get install -y --no-install-recommends libpango-1.0-0 libpangoft2-1.0-0 sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+# BSL-1.1 for sijill/; guard/ and verifier/ carry their own Apache-2.0 LICENSE
+COPY LICENSE LICENSE
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY sijill sijill

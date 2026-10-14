@@ -9,6 +9,10 @@ node.key
 node.pub
 **/node.key
 **/node.pub
+agent.key
+**/agent.key
+agent-key
+**/agent-key
 *.db
 **/*.db
 .sijill_digests.json
