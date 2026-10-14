@@ -42,13 +42,13 @@ def main(argv: list[str] | None = None, ledger: Ledger | None = None) -> int:
     ap.add_argument("--server")
     ap.add_argument("--http", default="")
     a = ap.parse_args(argv)
-    cfg = config.load(a.config)
-    ledger = ledger or ledger_for(cfg)
     cmd = " ".join(a.command)
     try:
+        cfg = config.load(a.config)
+        ledger = ledger or ledger_for(cfg)
         if cmd == "identity init":
             key = identity.ensure_key(cfg.key_path, a.repo)
-            seq = identity.register(ledger, cfg.agent_id, key, cfg.registered_by or identity.local_principal(),
+            seq = identity.register(ledger, cfg.agent_id, key, cfg.registered_by,
                                     cfg.display_name, os.environ.get(a.admin_token_env, ""),
                                     os.environ.get(a.principal_token_env, ""), cfg.principal_header)
             print(f"registered {cfg.agent_id} pubkey={identity.pubkey(key)} seq={seq}")

@@ -316,7 +316,10 @@ def _section(doc: dict, name: str, path: str) -> dict:
 
 
 def load(path: str) -> Config:
-    doc = yaml.safe_load(Path(path).read_bytes()) or {}
+    try:
+        doc = yaml.safe_load(Path(path).read_bytes()) or {}
+    except yaml.YAMLError as e:
+        raise ValueError(f"{path}: not YAML: {e}") from None
     if not isinstance(doc, dict) or doc.get("version") != 1:
         raise ValueError(f"{path}: version: 1 is required")
     unknown = set(doc) - SECTIONS

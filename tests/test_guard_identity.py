@@ -409,3 +409,44 @@ def test_a_closed_task_keeps_the_ledgers_detail_for_the_adapter(monkeypatch):
         task.end(None, st, "completed")
     assert e.value.detail == "task already ended" and st.tasks == []
     assert str(e.value) == "409: task already ended: task 7 is taken off the state file"
+
+
+@pytest.mark.parametrize("text", ["version: 2\n", "version: 1\nsijil: [unclosed\n"], ids=["invalid", "not-yaml"])
+def test_a_bad_config_is_a_one_line_error_and_exit_1(tmp_path, capsys, text):
+    path = tmp_path / "guard.yaml"
+    path.write_text(text)
+    assert main(["session", "open", "--config", str(path)]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("sijil-guard: ") and "Traceback" not in err
+
+
+def no_user(monkeypatch):
+    """A container UID with no passwd entry and no USER or LOGNAME: getpass has no name to give."""
+    import getpass
+
+    def getuser():
+        raise KeyError("getpwuid(): uid not found: 1000750000")
+    monkeypatch.setattr(getpass, "getuser", getuser)
+
+
+def test_identity_init_with_no_user_name_asks_for_registered_by(tmp_path, capsys, monkeypatch):
+    cfg_path = guard_yaml(tmp_path)
+    cfg_path.write_text(cfg_path.read_text().replace(f'  registered_by: local:{"a" * 64}\n', ""))
+    no_user(monkeypatch)
+    client, s = ledger_node(tmp_path)
+    with client:
+        code, _ = run(["identity", "init", "--config", str(cfg_path), "--repo", str(tmp_path / "repo")], client, capsys)
+    assert code == 1 and "identity.registered_by" in run.err and "unexpected reply" not in run.err
+
+
+def test_identity_init_under_principal_oidc_needs_no_user_name(tmp_path, capsys, monkeypatch):
+    """The ledger names registered_by from the principal token, so no local principal is derived."""
+    from test_principals import POLICY, node, officer
+    cfg_path = guard_yaml(tmp_path)
+    cfg_path.write_text(cfg_path.read_text().replace(f'  registered_by: local:{"a" * 64}\n', ""))
+    no_user(monkeypatch)
+    monkeypatch.setenv("SIJIL_PRINCIPAL_TOKEN", officer())
+    client, s = node(tmp_path, POLICY.replace("register_policy: open", "register_policy: principal_oidc"))
+    with client:
+        code, out = run(["identity", "init", "--config", str(cfg_path), "--repo", str(tmp_path / "repo")], client, capsys)
+    assert code == 0 and out.startswith(f"registered {AGENT} "), run.err
