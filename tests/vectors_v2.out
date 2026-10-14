@@ -1,5 +1,5 @@
-EPOCH_ROOT ced0e7f56661a22bfaeac824715f8ca46442d98c859a438df6d1954c08790d50
-RECEIPT_B64 hFgxowEnA3gcYXBwbGljYXRpb24vc2lqaWwtZXBvY2grY2JvcgRNZGV2LW1icC0wMS10c6BYiqQBdXNpamlsLXRzOi8vZGV2LW1icC0wMQJ4JHNwaWZmZTovL2FjbWUuZXhhbXBsZS9hZ2VudC9jaS1maXhlcgYaarE7gDoAAQAAo2Ryb290WCDO0Of1ZmGiK_rqyCRxX4ykZELZjIWaQ4320ZVMCHkNUGhlcG9jaF90bxgtamVwb2NoX2Zyb20YKFhAu6NLkZITcC_7n1u6IGdSxndJyS7ynI0I0z7TnSSR7ic5VZ2ZRAIUmu9Cp2HF_L5WzTeAFn7sSUSL5kx_0HVaDw
+EPOCH_ROOT 160e473087cd526d34360d4ec5cce2df5931fe13439525ee1fc616fb0535acf0
+RECEIPT_B64 hFgxowEnA3gcYXBwbGljYXRpb24vc2lqaWwtZXBvY2grY2JvcgRNZGV2LW1icC0wMS10c6BYiqQBdXNpamlsLXRzOi8vZGV2LW1icC0wMQJ4JHNwaWZmZTovL2FjbWUuZXhhbXBsZS9hZ2VudC9jaS1maXhlcgYaarE7gDoAAQAAo2Ryb290WCAWDkcwh81SbTQ2DU7FzOLfWTH-E0OVJe4fxhb7BTWs8GhlcG9jaF90bxgtamVwb2NoX2Zyb20YKFhALtkoqi_zM23Cac1yICcBR2P2HpdL3lE28dVb9IKwAqtBFPBrh1kvEGA0XguqPtUsuRfcebTTJQTXwRTJsrSdDA
 AGENT_PUB 29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7
 NEW_PUB 2543b92ff1095511476adc8369db6ddc933665a11978dda1404ee1066ca9559d
 PRINCIPAL email:03f5e1f3412d1c41f571c6869e8a02c819fe331f520af8fff4d3254ea0fe2446
@@ -784,13 +784,13 @@ AIP45 {"agentId":"spiffe://acme.example/agent/ci-fixer","aipVersion":"1","argume
   "mode": "record",
   "decision": "allow",
   "rule_hits": "[]",
-  "input_hash": "ced0e7f56661a22bfaeac824715f8ca46442d98c859a438df6d1954c08790d50",
-  "output_hash": "5fcc4bcd783a7655ed53f8e27128bdf8bed36df1a820dd5a2fea9842dc5702a5",
-  "ext": "{\"cose_alg\":\"EdDSA\",\"epoch_from\":40,\"epoch_to\":45,\"leaves\":6,\"receipt\":\"hFgxowEnA3gcYXBwbGljYXRpb24vc2lqaWwtZXBvY2grY2JvcgRNZGV2LW1icC0wMS10c6BYiqQBdXNpamlsLXRzOi8vZGV2LW1icC0wMQJ4JHNwaWZmZTovL2FjbWUuZXhhbXBsZS9hZ2VudC9jaS1maXhlcgYaarE7gDoAAQAAo2Ryb290WCDO0Of1ZmGiK_rqyCRxX4ykZELZjIWaQ4320ZVMCHkNUGhlcG9jaF90bxgtamVwb2NoX2Zyb20YKFhAu6NLkZITcC_7n1u6IGdSxndJyS7ynI0I0z7TnSSR7ic5VZ2ZRAIUmu9Cp2HF_L5WzTeAFn7sSUSL5kx_0HVaDw\",\"receipt_hash\":\"5fcc4bcd783a7655ed53f8e27128bdf8bed36df1a820dd5a2fea9842dc5702a5\",\"statement_subject\":\"spiffe://acme.example/agent/ci-fixer\",\"tree\":\"rfc6962-sha256\",\"ts\":\"sijil-ts://dev-mbp-01\",\"ts_kid\":\"dev-mbp-01-ts\",\"ts_kind\":\"self\"}",
+  "input_hash": "160e473087cd526d34360d4ec5cce2df5931fe13439525ee1fc616fb0535acf0",
+  "output_hash": "a05c10bfe991cf5c0473b1c13a2205a48614fcbf15321cd7c6ab9d73af931bb4",
+  "ext": "{\"cose_alg\":\"EdDSA\",\"epoch_from\":40,\"epoch_to\":45,\"leaves\":6,\"receipt\":\"hFgxowEnA3gcYXBwbGljYXRpb24vc2lqaWwtZXBvY2grY2JvcgRNZGV2LW1icC0wMS10c6BYiqQBdXNpamlsLXRzOi8vZGV2LW1icC0wMQJ4JHNwaWZmZTovL2FjbWUuZXhhbXBsZS9hZ2VudC9jaS1maXhlcgYaarE7gDoAAQAAo2Ryb290WCAWDkcwh81SbTQ2DU7FzOLfWTH-E0OVJe4fxhb7BTWs8GhlcG9jaF90bxgtamVwb2NoX2Zyb20YKFhALtkoqi_zM23Cac1yICcBR2P2HpdL3lE28dVb9IKwAqtBFPBrh1kvEGA0XguqPtUsuRfcebTTJQTXwRTJsrSdDA\",\"receipt_hash\":\"a05c10bfe991cf5c0473b1c13a2205a48614fcbf15321cd7c6ab9d73af931bb4\",\"statement_subject\":\"spiffe://acme.example/agent/ci-fixer\",\"tree\":\"rfc9162-sha256\",\"ts\":\"sijil-ts://dev-mbp-01\",\"ts_kid\":\"dev-mbp-01-ts\",\"ts_kind\":\"self\"}",
   "seq": 200,
   "prev_hash": "f6a7999999999999999999999999999999999999999999999999999999999999",
-  "record_hash": "96d030ae3e0e38a504ffca02aaa215ddfcb4975e0e353d72be617ee8fdf030e1",
-  "signature": "7869444b62317297ab8f6eb1ab5dd7f7e3c5c3354960b3ddb2a0f3a364068c201a44ec87c9940686dee943162f0262834535595b028d667b84024720a5895208"
+  "record_hash": "ef2f686806cfb76d63ccdf1fd06c083f6b8d4040df959685d03a60e2789ccb14",
+  "signature": "9a0d5a65c9256ac0d283405b58b574341b28c700dd129bced121f4ac865917ca4fe44a3e0fc347297077be5e2bc41f469ab44a7f9eeb530a2efaf715c2fd1203"
 }
 ASSESSOR_PUB 174553b456dddfc6908ecab1c101fe6ab21e2baa0617795b7d43a63482993fd5
 TOOL_SCOPE {"kind":"sijil-tool-scope","tools":["Edit","Glob","Grep","Read","mcp__sentry__get_issue","mcp__sentry__list_issues","mcp__sentry__search_events"],"version":1} f58ba9d614bf86dc3f99ef2bb02c76a0c47b829e0a21c4ce2f4ec35c84558a61

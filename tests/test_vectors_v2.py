@@ -4,6 +4,7 @@ tests/vectors_v2.py and tests/vectors_v2.out are copies of spec/examples/example
 spec/examples/vectors.out; tests/tokens/ is a copy of spec/examples/tokens/. The spec repo is the source.
 """
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -64,3 +65,23 @@ def test_fixture_token_and_jwks():
     assert (HERE / "tokens" / f"{token_hash}.jwt").read_bytes() == vectors_v2.OFFICER_JWT.encode()
     assert (HERE / "tokens" / f"{vectors_v2.JWKS_HASH}.json").read_bytes() == record.canonical_json(vectors_v2.JWKS)
     assert json.loads(PUBLISHED[70]["ext"])["principal_claims"]["token_hash"] == token_hash
+
+
+def _mth(leaves: list[bytes]) -> bytes:
+    """RFC 9162 §2.1.1 written out directly: k is found by doubling, not by bit tricks."""
+    if len(leaves) == 1:
+        return hashlib.sha256(b"\x00" + leaves[0]).digest()
+    k = 1
+    while k * 2 < len(leaves):
+        k *= 2
+    return hashlib.sha256(b"\x01" + _mth(leaves[:k]) + _mth(leaves[k:])).digest()
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 4, 5, 6, 7])
+def test_epoch_merkle_is_rfc9162_mth(n):
+    leaves = [hashlib.sha256(bytes([i])).digest() for i in range(n)]
+    assert vectors_v2.merkle([x.hex() for x in leaves]) == _mth(leaves).hex()
+    if n == 3:   # one shape where duplicate-the-odd-node differs (so do 5, 6 and 7): ((0,1),2), not ((0,1),(2,2))
+        leaf = lambda x: hashlib.sha256(b"\x00" + x).digest()
+        node = lambda a, b: hashlib.sha256(b"\x01" + a + b).digest()
+        assert _mth(leaves) == node(node(leaf(leaves[0]), leaf(leaves[1])), leaf(leaves[2]))
