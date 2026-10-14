@@ -386,3 +386,15 @@ def test_a_task_the_ledger_already_closed_leaves_the_stack(tmp_path, capsys, mon
         assert task.load(state_file, AGENT).tasks == [second]
     assert [json.loads(r["ext"])["outcome"] for r in rows(s.db_path, "type = 'task_end'")] == ["timeout"]
     assert verify(s.db_path, s.pubkey_path)[0] == 0
+
+
+def test_limits_set_the_rule_engines_size_caps(tmp_path):
+    from guard import rules
+    cfg = config.load(write_yaml(tmp_path, ""))
+    assert (cfg.max_command, cfg.max_args) == (rules.MAX_COMMAND, rules.MAX_ARGS) == (2048, 32768)
+    cfg = config.load(write_yaml(tmp_path, "limits: {max_command: 1024, max_args: 1048576}"))
+    assert (cfg.max_command, cfg.max_args) == (1024, 1048576)
+    for bad in ("limits: {max_args: 0}", "limits: {max_command: '4096'}", "limits: {max_command: true}",
+                "limits: {max_body: 1}"):
+        with pytest.raises(ValueError, match="limits"):
+            config.load(write_yaml(tmp_path, bad))

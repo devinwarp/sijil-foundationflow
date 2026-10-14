@@ -12,15 +12,18 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from . import rules
+
 PRINCIPAL = re.compile(r"oidc:[a-z0-9.-]+:\S+|email:[0-9a-f]{64}|local:[0-9a-f]{64}|human:[a-z0-9-]{1,32}:[0-9a-f]{64}")
 SECTIONS = {"version", "sijil", "identity", "task", "state_path", "repo", "rulepack", "egress", "context_window",
-            "correlation", "results", "servers", "allowed_command_dirs", "mcp", "lockfile", "integrity", "http_tools"}
+            "correlation", "results", "servers", "allowed_command_dirs", "mcp", "lockfile", "integrity", "http_tools",
+            "limits"}
 TOOLS_KEYS = {"allow", "deny"}
 KEYS = {"sijil": {"url", "token_env", "on_unreachable"},
         "identity": {"agent_id", "auth", "key_path", "registered_by", "display_name", "oidc_token_env"},
         "task": {"intent", "harness", "principal_header"},
         "egress": {"pins"}, "correlation": {"require_parent"}, "results": {"max_result_bytes", "invisible_unicode"}, "mcp": {"allowed_origins", "tools_token_env", "tls_cert", "tls_key"},
-        "integrity": {"recheck_seconds"},
+        "integrity": {"recheck_seconds"}, "limits": {"max_command", "max_args"},
         "http_tools": {"listen", "tls", "inbound_auth", "servers"}, "http_tools.tls": {"cert", "key"},
         "http_tools.inbound_auth": {"mode", "token_env", "client_ca"}, "http_tools.operations": TOOLS_KEYS,
         "http_tools.server": {"name", "upstream", "spec", "label", "forward_headers", "operations", "max_body_bytes",
@@ -288,6 +291,8 @@ class Config:
     lockfile: str                 # pinned tool definitions (spec §7.4); "" = none, only invisible Unicode is checked
     recheck_seconds: float        # tools/call re-checks the wrapped server's tools when the last check is older
     http_tools: HttpTools | None = None
+    max_command: int = rules.MAX_COMMAND    # limits: the rule engine's size caps, in characters (guard/rules.py)
+    max_args: int = rules.MAX_ARGS
 
 
 def _path(p: str, name: str, base: Path) -> str:
@@ -317,9 +322,12 @@ def load(path: str) -> Config:
     unknown = set(doc) - SECTIONS
     if unknown:
         raise ValueError(f"{path}: sections {sorted(unknown)} are not supported by this guard")
-    sijil, ident, task, egress, corr, res, mcp, integ = (
+    sijil, ident, task, egress, corr, res, mcp, integ, limits = (
         _section(doc, n, path) for n in ("sijil", "identity", "task", "egress", "correlation", "results", "mcp",
-                                         "integrity"))
+                                         "integrity", "limits"))
+    caps = {k: limits.get(k, getattr(rules, k.upper())) for k in ("max_command", "max_args")}
+    if any(type(v) is not int or v < 1 for v in caps.values()):
+        raise ValueError(f"{path}: limits.max_command and limits.max_args must be positive integers")
     recheck = integ.get("recheck_seconds", 30)
     if type(recheck) not in (int, float) or not 0 <= recheck <= 86400:
         raise ValueError(f"{path}: integrity.recheck_seconds must be a number from 0 to 86400")
@@ -374,4 +382,4 @@ def load(path: str) -> Config:
                   tls_cert=_path(mcp.get("tls_cert", ""), "mcp.tls_cert", base),
                   tls_key=_path(mcp.get("tls_key", ""), "mcp.tls_key", base),
                   lockfile=_path(doc.get("lockfile", ""), "lockfile", base), recheck_seconds=float(recheck),
-                  http_tools=_http_tools(doc.get("http_tools"), path, base))
+                  http_tools=_http_tools(doc.get("http_tools"), path, base), **caps)

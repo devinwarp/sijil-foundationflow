@@ -160,7 +160,8 @@ class Pipeline:
         facts, parsed = rules.call_facts(call.rule_tool, call.tool, call.args, self.roots, call.harness,
                                          call.command_arg, context_labels=ctx["labels"],
                                          context_exec_hints=bool(ctx["exec_hints"]), method=call.method,
-                                         path_template=call.path_template)
+                                         path_template=call.path_template, max_command=self.cfg.max_command,
+                                         max_args=self.cfg.max_args)
         summary = call.summary or (parsed.summary() if parsed else {"arg_keys": sorted(call.args)})
         qualified = call.qualified or name or call.rule_tool
         answer, body = {}, {}

@@ -317,3 +317,13 @@ def test_64_kb_of_letters_in_any_argument_is_sealed_blocked_and_the_chain_passes
     assert (rec["decision"], rec["mode"], json.loads(rec["rule_hits"])) == ("block", "enforce", ["command-too-long"])
     assert verify(s.db_path, s.pubkey_path)[0] == 0
     assert verify(s.db_path, s.pubkey_path, "--rulepack", f"{tmp_path}/starter.yaml")[0] == 0
+
+
+def test_the_configured_argument_cap_is_the_one_applied(g, monkeypatch):
+    client, s, cfg, state, p = g
+    small = Pipeline(p.ledger, state.agent_session, cfg.__class__(**{**cfg.__dict__, "max_args": 64}))
+    note = {"note": "a" * 100}
+    monkeypatch.setitem(REQUESTS, "note", ("add_note", note))
+    ask(client, state, "add the note")
+    with pytest.raises(Refusal, match="command-too-long"):
+        small.check(call("notes", "add_note", note))
