@@ -78,13 +78,18 @@ def local_principal() -> str:
 
 
 def register(ledger: Ledger, agent_id: str, key: Ed25519PrivateKey, registered_by: str, display_name: str = "",
-             admin_token: str = "") -> int:
+             admin_token: str = "", principal_token: str = "",
+             principal_header: str = "X-Sijil-Principal-Token") -> int:
     """Seal agent_register for a key agent (spec §2.4.7). Under register_policy: closed the operator's admin
-    token is required; under principal_oidc the ledger takes registered_by from the principal token."""
-    nonce = ledger.challenge(agent_id, "register")
+    token is required; under principal_oidc the ledger takes registered_by from the principal token, and names it
+    in the challenge's answer so that the self-proof signs it."""
+    principal = {principal_header: principal_token} if principal_token else {}
+    ch = ledger.call("POST", "/api/agent/challenge", json={"agent_id": agent_id, "purpose": "register"},
+                     headers=principal)
+    nonce, registered_by = ch["nonce"], ch.get("registered_by") or registered_by
     msg = {"agent_id": agent_id, "agent_pubkey": pubkey(key), "nonce": nonce, "registered_by": registered_by}
     body = {**msg, "self_proof": proof(key, msg), **({"display_name": display_name} if display_name else {})}
-    headers = {"Authorization": f"Bearer {admin_token}"} if admin_token else {}
+    headers = {**({"Authorization": f"Bearer {admin_token}"} if admin_token else {}), **principal}
     return ledger.call("POST", "/api/agent/register", json=body, headers=headers)["seq"]
 
 

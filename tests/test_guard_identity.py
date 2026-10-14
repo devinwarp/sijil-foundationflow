@@ -338,3 +338,21 @@ def test_github_oidc_failures_are_a_clean_refusal(monkeypatch, answer):
     monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runner-bearer")
     with pytest.raises(ValueError, match="GitHub Actions OIDC token request failed"):
         identity.github_token("n", httpx.Client(transport=httpx.MockTransport(lambda r: answer)))
+
+
+def test_identity_init_registers_under_principal_oidc_with_the_principal_token(tmp_path, capsys, monkeypatch):
+    """register_policy: principal_oidc takes registered_by from the human's token, sent in the guard's principal
+    header from --principal-token-env (default SIJIL_PRINCIPAL_TOKEN), as task start does."""
+    from test_principals import HUMAN, POLICY, node, officer
+    cfg_path = guard_yaml(tmp_path)
+    client, s = node(tmp_path, POLICY.replace("register_policy: open", "register_policy: principal_oidc"))
+    with client:
+        args = ["identity", "init", "--config", str(cfg_path), "--repo", str(tmp_path / "repo")]
+        monkeypatch.delenv("SIJIL_PRINCIPAL_TOKEN", raising=False)
+        assert run(args, client, capsys)[0] == 1
+        monkeypatch.setenv("SIJIL_PRINCIPAL_TOKEN", officer())
+        code, out = run(args, client, capsys)
+        assert code == 0 and out.startswith(f"registered {AGENT} "), run.err
+    rec = rows(s.db_path)[-1]
+    assert (rec["type"], rec["principal"], json.loads(rec["ext"])["principal_auth"]) == ("agent_register", HUMAN, "oidc")
+    assert verify(s.db_path, s.pubkey_path)[0] == 0
