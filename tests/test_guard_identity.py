@@ -398,3 +398,14 @@ def test_limits_set_the_rule_engines_size_caps(tmp_path):
                 "limits: {max_body: 1}", "limits: {max_command: 4097}", "limits: {max_args: 65537}"):
         with pytest.raises(ValueError, match="limits"):
             config.load(write_yaml(tmp_path, bad))
+
+
+def test_a_closed_task_keeps_the_ledgers_detail_for_the_adapter(monkeypatch):
+    """Review minor 6: the adapter answers e.detail, so it stays the ledger's exact string; the CLI's message adds
+    that the task left the state file."""
+    monkeypatch.setattr(task, "end_task", lambda *a: (_ for _ in ()).throw(Refused(409, "task already ended")))
+    st = task.State("as_1", AGENT, "p", "2099-01-01T00:00:00.000Z", tasks=[7])
+    with pytest.raises(task.Closed) as e:
+        task.end(None, st, "completed")
+    assert e.value.detail == "task already ended" and st.tasks == []
+    assert str(e.value) == "409: task already ended: task 7 is taken off the state file"

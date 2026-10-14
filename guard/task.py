@@ -29,7 +29,11 @@ CLOSED = ("task not open in this agent session", "task already ended")
 
 class Closed(Refused):
     """task end was refused because the ledger has already closed the task: it is off the stack, and the state
-    file is saved without it."""
+    file is saved without it. `detail` stays the ledger's (the adapter answers it); the message says so."""
+
+    def __init__(self, status: int, detail, seq: int):
+        super().__init__(status, detail)
+        self.args = (f"{status}: {detail}: task {seq} is taken off the state file",)
 
 
 @dataclass
@@ -175,7 +179,7 @@ def end(ledger: Ledger, state: State, outcome: str, task_seq: int | None = None)
         if e.status != 409 or e.detail not in CLOSED:
             raise
         drop(state, seq)
-        raise Closed(e.status, f"{e.detail}: task {seq} is taken off the state file") from e
+        raise Closed(e.status, e.detail, seq) from e
     drop(state, seq)
     return r
 
