@@ -68,6 +68,7 @@ python scripts/bench.py --n 100                                     # overhead p
 python report/generate.py --from 2026-09-25 --to 2026-09-25 --out report.pdf
 scripts/tamper.sh backup | alter <seq> | forge <seq> | restore
 python -m pytest                                                    # acceptance tests 1-7 and more
+python scripts/m2_demo.py                                           # narrated M2 demo: injection blocked, budget, named approval, offline verify
 ```
 
 ## Endpoints
