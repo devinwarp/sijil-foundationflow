@@ -5,6 +5,7 @@ import statistics
 from pathlib import Path
 
 import httpx
+import pytest
 
 from conftest import MODEL, ask, rows, stub_model, tamper, verify
 from sijill import policy, record
@@ -271,3 +272,14 @@ def test_a_request_no_record_can_hash_is_400_and_seals_nothing(node):
     r = client.post("/v1/chat/completions", content=body, headers={"Content-Type": "application/json"})
     assert r.status_code == 400 and "not canonical" in r.json()["detail"]
     assert rows(s.db_path) == []
+
+
+def test_only_a_lone_surrogate_is_mapped_to_400(node, monkeypatch):
+    """Any other encoding failure is a server fault: it stays a 500, not a client error."""
+    client, _ = node
+
+    def broken():
+        raise UnicodeEncodeError("ascii", "é", 0, 1, "ordinal not in range(128)")
+    monkeypatch.setattr(client.app.state.node.store, "count", broken)
+    with pytest.raises(UnicodeEncodeError):
+        client.get("/api/records")
