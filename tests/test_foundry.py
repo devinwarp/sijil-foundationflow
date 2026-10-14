@@ -687,3 +687,12 @@ def test_a_gated_call_reported_with_an_unhashable_name_still_has_its_result_seal
 def test_an_answer_the_seal_did_not_read_is_not_relayed_when_it_cannot_be_rendered(tmp_path, monkeypatch):
     r, s, _ = answer_once(tmp_path, monkeypatch, [{"type": "reasoning", "id": "rs_1", "summary": [{"score": float("nan")}]}])
     assert r.status_code == 502 and r.json()["sijill"]["seq"] == rows(s.db_path, "type = 'inference'")[0]["seq"]
+
+
+@pytest.mark.parametrize("extra", ['"metadata": {"x": NaN}', '"previous_response_id": "resp_\\ud800"'])
+def test_an_unhashable_forwarded_field_is_400_before_anything_is_sent(relay, extra):
+    """Every forwarded field is hashed at the front door (request_hash), as on /v1/chat/completions."""
+    client, s, foundry = relay
+    r = client.post("/v1/responses", headers={"X-Sijil-Principal-Token": officer(), "Content-Type": "application/json"},
+                    content='{"conversation": "conv_n", "input": "hello", ' + extra + "}")
+    assert r.status_code == 400 and foundry.seen == [] and rows(s.db_path, "type = 'inference'") == []

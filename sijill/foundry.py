@@ -341,7 +341,8 @@ def router() -> APIRouter:
             refused.append(f"input: a string or a list of items of type {list(ITEMS)}")
         if refused:
             raise HTTPException(400, f"not accepted by the relay (only the ledger's gate answers approvals): {refused}")
-        input_hash = record.sha256_hex(record.canonical_json(given))   # NaN or a lone surrogate: 400, before any task
+        record.canonical_json(payload)     # NaN or a lone surrogate in any forwarded field: 400, before any task
+        input_hash = record.sha256_hex(record.canonical_json(given))
         conv_hash = record.sha256_hex(conv.encode())
         sid = "fr_" + conv_hash[:32]                 # the relay's agent session for this conversation (not evidence)
         sess = n.store.session(sid)
