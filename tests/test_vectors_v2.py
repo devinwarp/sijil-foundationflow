@@ -77,11 +77,11 @@ def _mth(leaves: list[bytes]) -> bytes:
     return hashlib.sha256(b"\x01" + _mth(leaves[:k]) + _mth(leaves[k:])).digest()
 
 
-@pytest.mark.parametrize("n", [1, 2, 3, 5, 6])
+@pytest.mark.parametrize("n", [1, 2, 3, 4, 5, 6, 7])
 def test_epoch_merkle_is_rfc9162_mth(n):
     leaves = [hashlib.sha256(bytes([i])).digest() for i in range(n)]
     assert vectors_v2.merkle([x.hex() for x in leaves]) == _mth(leaves).hex()
-    if n == 3:   # the shapes where duplicate-the-odd-node differs: ((0,1),2), not ((0,1),(2,2))
+    if n == 3:   # one shape where duplicate-the-odd-node differs (so do 5, 6 and 7): ((0,1),2), not ((0,1),(2,2))
         leaf = lambda x: hashlib.sha256(b"\x00" + x).digest()
         node = lambda a, b: hashlib.sha256(b"\x01" + a + b).digest()
         assert _mth(leaves) == node(node(leaf(leaves[0]), leaf(leaves[1])), leaf(leaves[2]))
