@@ -264,7 +264,7 @@ def test_oversized_text_is_cut_at_a_character_boundary_and_sealed_truncated(env)
     r = tools.get("/case-api/cases?limit=10&open=true", headers={"X-Sijil-Task-Seq": str(t["task_seq"])})
     assert r.status_code == 200 and r.content == b"a" * (limit - 1)
     x = json.loads(rows(s.db_path, "type = 'tool_result'")[0]["ext"])
-    assert x["truncated"] is True and x["bytes"] == len(big) and x["http_status"] == 200
+    assert x["truncated"] is True and x["bytes"] == len(big) and x["http_status"] == 200 and "withheld" not in x
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 
 
@@ -278,7 +278,7 @@ def test_oversized_json_is_withheld_with_the_upstream_status(env):
     assert r.status_code == 201 and r.json() == {"sijil": "result withheld: over max_result_bytes"}
     result = rows(s.db_path, "type = 'tool_result'")[0]
     x = json.loads(result["ext"])
-    assert "truncated" not in x and x["bytes"] == len(big) and x["http_status"] == 201
+    assert "truncated" not in x and x["bytes"] == len(big) and x["http_status"] == 201 and x["withheld"] is True
     assert result["output_hash"] == record.sha256_hex(big) and r.headers["x-sijil-seq"] == str(result["seq"])
     assert verify(s.db_path, s.pubkey_path)[0] == 0
 

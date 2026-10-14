@@ -131,6 +131,21 @@ def test_rejects_bad_identity_payloads(type_, ext, match):
         seal({**BASE, "type": type_, "agent_id": AGENT, "principal": PRINCIPAL, "ext": cj(ext)})
 
 
+RESULT = {**BASE, "type": "tool_result", "parent_seq": "6", "task_seq": "4", "source_label": "http:case-api",
+          "agent_id": AGENT, "principal": HUMAN, "output_hash": "e" * 64}
+RESULT_EXT = {"tool": "listCases", "server": "case-api", "status": "ok", "bytes": 3,
+              "content_types": ["application/json"], "http_status": 200,
+              "invisible_unicode": {"found": False, "count": 0, "action": "none"}}
+
+
+def test_withheld_is_an_optional_true_only_tool_result_key():
+    """§2.4.2, §17.1: the HTTP adapter marks a withheld JSON or binary body; absent otherwise."""
+    seal({**RESULT, "ext": cj({**RESULT_EXT, "withheld": True})})
+    for bad in (False, 1, "true"):
+        with pytest.raises(ValueError, match="withheld"):
+            seal({**RESULT, "ext": cj({**RESULT_EXT, "withheld": bad})})
+
+
 @pytest.mark.parametrize("ext", [
     {**REQUEST, "approval_id": "ap_123"},
     {**REQUEST, "on_timeout": "allow"},

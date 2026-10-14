@@ -372,7 +372,7 @@ class Adapter:
         try:
             r = await asyncio.to_thread(p.result, call, sealed, text, "ok" if status and 200 <= status < 300 else "error",
                                         [media] if media else [], server.label, raw=data, http_status=status,
-                                        truncate=False, cut=cut)
+                                        truncate=False, cut=cut, withheld=withheld)
         except (Refusal, Refused, Unreachable) as e:
             return JSONResponse({"error": "Sijil ledger unreachable or refused the result"
                                  if isinstance(e, Unreachable) else f"Sijil ledger refused the record: {getattr(e, 'detail', e)}"},
