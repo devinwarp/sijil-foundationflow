@@ -1,5 +1,6 @@
 {{- if .Values.agent.enabled }}
 {{- $name := printf "%s-agent" (include "sijil.fullname" .) }}
+{{- $_ := required "rulepack is required with agent.enabled: the guard cannot run without it" .Values.rulepack }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,19 +18,21 @@ spec:
         app.kubernetes.io/component: agent
         sijil.io/agent: "true"
       annotations:
-        checksum/guard: {{ tpl .Values.guard.config . | sha256sum }}
+        checksum/guard: {{ list (tpl .Values.guard.config .) .Values.guard.files | toJson | sha256sum }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{ toJson . }}
       {{- end }}
+      automountServiceAccountToken: false   # nothing in the pod talks to the Kubernetes API
       securityContext: {{ toJson .Values.podSecurityContext }}
       initContainers:
         # The guard refuses a key it does not own or that others can read; a Secret volume is root-owned.
         - name: agent-key
-          image: {{ include "sijil.image" (dict "image" .Values.image.guard "root" .) }}
+          image: {{ include "sijil.image" (dict "image" .Values.image.guard "name" "guard") | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: [sh, -c, "cp /agent-key/agent.key /state/agent.key && chmod 600 /state/agent.key"]
           securityContext: {{ toJson .Values.securityContext }}
+          resources: {{ toJson .Values.guard.resources }}
           volumeMounts:
             - {name: agent-key, mountPath: /agent-key, readOnly: true}
             - {name: guard-state, mountPath: /state}
@@ -55,7 +58,7 @@ spec:
           resources: {{ toJson .Values.agent.resources }}
           volumeMounts:
             - {name: tmp, mountPath: /tmp}
-        {{- include "sijil.guardContainer" (dict "root" . "name" "sijil-adapter" "args" (list "http")) | nindent 8 }}
+        {{- include "sijil.guardContainer" (dict "root" . "name" "sijil-adapter" "args" (list "http") "probe" true) | nindent 8 }}
         {{- range .Values.agent.mcpGuards }}
         {{- include "sijil.guardContainer" (dict "root" $ "name" (printf "sijil-mcp-%s" .server) "args" (list "serve" "--server" .server "--http" (printf "127.0.0.1:%v" .port))) | nindent 8 }}
         {{- end }}
@@ -65,8 +68,9 @@ spec:
         - name: rulepack
           configMap: {name: {{ include "sijil.fullname" . }}-rulepack}
         - name: agent-key
-          # 0444: Secret files are root-owned and the pod runs as a non-root UID; only this pod mounts it
-          secret: {secretName: {{ required "guard.agentKeySecret" .Values.guard.agentKeySecret }}, defaultMode: 0444}
+          # 0440: root-owned, readable through the group: GID 0 (no runAsGroup) or fsGroup (OpenShift injects one).
+          # If you set runAsGroup to a non-zero GID, set fsGroup too (podSecurityContext).
+          secret: {secretName: {{ required "guard.agentKeySecret" .Values.guard.agentKeySecret }}, defaultMode: 0440}
         - name: guard-state
           emptyDir: {medium: Memory}
         - name: tmp

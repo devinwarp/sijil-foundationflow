@@ -2,23 +2,27 @@
 # runs as a sidecar in the agent's pod: agent sessions are bound to the address that opened them, so the
 # adapter must share the agent's network namespace (spec §12 item 47). See docs/OPERATOR_GUIDE_M2.md.
 
+# Required: a tag (the release tag, e.g. v1.2.0) or a digest (sha256:..., from the release's .digest asset; wins
+# over the tag) for each image. Pinned separately so the ledger is upgraded before the guard (guide §14).
 image:
-  ledger: {repository: ghcr.io/devinwarp/sijil, tag: ""}          # tag defaults to .Chart.AppVersion
-  guard: {repository: ghcr.io/devinwarp/sijil-guard, tag: ""}
+  ledger: {repository: ghcr.io/devinwarp/sijil, tag: "", digest: ""}
+  guard: {repository: ghcr.io/devinwarp/sijil-guard, tag: "", digest: ""}
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
 # Tokens, from a Secret you create (recommended). Keys: admin-token (SIJILL_ADMIN_TOKEN), agent-token
 # (SIJILL_TOKEN on the ledger, SIJIL_TOKEN on the guard), tools-token (SIJIL_TOOLS_TOKEN: the agent sends it to
 # the adapter as X-Sijil-Tools-Token). With existingSecret empty the chart creates one from `values` below:
-# for rehearsals only, the tokens then sit in your values file.
+# for rehearsals only, the tokens then sit in your values file. Pods read the tokens at start: after changing
+# them, `kubectl rollout restart` the ledger StatefulSet and the agent Deployments.
 secrets:
   existingSecret: ""
   values: {adminToken: "", agentToken: "", toolsToken: ""}
 
 # Pod and container security contexts for every pod of the chart. No runAsUser: OpenShift assigns one from the
 # namespace range and the images run as any UID in group 0. On clusters whose volumes are not group-writable,
-# add fsGroup (e.g. 1001) to podSecurityContext.
+# add fsGroup (e.g. 1001) to podSecurityContext. Key Secrets mount 0440 (owner root, read through the group):
+# if you set runAsGroup to a non-zero GID, also set fsGroup to it.
 podSecurityContext:
   runAsNonRoot: true
   seccompProfile: {type: RuntimeDefault}
@@ -46,6 +50,7 @@ ledger:
     size: 5Gi
     storageClass: ""
   service: {type: ClusterIP, port: 8000}
+  # No CPU limits by default (throttling slows signing). Add `cpu` to limits if a ResourceQuota requires one.
   resources:
     requests: {cpu: 250m, memory: 512Mi}
     limits: {memory: 2Gi}
@@ -76,9 +81,15 @@ guard:
   # Name of a Secret holding the agent's registered key as `agent.key`. An init container copies it to /state
   # with mode 0600 and the pod's UID (the guard refuses a key it does not own).
   agentKeySecret: ""
+  # Every guard sidecar and the key-copy init container. Add `cpu` to limits if a ResourceQuota requires one.
   resources:
     requests: {cpu: 50m, memory: 96Mi}
     limits: {memory: 256Mi}
+  # Exec readiness/liveness probes on the adapter sidecar: GET http://127.0.0.1:8090/_sijil/healthz from inside the
+  # container (it listens on loopback, out of the kubelet's reach). Needs a guard image whose adapter serves
+  # /_sijil/healthz; older images would fail the probe and restart. MCP guard sidecars have no probe.
+  probes:
+    enabled: false
 
 # An agent Deployment with the adapter as its sidecar. Off by default: it shows the wiring and serves
 # rehearsals. For your own agent copy examples/agent-sidecar.yaml into its pod spec.
@@ -93,8 +104,12 @@ agent:
   resources: {}
   securityContext: {}               # empty: the chart's securityContext
 
-# Off by default. On: the ledger accepts traffic only from pods labelled sijil.io/agent=true (agents and their
-# adapters) and from the namespaces/pods listed in `from` (the SSO reverse proxy, the SIEM forwarder).
+# Off by default. On: the ledger accepts traffic only from pods labelled sijil.io/agent=true in the release
+# namespace (agents and their adapters), and from the peers listed in `from` (NetworkPolicy `from` entries: the
+# SSO reverse proxy, the SIEM forwarder). Agents in other namespaces need an entry of their own, e.g.
+#   - {namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: agents}}, podSelector: {matchLabels: {sijil.io/agent: "true"}}}
+# On OpenShift, approvers reaching the ledger through the Router need
+#   - {namespaceSelector: {matchLabels: {policy-group.network.openshift.io/ingress: ""}}}
 networkPolicy:
   enabled: false
   from: []

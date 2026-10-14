@@ -11,6 +11,18 @@ spec:
   ports:
     - {name: http, port: {{ .Values.ledger.service.port }}, targetPort: http}
 ---
+# The StatefulSet's governing Service (pod DNS). Clients use the Service above.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-headless
+  labels: {{- include "sijil.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector: {app.kubernetes.io/instance: {{ .Release.Name }}, app.kubernetes.io/component: ledger}
+  ports:
+    - {name: http, port: {{ .Values.ledger.service.port }}, targetPort: http}
+---
 # One replica, always: one writer holds the chain head in memory (SQLite, one uvicorn worker).
 apiVersion: apps/v1
 kind: StatefulSet
@@ -20,23 +32,22 @@ metadata:
     app.kubernetes.io/component: ledger
 spec:
   replicas: 1
-  serviceName: {{ $name }}
+  serviceName: {{ $name }}-headless
   selector:
     matchLabels: {app.kubernetes.io/instance: {{ .Release.Name }}, app.kubernetes.io/component: ledger}
   template:
     metadata:
       labels: {{- include "sijil.labels" . | nindent 8 }}
         app.kubernetes.io/component: ledger
-      annotations:
-        checksum/tokens: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{ toJson . }}
       {{- end }}
+      automountServiceAccountToken: false   # the ledger never talks to the Kubernetes API
       securityContext: {{ toJson .Values.podSecurityContext }}
       containers:
         - name: ledger
-          image: {{ include "sijil.image" (dict "image" .Values.image.ledger "root" .) }}
+          image: {{ include "sijil.image" (dict "image" .Values.image.ledger "name" "ledger") | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports: [{name: http, containerPort: 8000}]
           env:
@@ -99,8 +110,9 @@ spec:
         {{- end }}
         {{- if .Values.ledger.nodeKeySecret }}
         - name: node-key
-          # 0444: Secret files are root-owned and the pod runs as a non-root UID; only this pod mounts it
-          secret: {secretName: {{ .Values.ledger.nodeKeySecret }}, defaultMode: 0444}
+          # 0440: root-owned, readable through the group: GID 0 (no runAsGroup) or fsGroup (OpenShift injects one).
+          # If you set runAsGroup to a non-zero GID, set fsGroup too (podSecurityContext).
+          secret: {secretName: {{ .Values.ledger.nodeKeySecret }}, defaultMode: 0440}
         {{- end }}
         {{- if .Values.ledger.models.existingClaim }}
         - name: models
