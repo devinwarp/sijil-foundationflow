@@ -1,4 +1,4 @@
-# Sijill — Build Spec
+# Sijil — Build Spec
 
 *For Devin or any coding agent. Self-contained: build from this document alone. Where this spec and the PRD disagree, this spec wins for implementation; the PRD wins for positioning.*
 

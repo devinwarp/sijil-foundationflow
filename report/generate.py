@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the Sijill audit report (A4 PDF) for a date range.
+"""Generate the Sijil audit report (A4 PDF) for a date range.
 
     python report/generate.py --db sijill.db --pubkey node.pub --from 2026-09-25 --to 2026-09-25 --out report.pdf
 
@@ -111,7 +111,7 @@ def render(ctx: dict, out: str) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Generate the Sijill audit report PDF.")
+    ap = argparse.ArgumentParser(description="Generate the Sijil audit report PDF.")
     ap.add_argument("--db", default=os.environ.get("DATABASE_PATH", "sijill.db"))
     ap.add_argument("--pubkey", default=os.environ.get("NODE_PUBKEY_PATH", "node.pub"))
     ap.add_argument("--from", dest="ts_from", help="YYYY-MM-DD or ISO timestamp (default: first record)")

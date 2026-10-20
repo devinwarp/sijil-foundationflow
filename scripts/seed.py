@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate N calls through the Sijill proxy: mostly plain questions, some with sensitive terms.
+"""Generate N calls through the Sijil proxy: mostly plain questions, some with sensitive terms.
 
     python scripts/seed.py --n 50
 """

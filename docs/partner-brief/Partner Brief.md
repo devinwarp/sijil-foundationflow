@@ -1,18 +1,18 @@
-# Sijill — Partner Brief
+# Sijil — Partner Brief
 
 *For integrators and platform vendors bidding government AI work. One page. Hand it over on the day, don't email it after.*
 
 ## What it is
 
-Sijill seals a tamper-evident record of every LLM inference — model version, execution node and location, policy in force, approval reference, input and output hashes — on infrastructure the customer owns. An independent verifier proves the chain is unbroken. The output is an audit report an assurance function can hand to a third party.
+Sijil seals a tamper-evident record of every LLM inference — model version, execution node and location, policy in force, approval reference, input and output hashes — on infrastructure the customer owns. An independent verifier proves the chain is unbroken. The output is an audit report an assurance function can hand to a third party.
 
 ## The accounts this is for
 
-**Not the ones you take whole.** Where a customer adopts your platform end to end, they get lineage and audit with it. Sijill is redundant there and we will say so.
+**Not the ones you take whole.** Where a customer adopts your platform end to end, they get lineage and audit with it. Sijil is redundant there and we will say so.
 
 **The ones you can't.** Customers who have already built their own inference stack, or run a mixed estate they will not replace, have no attestation path. Hyperscaler confidential-inference services do not reach infrastructure the customer owns. Replacing a working stack to obtain an audit trail is not a trade anyone makes — so the requirement goes unmet and the bid gets harder.
 
-Sijill covers those accounts without displacing anything you would otherwise sell.
+Sijil covers those accounts without displacing anything you would otherwise sell.
 
 ## What it does for your bid
 
@@ -41,7 +41,7 @@ No change to the model, the application, or the serving runtime.
 
 ## Honest boundaries
 
-Sijill proves records have not been altered since sealing. Hardware root of trust — binding the seal to the silicon — is roadmap, built on NVIDIA and TEE attestation primitives rather than replacing them. We say this to customers too.
+Sijil proves records have not been altered since sealing. Hardware root of trust — binding the seal to the silicon — is roadmap, built on NVIDIA and TEE attestation primitives rather than replacing them. We say this to customers too.
 
 ## Next step
 

@@ -1,4 +1,4 @@
-"""Sijill proxy: evaluate every chat completion against policy, forward or block, seal a record.
+"""Sijil proxy: evaluate every chat completion against policy, forward or block, seal a record.
 
 Run a single worker (records are sealed under an in-process lock):
 
@@ -271,7 +271,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
         approvals.stop(n)
         await app.state.node.aclose()
 
-    app = FastAPI(title="Sijill", lifespan=lifespan)
+    app = FastAPI(title="Sijil", lifespan=lifespan)
 
     @app.exception_handler(record.NotCanonical)
     @app.exception_handler(UnicodeEncodeError)      # a lone surrogate, which strict UTF-8 cannot encode
@@ -413,7 +413,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
         def blocked(rec: dict, block_hits: list[str], upstream_ms: float = 0.0):
             return JSONResponse(status_code=403, headers=headers(rec, upstream_ms), content={
-                "error": {"message": f"Blocked by Sijill policy: {', '.join(block_hits)}",
+                "error": {"message": f"Blocked by Sijil policy: {', '.join(block_hits)}",
                           "type": "policy_block", "code": "sijill_block"},
                 "sijill": {"seq": rec["seq"], "decision": "block", "rule_hits": block_hits,
                            "record_hash": rec["record_hash"]}})

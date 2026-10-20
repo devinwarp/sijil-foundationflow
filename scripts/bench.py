@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure Sijill's latency overhead, excluding model time (acceptance test 7).
+"""Measure Sijil's latency overhead, excluding model time (acceptance test 7).
 
 The proxy reports its own overhead per call in `X-Sijill-Overhead-Ms`: total
 handler time minus the time spent waiting on the model runtime. That covers
