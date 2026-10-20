@@ -31,9 +31,12 @@ Update `approved_models.allow_digests` in `policy.yaml` if you serve a different
 ## Run
 
 ```bash
+export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib          # WeasyPrint's pango/gobject; without it the report fails
 uvicorn sijill.proxy:app --port 8000 --env-file .env.local   # one worker only
 open http://localhost:8000                                  # demo console
 ```
+
+The export matters on Apple Silicon: WeasyPrint looks for Homebrew's `libgobject` on the default library path, which doesn't include `/opt/homebrew/lib`, so `import weasyprint` fails and *Generate report* errors. Everything else runs without it.
 
 The first run creates `node.key` (Ed25519 private key, mode 0600), `node.pub` and `sijill.db`. The first call to a model hashes its weights file, which takes about 4 s. After that the digest is cached at `SIJILL_DIGEST_CACHE` (default `.sijill_digests.json`).
 
@@ -98,6 +101,7 @@ Before going on stage, reset and prepare:
 
 ```bash
 rm -f sijill.db sijill.db.bak                       # keep node.key
+export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib  # or Generate report fails (see Run)
 uvicorn sijill.proxy:app --port 8000 --env-file .env.local
 python scripts/seed.py --n 30
 scripts/tamper.sh backup
