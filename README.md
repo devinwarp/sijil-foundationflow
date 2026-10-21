@@ -2,7 +2,7 @@
 
 Inference attestation for AI running on infrastructure you own.
 
-[![Watch the live demo (1:16, narrated)](docs/media/sijil-live-demo-poster.jpg)](docs/media/sijil-live-demo.mp4)
+[![Watch the live demo (1:16, narrated)](docs/media/sijil-live-demo-poster.jpg)](https://sijil.infinitebarakah.com/assets/sijil-live-demo.mp4)
 
 *Live demo, 1:16: an allowed call, an Emirates ID flag, a residency block, a record altered and then forged outside the app and caught by the independent verifier, and the audit report. Recorded against the real proxy and a local Llama 3.2 3B.*
 
