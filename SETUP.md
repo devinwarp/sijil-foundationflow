@@ -1,4 +1,4 @@
-# Sijill Development Setup
+# Sijil Development Setup
 
 *Complete this setup before September 25th to be ready for development.*
 
@@ -215,7 +215,7 @@ Run this final check to ensure everything is ready:
 
 ```bash
 #!/bin/bash
-echo "=== Sijill Development Setup Verification ==="
+echo "=== Sijil Development Setup Verification ==="
 
 # Check Python
 echo "Checking Python version..."

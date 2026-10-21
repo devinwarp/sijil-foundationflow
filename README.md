@@ -1,4 +1,4 @@
-# Sijill
+# Sijil
 
 Inference attestation for AI running on infrastructure you own.
 
@@ -6,7 +6,7 @@ Inference attestation for AI running on infrastructure you own.
 
 *Live demo, 1:16: an allowed call, an Emirates ID flag, a residency block, a record altered and then forged outside the app and caught by the independent verifier, and the audit report. Recorded against the real proxy and a local Llama 3.2 3B.*
 
-Sijill is a proxy in front of an OpenAI-compatible model endpoint. It evaluates every call against a policy, forwards or blocks it, and seals a signed, hash-chained record of it. An independent verifier proves the chain is intact or names the exact record that broke. A report generator produces an A4 audit PDF for a date range. Everything runs locally on one machine.
+Sijil is a proxy in front of an OpenAI-compatible model endpoint. It evaluates every call against a policy, forwards or blocks it, and seals a signed, hash-chained record of it. An independent verifier proves the chain is intact or names the exact record that broke. A report generator produces an A4 audit PDF for a date range. Everything runs locally on one machine.
 
 Website: **[sijil.infinitebarakah.com](https://sijil.infinitebarakah.com)** (static, in [`site/`](site/); every push to `main` redeploys it on Vercel). Pitch deck: [`docs/presentation/Sijil — Fish Tank pitch v2.html`](<docs/presentation/Sijil — Fish Tank pitch v2.html>) (self-contained, works offline; download and open in a browser, → to advance, N for speaker notes). The build spec is [`docs/README.md`](docs/README.md). The session log for the judges is [`DEVIN_LOG.md`](DEVIN_LOG.md).
 
@@ -146,7 +146,7 @@ Fallback: a pre-generated `report.pdf` and the screen recording.
 
 ## Honest boundaries
 
-Sijill proves records haven't been altered since they were sealed. It doesn't prove the sealing process was honest: node identity and region are asserted by the node and signed with its key, not bound to hardware. Hardware root of trust (TEE / GPU attestation) is roadmap. The chain also can't detect truncation of its newest records while the node is offline. Anchoring the chain head externally would fix that.
+Sijil proves records haven't been altered since they were sealed. It doesn't prove the sealing process was honest: node identity and region are asserted by the node and signed with its key, not bound to hardware. Hardware root of trust (TEE / GPU attestation) is roadmap. The chain also can't detect truncation of its newest records while the node is offline. Anchoring the chain head externally would fix that.
 
 HSM signing is optional over PKCS#11 (`SIJILL_PKCS11_*`). When it is configured, a failing HSM at startup stops the proxy; there is no key-file fallback. HSM custody limits key theft, not a compromised host. Enabling the HSM on a database signed by another key is refused at startup: rotate to the HSM key on a new database.
 

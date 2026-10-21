@@ -1,6 +1,6 @@
 """Model content digest: SHA-256 of the model weights file served by the runtime.
 
-LM Studio's API does not report a content digest, so Sijill computes one from
+LM Studio's API does not report a content digest, so Sijil computes one from
 the GGUF file on disk and caches it keyed by (path, size, mtime). A model whose
 weights cannot be located gets an empty digest, which no allowlist contains.
 """

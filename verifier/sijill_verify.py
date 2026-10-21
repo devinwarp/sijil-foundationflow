@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Shameer Thaha
 """
-Sijill verifier: standalone CLI. Record schema v2.
+Sijil verifier: standalone CLI. Record schema v2.
 
 Reimplements canonicalisation and verification from the Build Spec (docs/README.md) and the
 agent integration spec (§2.2 hashing, §4 checks, §17.7 government checks). Deliberately imports nothing
@@ -891,7 +891,7 @@ def banner(word, ok):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Verify a Sijill record chain.")
+    parser = argparse.ArgumentParser(description="Verify a Sijil record chain.")
     parser.add_argument("--db", required=True, help="path to the SQLite record store")
     parser.add_argument("--pubkey", required=True, help="Ed25519 public key (PEM or hex)")
     parser.add_argument("--plain", action="store_true", help="no banner, result line only")

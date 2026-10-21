@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Shameer Thaha
 """
-Sijill trace: who caused seq N? Answered from the database alone (spec §4.5).
+Sijil trace: who caused seq N? Answered from the database alone (spec §4.5).
 
     python verifier/sijill_trace.py --db sijill.db --pubkey node.pub <seq> [--json] [--no-verify]
 
@@ -205,7 +205,7 @@ def render(recs, tr, chain):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Trace who caused a Sijill record.")
+    parser = argparse.ArgumentParser(description="Trace who caused a Sijil record.")
     parser.add_argument("--db", required=True)
     parser.add_argument("--pubkey", required=True)
     parser.add_argument("seq", type=int)

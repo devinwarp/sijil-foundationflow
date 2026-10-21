@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Demo helper: edits the record store directly with the sqlite3 CLI, from outside
-# the application. Uses nothing from Sijill: only sqlite3 and shasum.
+# the application. Uses nothing from Sijil: only sqlite3 and shasum.
 #
 #   tamper.sh backup        copy the store aside (run before the demo)
 #   tamper.sh alter 17      change seq 17's output_hash      -> verifier: content altered
