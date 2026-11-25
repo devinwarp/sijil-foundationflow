@@ -165,7 +165,7 @@ def session_of(n, request: Request) -> dict | None:
     sess = n.store.session(sid)
     if sess is None or sess["expires_at"] <= ts_at(clock()):
         raise HTTPException(401, "agent session unknown or expired")
-    if sess["remote_addr"] != request.client.host:
+    if n.settings.bind_session_addr and sess["remote_addr"] != request.client.host:
         raise HTTPException(401, "agent session bound to another address")
     n.agents.active(sess["agent_id"])
     return sess

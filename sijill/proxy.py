@@ -69,6 +69,7 @@ class Settings:
     digest_cache: str = ".sijill_digests.json"
     jwks_dir: str = "jwks"             # JWKS snapshots by hash (spec §17.2.6); not evidence
     public_url: str = ""               # this ledger's URL as approvers reach it, for approval links (spec §17.5.2)
+    bind_session_addr: bool = True     # an agent session works only from the address that opened it; False for a node behind a proxy or used from serverless
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -94,6 +95,7 @@ class Settings:
             digest_cache=e("SIJILL_DIGEST_CACHE", cls.digest_cache),
             jwks_dir=e("SIJILL_JWKS_DIR", cls.jwks_dir),
             public_url=e("SIJILL_PUBLIC_URL", ""),
+            bind_session_addr=e("SIJILL_SESSION_ADDR_BIND", "1") != "0",
         )
 
 
