@@ -632,10 +632,13 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
                 "admin_auth": "token" if settings.admin_token else "disabled"}
 
     @app.get("/api/verify")
-    async def verify():
+    async def verify(allow_orphan_tool_calls: bool = False):
+        """The same check as the verifier CLI. ?allow_orphan_tool_calls=1 is its --allow-orphan-tool-calls: tool calls with no parent inference
+        pass but are counted in the output (an agent whose model calls do not go through this node seals only orphans). Strict by default."""
         proc = await asyncio.create_subprocess_exec(
             sys.executable, str(VERIFIER), "--db", str(Path(settings.db_path).resolve()),
             "--pubkey", str(Path(settings.pubkey_path).resolve()), "--plain",
+            *(["--allow-orphan-tool-calls"] if allow_orphan_tool_calls else []),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         out, _ = await proc.communicate()
         return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "output": out.decode().strip(),

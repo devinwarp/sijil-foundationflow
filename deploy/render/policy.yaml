@@ -1,0 +1,28 @@
+# Hosted demo node for the Prism AI-for-Good entry: ONE approved model, reached through OpenRouter, and a short list of prompt phrases the node refuses.
+# Synthetic data only. The node screens the text of every prompt sent to the model; a phrase in an `enforce` rule BLOCKS the request before it is
+# forwarded and seals a block record. Matching is a case-insensitive substring match on the full prompt text: it catches these phrases, not intent,
+# so a block means "a listed phrase was present", never "the prompt was proven aligned". Edit and POST /api/admin/policy/reload to change the list.
+policy_id: prism-demo
+version_label: "2026-11-25.1"
+approval_ref: "DEMO-0001"
+attestation: api
+node:
+  id: "prism-demo-node"
+  region: "AE-AZ"
+rules:
+  - id: residency
+    type: region_allowlist
+    allow: ["AE-AZ"]
+    mode: enforce
+  - id: approved_models
+    type: model_allowlist
+    allow_digests: ["api:openrouter:deepseek/deepseek-v4.1-flash"]
+    mode: enforce
+  - id: prompt_override
+    type: keyword_flag
+    terms: ["system override", "ignore previous instructions", "ignore all previous instructions", "disregard your instructions", "you are now authorised", "you are now authorized"]
+    mode: enforce
+  - id: agent_to_agent
+    type: keyword_flag
+    terms: ["message another agent", "send a message to another agent", "delegate this to another agent", "contact the other agent"]
+    mode: enforce

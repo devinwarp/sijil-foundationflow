@@ -265,3 +265,17 @@ def test_a_25_digit_sequence_number_is_a_4xx_not_a_500(flow):
     assert 400 <= seal(client, h, **TOOL_CALL, parent_seq="9" * 25).status_code < 500
     assert 400 <= seal(client, h, **TOOL_CALL, parent_seq=str(task + 1), task_seq="9" * 25).status_code < 500
     assert 400 <= chat(client, sess, "x", task_seq="9" * 25).status_code < 500
+
+
+def test_online_verify_can_tolerate_orphan_tool_calls_but_does_not_by_default(flow):
+    """Prism's agent calls its model elsewhere, so its sealed tool calls have no parent inference: the strict default stays strict, and
+    ?allow_orphan_tool_calls=1 is the same switch as the verifier's --allow-orphan-tool-calls (the orphans are still counted, not hidden)."""
+    client, s, sess, task, h = flow
+    ext = {**TOOL_CALL["ext"], "correlation": "none"}
+    del ext["tool_use_id"]
+    assert seal(client, h, **{**TOOL_CALL, "ext": ext}).status_code == 200
+    strict = client.get("/api/verify").json()
+    assert strict["ok"] is False and strict["output"].endswith("tool_call without parent inference")
+    tolerant = client.get("/api/verify", params={"allow_orphan_tool_calls": "1"}).json()
+    assert tolerant["ok"] is True and "orphans=1" in tolerant["output"]
+    assert client.get("/api/verify", params={"allow_orphan_tool_calls": "0"}).json()["ok"] is False

@@ -1,0 +1,24 @@
+# Render Blueprint: one always-on web service with a persistent disk. Needs a paid instance (a free one sleeps and has no disk, which would reset the chain).
+# Secrets are NOT in this file: Render asks for them when the blueprint is applied (sync: false).
+services:
+  - type: web
+    name: sijil-node
+    runtime: docker
+    dockerfilePath: ./deploy/render/Dockerfile
+    dockerContext: .
+    plan: starter
+    numInstances: 1
+    healthCheckPath: /api/policy
+    disk:
+      name: sijil-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: SIJILL_ADMIN_TOKEN
+        sync: false      # halt switch and admin routes: keep it on your machine only
+      - key: SIJILL_TOKEN
+        sync: false      # the agent token the app sends as x-sijil-token (SIJIL_AGENT_TOKEN in the app)
+      - key: LM_API_TOKEN
+        sync: false      # the OpenRouter API key, held only here
+      - key: SIJILL_PUBLIC_URL
+        sync: false      # this service's https URL once Render assigns it
